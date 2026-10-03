@@ -1,0 +1,7 @@
+/target
+*.pdb
+*.exe
+
+# Local rewrite archive and binding probe
+/*.zip
+/pall.rs
