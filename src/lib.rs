@@ -7,6 +7,7 @@
 compile_error!("cec targets Windows x64 (x86_64-pc-windows-msvc) only");
 
 pub mod arena;
+pub mod cec_contract;
 pub mod clock;
 pub mod completion;
 pub mod contract;

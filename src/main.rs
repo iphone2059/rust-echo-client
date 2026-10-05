@@ -50,15 +50,7 @@ impl Drop for ConsoleHandler {
 }
 
 fn help_text() -> String {
-    [
-        "Usage: rust-echo-client <IPv4-address> /p tcp|udp [/r port] [/l port] [/n count]",
-        "       [/t seconds] [/i ms] [/d text | /z bytes | /zt bytes] [/k tcp-depth]",
-        "       [/c sessions] [/threads workers] [/w seconds] [/rc [seconds]]",
-        "       [/report seconds] [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats]",
-        "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.",
-        "Each worker requires CQ >= sessions*(1+/k) and registered memory >= sessions*(1+/k)*payload.",
-    ]
-    .join("\n")
+    cec::cec_contract::help_text()
 }
 
 fn partition(session_count: u32, worker_count: u32) -> Vec<u32> {

@@ -1,5 +1,6 @@
 //! Argument contract and checked arithmetic, ported from the C++ client baseline.
 
+use crate::cec_contract::token;
 use crate::types::{
     ArgumentError, Options, Pattern, Protocol, MAXIMUM_SESSIONS, MAXIMUM_UDP_PAYLOAD_BYTES,
 };
@@ -67,7 +68,7 @@ fn switch_offset(token: &str) -> Option<usize> {
 fn numeric(value: &str) -> Result<u64, ArgumentError> {
     value
         .parse::<u64>()
-        .map_err(|_| ArgumentError("numeric switch has an invalid value".to_string()))
+        .map_err(|_| ArgumentError(token::INVALID_NUMBER.to_string()))
 }
 
 /// Strict parser: exactly one positional target host, mutually exclusive payload
@@ -128,7 +129,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             "p" | "d" | "r" | "l" | "n" | "t" | "i" | "b" | "k" | "z" | "zt" | "w" | "rc"
                 | "report" | "c" | "threads" | "cq" | "memory"
         ) {
-            return Err(ArgumentError("unknown switch".to_string()));
+            return Err(ArgumentError(token::UNKNOWN_SWITCH.to_string()));
         }
         let value = match inline {
             Some(value) => value,
@@ -156,9 +157,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             let number = if name == "d" { 0 } else { numeric(&value)? };
             if name != "d" {
                 if number == 0 || number > MAXIMUM_UDP_PAYLOAD_BYTES.max(u64::from(u32::MAX)) {
-                    return Err(ArgumentError(
-                        "unknown switch or value outside its valid range".to_string(),
-                    ));
+                    return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
                 }
             }
             match name.as_str() {
@@ -197,9 +196,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             _ => 1_048_576..=u64::MAX,
         };
         if !range.contains(&number) {
-            return Err(ArgumentError(
-                "unknown switch or value outside its valid range".to_string(),
-            ));
+            return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
         }
         match name.as_str() {
             "r" => options.remote_port = number as u16,
@@ -213,7 +210,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
                 // baseline clients reject the switch outright for UDP, so accepting it here
                 // would silently diverge.
                 if options.protocol == Protocol::Udp {
-                    return Err(ArgumentError("/k is available only for TCP".to_string()));
+                    return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
                 }
                 options.pipeline_depth = number as u32;
             }
@@ -262,7 +259,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     }
     if options.protocol == Protocol::Udp && options.pipeline_depth != 1 {
         // A /k that appeared before /p udp is caught here.
-        return Err(ArgumentError("/k is available only for TCP".to_string()));
+        return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
     }
     Ok(options)
 }
