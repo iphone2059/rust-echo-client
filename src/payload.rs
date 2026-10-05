@@ -1,7 +1,7 @@
 //! Echo payload construction and byte-exact verification, plus the run statistics the
 //! exit code is derived from.
 
-use crate::contract::{classify_result, unclaimed_echoes};
+use crate::cec_contract::{classify_result, unclaimed_echoes};
 use crate::types::{ArgumentError, ExitCode, Options, Pattern, MAXIMUM_TCP_BATCH_BYTES, MAXIMUM_UDP_PAYLOAD_BYTES};
 
 /// The default payload of the baseline: the literal text below, sent as ASCII.
@@ -239,7 +239,7 @@ elapsed_ms={} echo_per_sec={:.2} MiB_per_sec={:.2} p50_us~{} p99_us~{} p999_us~{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::parse;
+    use crate::cec_contract::parse;
 
     fn options(values: &[&str]) -> Options {
         let mut arguments = vec!["rust-echo-client".to_string()];

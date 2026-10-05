@@ -1,7 +1,7 @@
 use std::process::ExitCode as ProcessExitCode;
 
 use cec::clock::RioClock;
-use cec::contract::parse;
+use cec::cec_contract::parse;
 use cec::native::Winsock;
 use cec::payload::{Statistics, build, validate_payload};
 use cec::transport::RioTransport;
