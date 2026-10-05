@@ -10,7 +10,6 @@ pub mod arena;
 pub mod cec_contract;
 pub mod clock;
 pub mod completion;
-pub mod contract;
 pub mod endpoint;
 pub mod native;
 pub mod overlapped;
