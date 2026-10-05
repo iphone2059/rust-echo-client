@@ -1,0 +1,1 @@
+..\..\..\rust-echo-server\target\release\rust-echo-server.exe
