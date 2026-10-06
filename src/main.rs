@@ -1,12 +1,12 @@
 use std::process::ExitCode as ProcessExitCode;
 
 use cec::clock::RioClock;
-use cec::cec_contract::parse;
+use cec::contract::parse;
 use cec::native::Winsock;
 use cec::payload::{Statistics, build, validate_payload};
 use cec::transport::RioTransport;
 use cec::types::{ExitCode, Options, Protocol};
-use cec::cec_engine::{StopFlag, Worker};
+use cec::engine::{StopFlag, Worker};
 
 // SetConsoleCtrlHandler is deliberately linked directly: the handler must do nothing except
 // flip the process-wide atomic stop flag and this keeps console shutdown independent of the
@@ -50,7 +50,7 @@ impl Drop for ConsoleHandler {
 }
 
 fn help_text() -> String {
-    cec::cec_contract::help_text()
+    cec::contract::help_text()
 }
 
 fn partition(session_count: u32, worker_count: u32) -> Vec<u32> {

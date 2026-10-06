@@ -6,8 +6,8 @@
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 compile_error!("cec targets Windows x64 (x86_64-pc-windows-msvc) only");
 
-pub mod cec_contract;
-pub mod cec_engine;
+pub mod contract;
+pub mod engine;
 pub mod cec_engine_internal;
 pub mod clock;
 pub mod endpoint;
@@ -19,3 +19,4 @@ pub mod timer;
 pub mod trace;
 pub mod transport;
 pub mod types;
+
