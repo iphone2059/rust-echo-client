@@ -1,13 +1,13 @@
 use std::process::ExitCode as ProcessExitCode;
 
-use cec::clock::RioClock;
+use cec::native::clock::RioClock;
 use cec::contract::parse;
 use cec::native::Winsock;
 use cec::metrics::Statistics;
 use cec::payload::{build, validate_payload};
 use cec::transport::RioTransport;
 use cec::types::{ExitCode, Options, Protocol};
-use cec::engine::{StopFlag, Worker};
+use cec::worker::{StopFlag, Worker};
 
 // SetConsoleCtrlHandler is deliberately linked directly: the handler must do nothing except
 // flip the process-wide atomic stop flag and this keeps console shutdown independent of the
@@ -302,4 +302,5 @@ mod tests {
         assert_eq!(worker_memory_share(1_000, 0, 10), 0);
     }
 }
+
 
