@@ -6,7 +6,7 @@ use cec::native::Winsock;
 use cec::payload::{Statistics, build, validate_payload};
 use cec::transport::RioTransport;
 use cec::types::{ExitCode, Options, Protocol};
-use cec::worker::{StopFlag, Worker};
+use cec::cec_engine::{StopFlag, Worker};
 
 // SetConsoleCtrlHandler is deliberately linked directly: the handler must do nothing except
 // flip the process-wide atomic stop flag and this keeps console shutdown independent of the
