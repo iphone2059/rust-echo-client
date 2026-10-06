@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::native::completion::{Operation, WSAEMSGSIZE, is_connection_level};
-use crate::scheduler::{Scheduler, Step};
+use crate::session::scheduler::{Scheduler, Step};
 use crate::types::Options;
 
 /// One completion after native ownership accounting has already been retired by the transport.
@@ -604,5 +604,6 @@ mod tests {
 // The worker owns the IOCP loop, the RIONotify lifecycle, the timer wheel and the trace helpers.
 pub mod timer;
 pub mod trace;
+
 
 
