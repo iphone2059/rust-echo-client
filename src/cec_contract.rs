@@ -251,6 +251,11 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             _ => options.memory_bytes = number,
         }
     }
+    // The datagram path has no /k; a /k that appeared before /p udp is rejected here, before the
+    // help short-circuit, so the diagnostic does not depend on the order of the switches.
+    if options.protocol == Protocol::Udp && options.pipeline_depth != 1 {
+        return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
+    }
     if options.help {
         return Ok(options);
     }
@@ -284,10 +289,6 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     if options.protocol == Protocol::Udp && u64::from(options.pattern_bytes) > MAXIMUM_UDP_PAYLOAD_BYTES
     {
         return Err(ArgumentError("UDP payload exceeds 65507 bytes".to_string()));
-    }
-    if options.protocol == Protocol::Udp && options.pipeline_depth != 1 {
-        // A /k that appeared before /p udp is caught here.
-        return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
     }
     Ok(options)
 }
