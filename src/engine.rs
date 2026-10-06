@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::internal::completion::{Operation, WSAEMSGSIZE, is_connection_level};
+use crate::native::completion::{Operation, WSAEMSGSIZE, is_connection_level};
 use crate::scheduler::{Scheduler, Step};
 use crate::types::Options;
 
@@ -505,7 +505,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::internal::completion::NO_SEND_SLOT;
+    use crate::native::completion::NO_SEND_SLOT;
 
     #[derive(Default)]
     struct TestClock {
@@ -600,5 +600,6 @@ mod tests {
         assert!(recorder.receives.iter().any(|entry| *entry == (0, 6)));
     }
 }
+
 
 
