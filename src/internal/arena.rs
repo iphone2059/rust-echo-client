@@ -12,7 +12,7 @@ use windows::Win32::memoryapi::{VirtualAlloc, VirtualFree};
 use windows::Win32::mswsockdef::RIO_BUF;
 
 use crate::native::{NativeError, RioFunctions};
-use crate::cec_engine_internal::rio::RegisteredBuffer;
+use crate::internal::rio::RegisteredBuffer;
 
 const MEM_COMMIT: u32 = 0x0000_1000;
 const MEM_RESERVE: u32 = 0x0000_2000;
@@ -291,4 +291,5 @@ mod tests {
         assert_eq!(checked_slot_offset(4, 1024, 4096), None);
     }
 }
+
 
