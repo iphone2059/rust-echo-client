@@ -244,13 +244,20 @@ fn run(options: &Options) -> ExitCode {
         }
     }
 
+    // A finite quota the run never claimed is a loss, exactly like the reference: those attempts
+    // were asked for and never completed, so the shared classification reports an echo failure even
+    // when the terminal cause was a worker or network failure. An unlimited run or a controlled stop
+    // claims nothing extra.
+    let unclaimed = statistics.unclaimed(options.echo_count, all_controlled);
+    if unclaimed != 0 {
+        statistics.lost = statistics.lost.saturating_add(unclaimed);
+    }
+
     if options.stats {
         println!("{}", statistics.line("final"));
     }
     if worker_panic || worker_spawn_error {
         ExitCode::Internal
-    } else if worker_error {
-        ExitCode::Network
     } else {
         statistics.exit_code(all_controlled)
     }
