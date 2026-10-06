@@ -228,3 +228,8 @@ mod tests {
         );
     }
 }
+
+// A session owns its socket, its request queue and the batch scheduler that drives its progress.
+pub mod scheduler;
+pub mod transport;
+

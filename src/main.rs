@@ -5,7 +5,7 @@ use cec::contract::parse;
 use cec::native::Winsock;
 use cec::metrics::Statistics;
 use cec::payload::{build, validate_payload};
-use cec::transport::RioTransport;
+use cec::session::transport::RioTransport;
 use cec::types::{ExitCode, Options, Protocol};
 use cec::worker::{StopFlag, Worker};
 
@@ -302,5 +302,6 @@ mod tests {
         assert_eq!(worker_memory_share(1_000, 0, 10), 0);
     }
 }
+
 
 
