@@ -225,7 +225,7 @@ pub fn load_connect_ex(socket: SOCKET) -> Result<LPFN_CONNECTEX, NativeError> {
             socket,
             // A single extension uses SIO_GET_EXTENSION_FUNCTION_POINTER; the MULTIPLE
             // variant is only valid for the RIO table and fails here with WSAEOPNOTSUPP.
-            crate::endpoint::SIO_GET_EXTENSION_FUNCTION_POINTER,
+            crate::native::endpoint::SIO_GET_EXTENSION_FUNCTION_POINTER,
             Some(&WSAID_CONNECTEX as *const GUID as *const c_void),
             size_of::<GUID>() as u32,
             Some(&mut function as *mut LPFN_CONNECTEX as *mut c_void),
@@ -243,3 +243,13 @@ pub fn load_connect_ex(socket: SOCKET) -> Result<LPFN_CONNECTEX, NativeError> {
     }
     Ok(function)
 }
+
+// The Windows substrate is grouped here: the queue wrappers, the completion bookkeeping, the
+// overlapped storage, the registered arena and the endpoint helpers are submodules of this module.
+pub mod arena;
+pub mod completion;
+pub mod endpoint;
+pub mod overlapped;
+pub mod rio;
+
+

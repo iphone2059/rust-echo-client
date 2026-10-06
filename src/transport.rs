@@ -16,19 +16,19 @@ use windows::Win32::mswsockdef::RIORESULT;
 use windows::Win32::winsock2::SOCKET;
 use windows::Win32::ws2::SOCKADDR_IN;
 
-use crate::internal::arena::Arena;
-use crate::internal::completion::{
+use crate::native::arena::Arena;
+use crate::native::completion::{
     MAXIMUM_SEND_SLOT, MAXIMUM_SESSION_INDEX, NO_SEND_SLOT, Operation, RequestContext,
     WSAEMSGSIZE, decode_context, encode_context, next_generation,
 };
-use crate::endpoint::{
+use crate::native::endpoint::{
     begin_connect, bind_local, connect_udp, ipv4_endpoint, update_connect_context,
 };
 use crate::native::{
     NativeError, RioFunctions, SocketOwner, configure_socket, load_connect_ex, registered_socket,
 };
-use crate::internal::overlapped::PendingOverlapped;
-use crate::internal::rio::{CompletionPort, CompletionQueue, RequestQueue};
+use crate::native::overlapped::PendingOverlapped;
+use crate::native::rio::{CompletionPort, CompletionQueue, RequestQueue};
 use crate::types::{Options, Protocol};
 use crate::engine::{Completion, Transport};
 
@@ -249,7 +249,7 @@ impl RioTransport {
             &rio,
             &port,
             options.cq_capacity,
-            crate::internal::rio::RIO_COMPLETION_KEY as *mut c_void,
+            crate::native::rio::RIO_COMPLETION_KEY as *mut c_void,
             &mut *notification_overlapped as *mut OVERLAPPED as *mut c_void,
         )
         .map_err(stage)?;
@@ -615,7 +615,7 @@ impl RioTransport {
         };
 
         if signaled.as_bool() {
-            if key as usize == crate::internal::rio::RIO_COMPLETION_KEY {
+            if key as usize == crate::native::rio::RIO_COMPLETION_KEY {
                 self.queue
                     .as_mut()
                     .ok_or_else(|| "transport completion queue is closed".to_string())?
@@ -999,6 +999,7 @@ mod tests {
         assert!(session.release_send_slot(slot).is_err());
     }
 }
+
 
 
 
