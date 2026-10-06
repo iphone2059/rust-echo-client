@@ -5,7 +5,7 @@
 //! `GenerationDrained` -> reconnect timer. This prevents a new socket from being created
 //! while the old generation can still produce completions.
 
-use crate::payload::Statistics;
+use crate::metrics::Statistics;
 use crate::session::{ReceiveOutcome, Session, SessionState};
 use crate::timer::TimerHeap;
 use crate::types::{Options, Protocol};
@@ -721,3 +721,4 @@ mod tests {
         assert!(scheduler.statistics.fatal);
     }
 }
+

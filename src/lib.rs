@@ -12,6 +12,7 @@ pub mod internal;
 pub mod clock;
 pub mod endpoint;
 pub mod native;
+pub mod metrics;
 pub mod payload;
 pub mod scheduler;
 pub mod session;
@@ -19,5 +20,6 @@ pub mod timer;
 pub mod trace;
 pub mod transport;
 pub mod types;
+
 
 
