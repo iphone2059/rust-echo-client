@@ -251,5 +251,5 @@ pub mod completion;
 pub mod endpoint;
 pub mod overlapped;
 pub mod rio;
-
+pub mod clock;
 

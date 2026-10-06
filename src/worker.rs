@@ -194,7 +194,7 @@ impl Worker {
         transport: &mut T,
         outcome: &mut RunOutcome,
     ) {
-        crate::trace::event_args(
+        crate::worker::trace::event_args(
             "COMPLETION",
             format_args!(
                 "session={} generation={} op={:?} slot={} status={} bytes={}",
@@ -217,7 +217,7 @@ impl Worker {
         // A previous completion in this same Vec can already have moved the generation to
         // Closing, so re-check liveness immediately before touching scheduler state.
         if !transport.completion_is_live(completion.index, completion.generation) {
-            crate::trace::event_args(
+            crate::worker::trace::event_args(
                 "COMPLETION_IGNORED_AFTER_CLOSE",
                 format_args!(
                     "session={} generation={} op={:?}",
@@ -236,7 +236,7 @@ impl Worker {
                 let steps = self.scheduler.on_corrupted_receive(completion.index);
                 self.dispatch(&steps, transport, outcome, now);
             } else if is_connection_level(completion.status) {
-                crate::trace::event_args(
+                crate::worker::trace::event_args(
                     "CONNECTION_FAILURE",
                     format_args!(
                         "session={} generation={} status={}",
@@ -249,7 +249,7 @@ impl Worker {
                 // ordinary peer/network failure. Reconnecting would hide provider/state
                 // corruption and could loop forever, so make the run fatal. Transport
                 // shutdown still performs the bounded cancellation/drain protocol.
-                crate::trace::event_args(
+                crate::worker::trace::event_args(
                     "NATIVE_OPERATION_FATAL",
                     format_args!(
                         "session={} generation={} op={:?} status={}",
@@ -267,7 +267,7 @@ impl Worker {
         let steps = match completion.operation {
             Operation::Connect => {
                 if let Err(reason) = transport.connected(completion.index, completion.generation) {
-                    crate::trace::event("CONNECT_FINALIZE_FAILED", &reason);
+                    crate::worker::trace::event("CONNECT_FINALIZE_FAILED", &reason);
                     outcome.failures = outcome.failures.saturating_add(1);
                     self.fail_session(completion.index, now, transport, outcome);
                     return;
@@ -276,7 +276,7 @@ impl Worker {
             }
             Operation::Send => {
                 if completion.bytes != self.payload_bytes {
-                    crate::trace::event_args(
+                    crate::worker::trace::event_args(
                         "SHORT_SEND",
                         format_args!(
                             "session={} generation={} bytes={} expected={}",
@@ -381,7 +381,7 @@ impl Worker {
             let completions = match transport.wait_and_drain(wait, DRAIN_BATCHES) {
                 Ok(completions) => completions,
                 Err(reason) => {
-                    crate::trace::event("WAIT_DRAIN_FAILED", &reason);
+                    crate::worker::trace::event("WAIT_DRAIN_FAILED", &reason);
                     self.scheduler.mark_fatal();
                     outcome.failures = outcome.failures.saturating_add(1);
                     break;
@@ -422,7 +422,7 @@ impl Worker {
         }
 
         if let Err(reason) = transport.shutdown() {
-            crate::trace::event("TRANSPORT_SHUTDOWN_FAILED", &reason);
+            crate::worker::trace::event("TRANSPORT_SHUTDOWN_FAILED", &reason);
             self.scheduler.mark_fatal();
             StopFlag::request_global();
             outcome.failures = outcome.failures.saturating_add(1);
@@ -449,7 +449,7 @@ impl Worker {
                 Step::Receive { index, .. } => index,
             };
             if failed_session == Some(step_index) {
-                crate::trace::event_args("STEP_SKIPPED_AFTER_FAILURE", format_args!("{step:?}"));
+                crate::worker::trace::event_args("STEP_SKIPPED_AFTER_FAILURE", format_args!("{step:?}"));
                 continue;
             }
 
@@ -467,7 +467,7 @@ impl Worker {
             match result {
                 Ok(()) => {
                     outcome.steps = outcome.steps.saturating_add(1);
-                    crate::trace::event_args("STEP_OK", format_args!("{step:?}"));
+                    crate::worker::trace::event_args("STEP_OK", format_args!("{step:?}"));
                     if let Step::Send(index) = *step {
                         if let Some(queue) = self.sent_at.get_mut(index as usize) {
                             queue.push_back(Instant::now());
@@ -475,7 +475,7 @@ impl Worker {
                     }
                 }
                 Err(reason) => {
-                    crate::trace::event_args("STEP_FAILED", format_args!("{step:?} reason={reason}"));
+                    crate::worker::trace::event_args("STEP_FAILED", format_args!("{step:?} reason={reason}"));
                     outcome.failures = outcome.failures.saturating_add(1);
 
                     // The scheduler reserved every step in this precomputed batch before
@@ -601,5 +601,8 @@ mod tests {
     }
 }
 
+// The worker owns the IOCP loop, the RIONotify lifecycle, the timer wheel and the trace helpers.
+pub mod timer;
+pub mod trace;
 
 

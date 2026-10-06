@@ -30,7 +30,7 @@ use crate::native::{
 use crate::native::overlapped::PendingOverlapped;
 use crate::native::rio::{CompletionPort, CompletionQueue, RequestQueue};
 use crate::types::{Options, Protocol};
-use crate::engine::{Completion, Transport};
+use crate::worker::{Completion, Transport};
 
 pub const MAX_RECEIVE: u32 = 1;
 pub const COMPLETION_BATCH_SIZE: usize = 256;
@@ -38,7 +38,7 @@ const WAIT_TIMEOUT: i32 = 258;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn stage(error: NativeError) -> String {
-    crate::trace::event_args(
+    crate::worker::trace::event_args(
         "TRANSPORT_ERROR",
         format_args!("{} code={}", error.stage, error.code),
     );
@@ -400,7 +400,7 @@ impl RioTransport {
         slot.socket = Some(socket);
         slot.overlapped.reset_after_drain().map_err(stage)?;
 
-        crate::trace::event_args(
+        crate::worker::trace::event_args(
             "GENERATION_BEGIN",
             format_args!("session={index} generation={generation}"),
         );
@@ -422,7 +422,7 @@ impl RioTransport {
             .ok_or_else(|| "session index out of range".to_string())?;
         let generation = slot.generation;
         slot.reset_generation_storage()?;
-        crate::trace::event_args(
+        crate::worker::trace::event_args(
             "GENERATION_DRAINED",
             format_args!("session={index} generation={generation}"),
         );
@@ -462,7 +462,7 @@ impl RioTransport {
             return Ok(());
         }
 
-        crate::trace::event_args(
+        crate::worker::trace::event_args(
             "CLOSE_BEGIN",
             format_args!("session={index} generation={}", slot.generation),
         );
@@ -497,7 +497,7 @@ impl RioTransport {
             return Err("completion has an out-of-range session index".to_string());
         };
         if context.generation != session.generation {
-            crate::trace::event_args(
+            crate::worker::trace::event_args(
                 "STALE_COMPLETION",
                 format_args!(
                     "session={} generation={} live={}",
@@ -655,7 +655,7 @@ impl RioTransport {
     }
 
     fn leak_resources(&mut self, reason: &str) {
-        crate::trace::event("SHUTDOWN_LEAK", reason);
+        crate::worker::trace::event("SHUTDOWN_LEAK", reason);
         // Memory safety wins over cleanup if Windows/provider state is no longer observable.
         // The process will reclaim these objects; freeing them while I/O may still reference
         // them would be undefined behaviour.
@@ -706,7 +706,7 @@ impl RioTransport {
             {
                 self.pending.clear();
                 self.release_resources();
-                crate::trace::event("SHUTDOWN", "all generations drained");
+                crate::worker::trace::event("SHUTDOWN", "all generations drained");
                 return Ok(());
             }
             if started.elapsed() >= timeout {
@@ -754,7 +754,7 @@ impl Transport for RioTransport {
                 status: 0,
                 bytes: 0,
             });
-            crate::trace::event_args(
+            crate::worker::trace::event_args(
                 "CONNECT_POST",
                 format_args!("session={index} generation={generation} udp=1"),
             );
@@ -773,7 +773,7 @@ impl Transport for RioTransport {
         match result {
             Ok(_) => {
                 self.sessions[slot_index].connect_outstanding = true;
-                crate::trace::event_args(
+                crate::worker::trace::event_args(
                     "CONNECT_POST",
                     format_args!("session={index} generation={generation}"),
                 );
@@ -805,7 +805,7 @@ impl Transport for RioTransport {
             update_connect_context(slot.socket()?).map_err(stage)?;
         }
         slot.state = GenerationState::Active;
-        crate::trace::event_args(
+        crate::worker::trace::event_args(
             "CONNECT_COMPLETE",
             format_args!("session={index} generation={generation}"),
         );
@@ -854,7 +854,7 @@ impl Transport for RioTransport {
             return Err(error);
         }
         self.sessions[slot_index].send_outstanding += 1;
-        crate::trace::event_args(
+        crate::worker::trace::event_args(
             "SEND_POST",
             format_args!(
                 "session={index} generation={generation} slot={send_slot} bytes={bytes}"
@@ -899,7 +899,7 @@ impl Transport for RioTransport {
             .map_err(stage)?;
         self.sessions[slot_index].receive_outstanding = 1;
         self.sessions[slot_index].receive_posted_bytes = bytes;
-        crate::trace::event_args(
+        crate::worker::trace::event_args(
             "RECV_POST",
             format_args!("session={index} generation={generation} bytes={bytes}"),
         );
@@ -908,7 +908,7 @@ impl Transport for RioTransport {
 
     fn close(&mut self, index: u32) {
         if let Err(error) = self.begin_close(index) {
-            crate::trace::event("CLOSE_ERROR", &error);
+            crate::worker::trace::event("CLOSE_ERROR", &error);
         }
     }
 
@@ -999,6 +999,7 @@ mod tests {
         assert!(session.release_send_slot(slot).is_err());
     }
 }
+
 
 
 

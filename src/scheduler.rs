@@ -7,7 +7,7 @@
 
 use crate::metrics::Statistics;
 use crate::session::{ReceiveOutcome, Session, SessionState};
-use crate::timer::TimerHeap;
+use crate::worker::timer::TimerHeap;
 use crate::types::{Options, Protocol};
 
 const GENERATION_DRAIN_GRACE_MS: u64 = 5_000;
@@ -387,11 +387,11 @@ impl Scheduler {
 
         match outcome {
             ReceiveOutcome::Partial => {
-                crate::trace::event_args("RECV_PARTIAL", format_args!("session={index}"));
+                crate::worker::trace::event_args("RECV_PARTIAL", format_args!("session={index}"));
                 self.top_up(index, now)
             }
             ReceiveOutcome::Verified => {
-                crate::trace::event_args("RECV_COMPLETE", format_args!("session={index}"));
+                crate::worker::trace::event_args("RECV_COMPLETE", format_args!("session={index}"));
                 self.statistics.echoes = self.statistics.echoes.saturating_add(1);
                 self.top_up(index, now)
             }
@@ -408,7 +408,7 @@ impl Scheduler {
         if slot >= self.sessions.len() || self.sessions[slot].is_finished() {
             return Vec::new();
         }
-        crate::trace::event_args("RECV_CORRUPT", format_args!("session={index}"));
+        crate::worker::trace::event_args("RECV_CORRUPT", format_args!("session={index}"));
         self.statistics.corrupted = self.statistics.corrupted.saturating_add(1);
         let lost = match self.inflight_echoes(slot) {
             Some(inflight) => inflight.max(1),
@@ -553,7 +553,7 @@ impl Scheduler {
                 }
                 SessionState::Closing => {
                     if self.sessions[slot].deadline.is_some_and(|at| now >= at) {
-                        crate::trace::event_args(
+                        crate::worker::trace::event_args(
                             "GENERATION_DRAIN_TIMEOUT",
                             format_args!("session={index}"),
                         );
@@ -721,4 +721,5 @@ mod tests {
         assert!(scheduler.statistics.fatal);
     }
 }
+
 
