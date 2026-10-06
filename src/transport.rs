@@ -30,7 +30,7 @@ use crate::native::{
 use crate::cec_engine_internal::overlapped::PendingOverlapped;
 use crate::cec_engine_internal::rio::{CompletionPort, CompletionQueue, RequestQueue};
 use crate::types::{Options, Protocol};
-use crate::cec_engine::{Completion, Transport};
+use crate::engine::{Completion, Transport};
 
 pub const MAX_RECEIVE: u32 = 1;
 pub const COMPLETION_BATCH_SIZE: usize = 256;
@@ -999,5 +999,6 @@ mod tests {
         assert!(session.release_send_slot(slot).is_err());
     }
 }
+
 
 
