@@ -3,7 +3,8 @@ use std::process::ExitCode as ProcessExitCode;
 use cec::clock::RioClock;
 use cec::contract::parse;
 use cec::native::Winsock;
-use cec::payload::{Statistics, build, validate_payload};
+use cec::metrics::Statistics;
+use cec::payload::{build, validate_payload};
 use cec::transport::RioTransport;
 use cec::types::{ExitCode, Options, Protocol};
 use cec::engine::{StopFlag, Worker};
@@ -301,3 +302,4 @@ mod tests {
         assert_eq!(worker_memory_share(1_000, 0, 10), 0);
     }
 }
+
