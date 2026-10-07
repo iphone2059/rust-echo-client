@@ -398,7 +398,11 @@ impl Worker {
             if self.report_seconds != 0 && !self.quiet {
                 let reported_at = clock.now_milliseconds();
                 if reported_at >= self.next_report {
-                    println!("{}", self.scheduler.statistics().line("final"));
+                    // The periodic report uses the terminal line's schema, so the live counters are
+                    // read from the scheduler at the moment of the report.
+                    let sessions = self.scheduler.sessions().len() as u32;
+                    let active = self.scheduler.sessions().iter().filter(|s| !s.is_finished()).count() as u32;
+                    println!("{}", self.scheduler.statistics().line("final", sessions, active));
                     self.next_report = reported_at
                         .saturating_add(u64::from(self.report_seconds).saturating_mul(1_000));
                 }
@@ -604,6 +608,5 @@ mod tests {
 // The worker owns the IOCP loop, the RIONotify lifecycle, the timer wheel and the trace helpers.
 pub mod timer;
 pub mod trace;
-
 
 

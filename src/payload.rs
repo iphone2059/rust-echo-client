@@ -68,6 +68,7 @@ pub fn verify_echo(echoed: &[u8], pattern: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::metrics::Statistics;
+    use crate::types::ExitCode;
 
     use super::*;
     use crate::contract::parse;
@@ -149,6 +150,6 @@ mod tests {
         assert_eq!(merged.echoes, 3);
         assert_eq!(merged.sent_bytes, 8);
         assert!(merged.fatal);
-        assert!(merged.line("worker 0").starts_with("worker 0 echoed=3 "));
+        assert!(merged.line("worker 0", 1, 0).starts_with("worker 0 elapsed_ms=0 sessions=1 "));
     }
 }

@@ -245,9 +245,21 @@ pub fn run(options: &Options) -> ExitCode {
     if unclaimed != 0 {
         statistics.lost = statistics.lost.saturating_add(unclaimed);
     }
+    // A controlled stop cancels the attempts that were claimed and never finished; they are neither
+    // echoes nor losses, which is what the reference reports as cancelled.
+    if all_controlled {
+        let unfinished = statistics.attempted.saturating_sub(
+            statistics
+                .echoes
+                .saturating_add(statistics.corrupted)
+                .saturating_add(statistics.lost),
+        );
+        statistics.cancelled = statistics.cancelled.saturating_add(unfinished);
+    }
 
     if options.stats {
-        println!("{}", statistics.line("final"));
+        // Every worker has joined, so no session is live when the terminal line is printed.
+        println!("{}", statistics.line("final", options.session_count, 0));
     }
     if worker_panic || worker_spawn_error {
         ExitCode::Internal
