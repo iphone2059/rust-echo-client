@@ -4,7 +4,7 @@
 use crate::types::{ArgumentError, Options, Pattern, MAXIMUM_TCP_BATCH_BYTES, MAXIMUM_UDP_PAYLOAD_BYTES};
 
 /// The default payload of the baseline: the literal text below, sent as ASCII.
-pub const DEFAULT_TEXT_PREFIX: &str = "C++ echo from ";
+pub const DEFAULT_TEXT_PREFIX: &str = "echo from ";
 
 /// Builds the payload for a session. Sizes are validated here as well as in the parser so
 /// a caller that builds options by hand cannot smuggle an impossible payload in.
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn default_payload_matches_the_baseline_text() {
         let built = build(&options(&["127.0.0.1", "/p", "tcp"])).expect("payload");
-        assert_eq!(String::from_utf8(built).unwrap(), "C++ echo from 127.0.0.1");
+        assert_eq!(String::from_utf8(built).unwrap(), "echo from 127.0.0.1");
     }
 
     #[test]
