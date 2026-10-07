@@ -19,7 +19,7 @@ pub enum ExitCode {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pattern {
-    /// "C++ echo from <host>" (the baseline default payload).
+    /// "echo from <host>" (the baseline default payload).
     DefaultText,
     LiteralText,
     BinaryCounter,
