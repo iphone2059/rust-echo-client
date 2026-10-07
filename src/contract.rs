@@ -259,13 +259,13 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     if options.help {
         return Ok(options);
     }
-    if options.protocol == Protocol::None {
-        return Err(ArgumentError("missing /p tcp or /p udp".to_string()));
-    }
+    // The baseline reports the missing target first and the missing protocol second, so a bare
+    // invocation and a host-only invocation produce different diagnostics.
     if options.host.is_empty() {
-        return Err(ArgumentError(
-            "client requires exactly one valid target host".to_string(),
-        ));
+        return Err(ArgumentError("missing-target".to_string()));
+    }
+    if options.protocol == Protocol::None {
+        return Err(ArgumentError("missing-protocol".to_string()));
     }
     if options.host.parse::<std::net::Ipv4Addr>().is_err() {
         return Err(ArgumentError(
