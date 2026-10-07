@@ -187,6 +187,7 @@ impl Scheduler {
         flow.requested = requested;
         flow.sends_in_flight = sends;
         flow.started = true;
+        self.statistics.attempted = self.statistics.attempted.saturating_add(1);
         steps.push(Step::Send(index));
         true
     }
@@ -721,5 +722,4 @@ mod tests {
         assert!(scheduler.statistics.fatal);
     }
 }
-
 

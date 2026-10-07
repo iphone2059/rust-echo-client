@@ -16,6 +16,11 @@ pub struct Statistics {
     pub received_bytes: u64,
     pub corrupted: u64,
     pub lost: u64,
+    /// Attempts the scheduler claimed. The identity is attempted = pending + echoed + corrupted
+    /// + lost + cancelled, exactly as the reference reports it.
+    pub attempted: u64,
+    /// Attempts that were claimed but never finished when the run stopped under control.
+    pub cancelled: u64,
     pub connections: u64,
     pub reconnects: u64,
     /// Sessions that permanently ended because a transport generation could not recover.
@@ -37,6 +42,8 @@ impl Default for Statistics {
             received_bytes: 0,
             corrupted: 0,
             lost: 0,
+            attempted: 0,
+            cancelled: 0,
             connections: 0,
             reconnects: 0,
             network_failures: 0,
@@ -58,6 +65,8 @@ impl Statistics {
         self.received_bytes = self.received_bytes.saturating_add(other.received_bytes);
         self.corrupted = self.corrupted.saturating_add(other.corrupted);
         self.lost = self.lost.saturating_add(other.lost);
+        self.attempted = self.attempted.saturating_add(other.attempted);
+        self.cancelled = self.cancelled.saturating_add(other.cancelled);
         self.connections = self.connections.saturating_add(other.connections);
         self.reconnects = self.reconnects.saturating_add(other.reconnects);
         self.network_failures = self.network_failures.saturating_add(other.network_failures);
@@ -148,21 +157,36 @@ impl Statistics {
         )
     }
 
-    /// One stats line per worker plus a total, mirroring the shape of the baseline report.
-    pub fn line(&self, label: &str) -> String {
+    /// The terminal line. Its fields, their order and their separators are the baseline's, so a run
+    /// can be compared across ports by reading the line alone. Pending is derived, because an attempt
+    /// is pending exactly while it has been claimed and has not reached a terminal state.
+    pub fn line(&self, label: &str, sessions: u32, active: u32) -> String {
+        let terminal = self
+            .echoes
+            .saturating_add(self.corrupted)
+            .saturating_add(self.lost)
+            .saturating_add(self.cancelled);
+        let pending = self.attempted.saturating_sub(terminal);
         format!(
-            "{} echoed={} sent={} bytes={} corrupted={} lost={} connections={} reconnects={} network_errors={} \
-elapsed_ms={} echo_per_sec={:.2} MiB_per_sec={:.2} p50_us~{} p99_us~{} p999_us~{} mean_us~{} max_us~{} latency_sample=fifo_echo",
+            "{} elapsed_ms={} sessions={} active={} attempted={} pending={} echoed={} corrupted={} lost={} cancelled={} \
+sent_bytes={} received_bytes={} bytes={} connections={} reconnects={} network_errors={} echo_per_sec={:.2} MiB_per_sec={:.2} \
+p50_us~{} p99_us~{} p999_us~{} mean_us={} max_us~{} latency_sample=batch",
             label,
+            self.elapsed_milliseconds,
+            sessions,
+            active,
+            self.attempted,
+            pending,
             self.echoes,
-            self.sent_bytes,
-            self.received_bytes,
             self.corrupted,
             self.lost,
+            self.cancelled,
+            self.sent_bytes,
+            self.received_bytes,
+            self.received_bytes,
             self.connections,
             self.reconnects,
             self.network_failures,
-            self.elapsed_milliseconds,
             self.echo_per_second(),
             self.mib_per_second(),
             self.percentile(50, 100),
