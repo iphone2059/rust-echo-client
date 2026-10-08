@@ -30,12 +30,29 @@ pub fn binary_counter(length: u32) -> Result<Vec<u8>, ArgumentError> {
     Ok((0..length).map(|index| index as u8).collect())
 }
 
-/// Printable counter: a repeating 'a'..'z' cycle, so captures stay readable in logs.
+/// Printable counter: the reference's CEC printable pattern, which is a stream of nine-byte records.
+/// Each record is eight decimal digits holding the record number, followed by a space, so /zt 9 is
+/// "00000000 " and /zt 18 is "00000000 00000001 ". The bytes are what a peer sees, so this has to
+/// match the reference exactly rather than merely look readable.
 pub fn printable_counter(length: u32) -> Result<Vec<u8>, ArgumentError> {
     if length == 0 || u64::from(length) > MAXIMUM_UDP_PAYLOAD_BYTES.max(MAXIMUM_TCP_BATCH_BYTES) {
         return Err(ArgumentError("printable payload length out of range".to_string()));
     }
-    Ok((0..length).map(|index| b'a' + (index % 26) as u8).collect())
+    let mut bytes = Vec::with_capacity(length as usize);
+    for index in 0..length as usize {
+        let record_offset = index % 9;
+        if record_offset == 8 {
+            bytes.push(b' ');
+            continue;
+        }
+        let record = index / 9;
+        let mut divisor = 10_000_000usize;
+        for _ in 0..record_offset {
+            divisor /= 10;
+        }
+        bytes.push(b'0' + ((record / divisor) % 10) as u8);
+    }
+    Ok(bytes)
 }
 
 /// The transport limits that apply to one payload, before any session is created.
@@ -93,9 +110,13 @@ mod tests {
         assert_eq!(binary[255], 255);
         assert_eq!(binary[256], 0);
         let printable = printable_counter(30).expect("printable");
-        assert_eq!(printable[0], b'a');
-        assert_eq!(printable[25], b'z');
-        assert_eq!(printable[26], b'a');
+        // The reference pattern: records of eight decimal digits and a space, counting from zero.
+        assert_eq!(printable[0], b'0');
+        assert_eq!(printable[7], b'0');
+        assert_eq!(printable[8], b' ');
+        assert_eq!(printable[9], b'0');
+        assert_eq!(printable[17], b' ');
+        assert_eq!(printable[18], b'0');
         assert!(binary_counter(0).is_err());
         assert!(printable_counter(0).is_err());
     }
