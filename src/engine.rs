@@ -7,7 +7,7 @@ use crate::native::Winsock;
 use crate::metrics::Statistics;
 use crate::payload::{build, validate_payload};
 use crate::session::transport::RioTransport;
-use crate::types::{ExitCode, Options, Protocol};
+use crate::types::{available_processors, resolved_worker_count, ExitCode, Options, Protocol};
 use crate::worker::{StopFlag, Worker};
 
 #[link(name = "Kernel32")]
@@ -49,12 +49,11 @@ impl Drop for ConsoleHandler {
 }
 
 fn partition(session_count: u32, worker_count: u32) -> Vec<u32> {
-    let workers = if worker_count == 0 {
-        session_count.min(32)
-    } else {
-        worker_count.min(session_count)
-    }
-    .max(1);
+    // The reference resolves /threads (or the automatic count) and then takes the smaller of that and
+    // the session count, so the shard the capacity rules compute is the one actually used.
+    let workers = resolved_worker_count(worker_count, available_processors())
+        .min(session_count)
+        .max(1);
     let base = session_count / workers;
     let extra = session_count % workers;
     (0..workers)
@@ -277,9 +276,19 @@ mod tests {
     use super::{partition, worker_memory_share};
 
     #[test]
+    fn worker_count_resolution_follows_the_reference() {
+        use crate::types::resolved_worker_count;
+        // An explicit /threads wins; the automatic count is the processor count clamped to [1, 64].
+        assert_eq!(resolved_worker_count(3, 8), 3);
+        assert_eq!(resolved_worker_count(0, 8), 8);
+        assert_eq!(resolved_worker_count(0, 0), 1);
+        assert_eq!(resolved_worker_count(0, 200), 64);
+    }
+
+    #[test]
     fn sessions_are_partitioned_evenly() {
-        assert_eq!(partition(1, 0), vec![1]);
-        assert_eq!(partition(10, 0), vec![1; 10]);
+        // Only explicit worker counts are asserted here: the automatic count depends on the machine, and
+        // the rule for it is pinned separately by worker_count_resolution.
         assert_eq!(partition(10, 3), vec![4, 3, 3]);
         assert_eq!(partition(9, 3), vec![3, 3, 3]);
         assert_eq!(partition(2, 8), vec![1, 1]);

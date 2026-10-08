@@ -94,3 +94,25 @@ impl Default for Options {
         }
     }
 }
+
+/// Automatic worker count is the active processor count, clamped to this cap, mirroring the
+/// reference's CEC_MAX_WORKERS.
+pub const AUTOMATIC_WORKER_CAP: u32 = 64;
+
+/// Resolves /threads, or the automatic count when it is absent, exactly like the reference: the
+/// processor count is clamped to [1, 64] and the caller then takes the smaller of that and the
+/// session count. The processor count is passed in so the rule is testable without the machine.
+pub fn resolved_worker_count(worker_count: u32, processors: u32) -> u32 {
+    if worker_count != 0 {
+        return worker_count;
+    }
+    processors.clamp(1, AUTOMATIC_WORKER_CAP)
+}
+
+/// Active processors. The reference asks GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); this asks the
+/// standard library, which is affinity-aware, so the two can differ on a machine that pins threads.
+pub fn available_processors() -> u32 {
+    std::thread::available_parallelism()
+        .map(|count| count.get() as u32)
+        .unwrap_or(1)
+}

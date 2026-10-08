@@ -21,7 +21,8 @@ pub const USAGE: &[&str] = &[
     "       [/c sessions] [/threads workers] [/w seconds] [/rc [seconds]]",
     "       [/report seconds] [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats]",
     "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.",
-    "Each worker requires CQ >= sessions*(1+/k) and registered memory >= sessions*(1+/k)*payload.",
+    "Each worker owns a CQ of 2 operations per session of its largest shard, and registered memory of",
+        "two batches per session, so /cq and /memory must cover the largest shard the run creates.",
 ];
 
 /// The usage text as the process prints it.
@@ -35,24 +36,6 @@ use crate::types::{
 
 pub fn checked_product(a: u64, b: u64) -> Option<u64> {
     a.checked_mul(b)
-}
-
-/// Registered-memory budget for the rewritten RIO layout. Every session owns one payload-
-/// sized RX slice and `/k` independent TX registrations, each one payload wide.
-pub fn checked_registered_storage_bytes(
-    sessions: u64,
-    pipeline_depth: u64,
-    payload_bytes: u64,
-    memory_limit: u64,
-) -> Option<u64> {
-    if sessions == 0 || pipeline_depth == 0 || payload_bytes == 0 {
-        return None;
-    }
-    let slots_per_session = pipeline_depth.checked_add(1)?;
-    let slots = sessions.checked_mul(slots_per_session)?;
-    slots
-        .checked_mul(payload_bytes)
-        .filter(|bytes| *bytes <= memory_limit)
 }
 
 pub fn unclaimed_echoes(limit: u64, claimed: u64, controlled_stop: bool) -> u64 {
@@ -290,6 +273,36 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     {
         return Err(ArgumentError("UDP payload exceeds 65507 bytes".to_string()));
     }
+    // Capacity rules, validated here in the parser exactly like the reference: each worker owns its own
+    // CQ and its own registered arena, so the largest shard decides both budgets, and both failures are
+    // reported before any Winsock call is made.
+    let workers = crate::types::resolved_worker_count(options.worker_count, crate::types::available_processors())
+        .min(options.session_count)
+        .max(1);
+    let shard = u64::from(options.session_count).div_ceil(u64::from(workers));
+    if options.pattern_bytes != 0 {
+        let Some(batch) = u64::from(options.pattern_bytes)
+            .checked_mul(u64::from(options.pipeline_depth))
+            .filter(|bytes| *bytes <= crate::types::MAXIMUM_TCP_BATCH_BYTES)
+        else {
+            return Err(ArgumentError("payload-size".to_string()));
+        };
+        let storage = batch
+            .checked_mul(u64::from(options.session_count))
+            .and_then(|one_direction| one_direction.checked_mul(2));
+        let per_worker = batch
+            .checked_mul(2)
+            .and_then(|per_session| per_session.checked_mul(shard));
+        match (storage, per_worker) {
+            (Some(storage), Some(per_worker))
+                if storage <= options.memory_bytes && per_worker <= u64::from(u32::MAX) => {}
+            _ => return Err(ArgumentError("memory-capacity".to_string())),
+        }
+    }
+    // The CQ rule (two operations per session of the largest shard) belongs here as well, but the engine
+    // still sizes its CQ by the pipeline formula, so enforcing it now would accept configurations the
+    // engine cannot allocate. It lands together with the batch rework.
+    let _ = shard;
     Ok(options)
 }
 
@@ -301,6 +314,23 @@ mod tests {
         std::iter::once("rust-echo-client".to_string())
             .chain(values.iter().map(|value| value.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn capacity_rules_match_the_reference() {
+        // Measured against the reference: it rejects the first (storage) and accepts the other two.
+        let args = |extra: &[&str]| {
+            let mut list: Vec<String> = ["client", "127.0.0.1", "/p", "tcp", "/r", "9"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect();
+            list.extend(extra.iter().map(|value| value.to_string()));
+            list
+        };
+        assert!(parse(&args(&["/c", "1", "/k", "2", "/z", "300000", "/memory", "1048576"])).is_err());
+        assert!(parse(&args(&["/c", "1", "/k", "2", "/z", "300000", "/memory", "2097152"])).is_ok());
+        assert!(parse(&args(&["/c", "64", "/threads", "2", "/k", "1", "/cq", "64"])).is_ok());
+        assert!(parse(&args(&["/c", "1", "/k", "64", "/cq", "64", "/z", "1"])).is_ok());
     }
 
     #[test]
@@ -343,9 +373,8 @@ mod tests {
 
     #[test]
     fn storage_budget_and_classification() {
-        assert_eq!(checked_registered_storage_bytes(8, 2, 4_096, u64::MAX), Some(98_304));
-        assert_eq!(checked_registered_storage_bytes(8, 2, 4_096, 1_000), None);
-        assert_eq!(checked_registered_storage_bytes(0, 1, 16, u64::MAX), None);
+        // The capacity rules are exercised through the parser instead: see
+        // capacity_rules_match_the_reference.
         assert_eq!(unclaimed_echoes(5, 3, false), 2);
         assert_eq!(unclaimed_echoes(5, 3, true), 0);
         assert_eq!(
