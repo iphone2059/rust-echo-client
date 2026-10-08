@@ -214,6 +214,9 @@ pub fn run(options: &Options) -> ExitCode {
     let mut statistics = Statistics::default();
     let mut all_controlled = true;
     let mut worker_panic = false;
+    // A worker that returns Err never reached a clean stop, so the run must not be classified from the
+    // statistics it left behind: those are partial and a controlled stop would otherwise look clean.
+    let mut worker_failure = false;
 
     // Always join every worker. Returning on the first failed handle would detach the rest
     // while they may still own sockets, RIO queues and registered memory. `run_worker`
@@ -227,6 +230,7 @@ pub fn run(options: &Options) -> ExitCode {
             }
             Ok(Err(reason)) => {
                 eprintln!("RIO worker failed: {reason}");
+                worker_failure = true;
                 StopFlag::request_global();
             }
             Err(_) => {
@@ -261,7 +265,7 @@ pub fn run(options: &Options) -> ExitCode {
         // Every worker has joined, so no session is live when the terminal line is printed.
         println!("{}", statistics.line("final", options.session_count, 0));
     }
-    if worker_panic || worker_spawn_error {
+    if worker_panic || worker_spawn_error || worker_failure {
         ExitCode::Internal
     } else {
         statistics.exit_code(all_controlled)
