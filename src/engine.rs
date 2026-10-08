@@ -125,40 +125,10 @@ pub fn run(options: &Options) -> ExitCode {
         eprintln!("Invalid payload: {}", error.0);
         return ExitCode::Usage;
     }
-    // Capacity is an argument property, not a run-time one: the request queues reserve their
-    // outstanding operations against the completion queue, and the registered arena holds one
-    // receive window per pipeline slot plus the shared send region. Both budgets are checked
-    // here so an impossible configuration fails as a usage error before any RIO object exists,
-    // which is the same contract the C++ client follows.
-    let slots_per_session = u64::from(options.pipeline_depth) + 1;
-    let required_operations = match u64::from(options.session_count).checked_mul(slots_per_session) {
-        Some(value) => value,
-        None => {
-            eprintln!("Invalid arguments: completion queue budget overflows");
-            return ExitCode::Usage;
-        }
-    };
-    if required_operations > u64::from(options.cq_capacity) {
-        eprintln!(
-            "Invalid arguments: completion queue holds {} entries but {} sessions reserve {}",
-            options.cq_capacity, options.session_count, required_operations
-        );
-        return ExitCode::Usage;
-    }
-    let required_memory = match required_operations.checked_mul(payload.len() as u64) {
-        Some(value) => value,
-        None => {
-            eprintln!("Invalid arguments: registered memory budget overflows");
-            return ExitCode::Usage;
-        }
-    };
-    if required_memory > options.memory_bytes {
-        eprintln!(
-            "Invalid arguments: registered memory needs {required_memory} bytes but /memory is {}",
-            options.memory_bytes
-        );
-        return ExitCode::Usage;
-    }
+    // Capacity is an argument property, not a run-time one: the parser has already validated the
+    // completion-queue and registered-memory budgets against the largest shard, and the transport
+    // re-checks its own arena size as a last line of defence. No usage diagnostic may be produced
+    // from here, because the reference reports both failures during argument parsing.
 
     StopFlag::clear_global();
     let _console_handler = match ConsoleHandler::install() {
@@ -244,9 +214,12 @@ pub fn run(options: &Options) -> ExitCode {
     // were asked for and never completed, so the shared classification reports an echo failure even
     // when the terminal cause was a worker or network failure. An unlimited run or a controlled stop
     // claims nothing extra.
-    let unclaimed = statistics.unclaimed(options.echo_count, all_controlled);
+    let unclaimed = statistics.unclaimed(options.echo_count, options.session_count, all_controlled);
     if unclaimed != 0 {
         statistics.lost = statistics.lost.saturating_add(unclaimed);
+        // The reference reports an echo that was asked for and never claimed as both lost and
+        // attempted, so attempted stays the size of the run the command line described.
+        statistics.attempted = statistics.attempted.saturating_add(unclaimed);
     }
     // A controlled stop cancels the attempts that were claimed and never finished; they are neither
     // echoes nor losses, which is what the reference reports as cancelled.
@@ -260,8 +233,10 @@ pub fn run(options: &Options) -> ExitCode {
         statistics.cancelled = statistics.cancelled.saturating_add(unfinished);
     }
 
-    if options.stats {
-        // Every worker has joined, so no session is live when the terminal line is printed.
+    // The reference prints the terminal line by default: /q suppresses it and /stats forces it,
+    // so /q /stats is exactly one line and neither switch is silent. Every worker has joined here,
+    // so no session is live when the line is printed.
+    if options.stats || !options.quiet {
         println!("{}", statistics.line("final", options.session_count, 0));
     }
     if worker_panic || worker_spawn_error || worker_failure {

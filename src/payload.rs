@@ -138,13 +138,13 @@ mod tests {
 
     #[test]
     fn statistics_classify_every_outcome() {
-        let mut statistics = Statistics { echoes: 5, ..Statistics::default() };
+        let mut statistics = Statistics { echoes: 5, attempted: 5, ..Statistics::default() };
         assert_eq!(statistics.exit_code(false), ExitCode::Success);
-        assert_eq!(statistics.unclaimed(5, false), 0);
-
-        statistics.echoes = 3;
-        assert_eq!(statistics.unclaimed(5, false), 2);
-        assert_eq!(statistics.unclaimed(5, true), 0);
+        // /n is a per-session quota, so one session with /n 5 has nothing left unclaimed.
+        assert_eq!(statistics.unclaimed(5, 1, false), 0);
+        // Four sessions asked for 20 echoes and only 5 were claimed.
+        assert_eq!(statistics.unclaimed(5, 4, false), 15);
+        assert_eq!(statistics.unclaimed(5, 4, true), 0);
 
         statistics.corrupted = 1;
         assert_eq!(statistics.exit_code(false), ExitCode::EchoFailure);

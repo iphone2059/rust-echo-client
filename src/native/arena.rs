@@ -254,6 +254,19 @@ impl Arena {
         Ok(view)
     }
 
+    /// A view of part of a slot, used to re-post the remainder of a partially completed send.
+    pub fn view_from(&self, slot: u32, offset: u32, length: u32) -> Result<RIO_BUF, NativeError> {
+        let mut view = self.view(slot, length)?;
+        if u64::from(offset).saturating_add(u64::from(length)) > u64::from(self.stride) {
+            return Err(NativeError {
+                stage: "registered arena view offset bounds",
+                code: 13,
+            });
+        }
+        view.Offset = view.Offset.wrapping_add(offset);
+        Ok(view)
+    }
+
     /// Reads bytes written by a completed receive. The caller must only call this after the
     /// corresponding completion has been dequeued and before that slot is reposted.
     pub fn read(&self, slot: u32, length: u32) -> &[u8] {

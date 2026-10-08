@@ -28,7 +28,7 @@ pub struct Session {
     pub index: u32,
     pub state: SessionState,
     pub echoes: u64,
-    /// Bytes already verified for the current echo unit.
+    /// Bytes already received for the attempt currently in flight.
     pub received: u32,
     /// Absolute operation deadline (connect or active I/O), if one is armed.
     pub deadline: Option<u64>,
@@ -129,14 +129,21 @@ impl Session {
         }
     }
 
-    pub fn receive_remaining(&self, payload_bytes: u32) -> Option<u32> {
-        payload_bytes.checked_sub(self.received).filter(|remaining| *remaining != 0)
+    /// Bytes of the current attempt still expected. The scheduler posts the remainder after a
+    /// partial receive, so the accumulator is per attempt rather than per echo unit.
+    pub fn receive_remaining(&self, attempt_bytes: u32) -> Option<u32> {
+        attempt_bytes.checked_sub(self.received).filter(|remaining| *remaining != 0)
     }
 
+    /// Validates received bytes against the attempt's expected payload. One attempt carries
+    /// `units` copies of `pattern`, so the expected byte at any offset is the pattern byte at
+    /// that offset modulo the pattern length. That keeps the comparison allocation-free while
+    /// still requiring the exact bytes at the exact offsets.
     pub fn on_received(
         &mut self,
         chunk: &[u8],
-        expected: &[u8],
+        pattern: &[u8],
+        units: u32,
         now: u64,
         timeout_ms: u64,
         allow_partial: bool,
@@ -151,18 +158,30 @@ impl Session {
                 ReceiveOutcome::Corrupted
             };
         }
-
+        if pattern.is_empty() || units == 0 {
+            return ReceiveOutcome::Corrupted;
+        }
+        let Some(total) = (pattern.len() as u64).checked_mul(u64::from(units)) else {
+            return ReceiveOutcome::Corrupted;
+        };
         let start = self.received as usize;
         let Some(end) = start.checked_add(chunk.len()) else {
             return ReceiveOutcome::Corrupted;
         };
-        if end > expected.len() || &expected[start..end] != chunk {
+        if end as u64 > total {
+            return ReceiveOutcome::Corrupted;
+        }
+        if chunk
+            .iter()
+            .enumerate()
+            .any(|(offset, byte)| *byte != pattern[(start + offset) % pattern.len()])
+        {
             return ReceiveOutcome::Corrupted;
         }
 
         self.received = end as u32;
-        if end == expected.len() {
-            self.echoes = self.echoes.saturating_add(1);
+        if end as u64 == total {
+            self.echoes = self.echoes.saturating_add(u64::from(units));
             self.received = 0;
             self.deadline = None;
             ReceiveOutcome::Verified
@@ -206,12 +225,12 @@ mod tests {
         session.begin_connect(0, 5_000);
         session.connected();
         assert_eq!(
-            session.on_received(b"abc", PAYLOAD, 1, 5_000, true),
+            session.on_received(b"abc", PAYLOAD, 1, 1, 5_000, true),
             ReceiveOutcome::Partial
         );
         assert_eq!(session.receive_remaining(PAYLOAD.len() as u32), Some(3));
         assert_eq!(
-            session.on_received(b"def", PAYLOAD, 2, 5_000, true),
+            session.on_received(b"def", PAYLOAD, 1, 2, 5_000, true),
             ReceiveOutcome::Verified
         );
         assert_eq!(session.echoes, 1);
@@ -223,7 +242,7 @@ mod tests {
         session.begin_connect(0, 5_000);
         session.connected();
         assert_eq!(
-            session.on_received(&[], PAYLOAD, 0, 5_000, true),
+            session.on_received(&[], PAYLOAD, 1, 0, 5_000, true),
             ReceiveOutcome::PeerClosed
         );
     }

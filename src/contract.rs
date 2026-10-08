@@ -21,8 +21,8 @@ pub const USAGE: &[&str] = &[
     "       [/c sessions] [/threads workers] [/w seconds] [/rc [seconds]]",
     "       [/report seconds] [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats]",
     "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.",
-    "Each worker owns a CQ of 2 operations per session of its largest shard, and registered memory of",
-        "two batches per session, so /cq and /memory must cover the largest shard the run creates.",
+    "One attempt is one receive plus one send whatever /k is, so each worker's CQ reserves two",
+    "operations per session of its largest shard and two batches of registered memory per session.",
 ];
 
 /// The usage text as the process prints it.
@@ -98,10 +98,12 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         let token = arguments[index].clone();
         index += 1;
         let Some(offset) = switch_offset(&token) else {
-            if !options.host.is_empty() || token.is_empty() {
-                return Err(ArgumentError(
-                    "client requires exactly one valid target host".to_string(),
-                ));
+            if !options.host.is_empty() {
+                // A second positional is its own contract violation in the reference.
+                return Err(ArgumentError("unexpected-target".to_string()));
+            }
+            if token.is_empty() {
+                return Err(ArgumentError("target host is empty".to_string()));
             }
             if token.len() >= 256 {
                 return Err(ArgumentError("target host is too long".to_string()));
@@ -239,18 +241,22 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     if options.protocol == Protocol::Udp && options.pipeline_depth != 1 {
         return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
     }
-    if options.help {
-        return Ok(options);
+    // The worker split is validated before the mandatory arguments, which is why
+    // `/c 1 /threads 2` reports out-of-range and not missing-target.
+    if options.worker_count > options.session_count {
+        return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
     }
+    // /h suppresses only the two mandatory-argument checks. Every other rule, including the
+    // capacity budgets, still applies exactly as it does without /h.
     // The baseline reports the missing target first and the missing protocol second, so a bare
     // invocation and a host-only invocation produce different diagnostics.
-    if options.host.is_empty() {
+    if !options.help && options.host.is_empty() {
         return Err(ArgumentError("missing-target".to_string()));
     }
-    if options.protocol == Protocol::None {
+    if !options.help && options.protocol == Protocol::None {
         return Err(ArgumentError("missing-protocol".to_string()));
     }
-    if options.host.parse::<std::net::Ipv4Addr>().is_err() {
+    if !options.help && options.host.parse::<std::net::Ipv4Addr>().is_err() {
         return Err(ArgumentError(
             "target must be an IPv4 address literal".to_string(),
         ));
@@ -269,9 +275,26 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             "TCP fixed local port does not allow /rc".to_string(),
         ));
     }
-    if options.protocol == Protocol::Udp && u64::from(options.pattern_bytes) > MAXIMUM_UDP_PAYLOAD_BYTES
-    {
+    // The effective payload length is known before any session exists: the counter payloads carry
+    // their own /z or /zt length, while the literal and default texts are measured in UTF-8 bytes
+    // exactly as the reference measures them through WideCharToMultiByte.
+    let pattern_bytes = match options.pattern {
+        Pattern::BinaryCounter | Pattern::PrintableCounter => u64::from(options.pattern_bytes),
+        Pattern::LiteralText => options.literal_pattern.len() as u64,
+        Pattern::DefaultText => {
+            if options.host.is_empty() {
+                0
+            } else {
+                (crate::payload::DEFAULT_TEXT_PREFIX.len() + options.host.len()) as u64
+            }
+        }
+    };
+    if options.protocol == Protocol::Udp && pattern_bytes > MAXIMUM_UDP_PAYLOAD_BYTES {
         return Err(ArgumentError("UDP payload exceeds 65507 bytes".to_string()));
+    }
+    // Nothing else can be validated without a protocol, which is how /h alone succeeds.
+    if options.protocol == Protocol::None {
+        return Ok(options);
     }
     // Capacity rules, validated here in the parser exactly like the reference: each worker owns its own
     // CQ and its own registered arena, so the largest shard decides both budgets, and both failures are
@@ -280,8 +303,8 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         .min(options.session_count)
         .max(1);
     let shard = u64::from(options.session_count).div_ceil(u64::from(workers));
-    if options.pattern_bytes != 0 {
-        let Some(batch) = u64::from(options.pattern_bytes)
+    if pattern_bytes != 0 {
+        let Some(batch) = pattern_bytes
             .checked_mul(u64::from(options.pipeline_depth))
             .filter(|bytes| *bytes <= crate::types::MAXIMUM_TCP_BATCH_BYTES)
         else {
@@ -299,10 +322,12 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             _ => return Err(ArgumentError("memory-capacity".to_string())),
         }
     }
-    // The CQ rule (two operations per session of the largest shard) belongs here as well, but the engine
-    // still sizes its CQ by the pipeline formula, so enforcing it now would accept configurations the
-    // engine cannot allocate. It lands together with the batch rework.
-    let _ = shard;
+    // One attempt is one receive plus one send whatever /k is, so the largest shard reserves exactly
+    // two operations per session against the completion queue.
+    match shard.checked_mul(2) {
+        Some(reserved) if reserved <= u64::from(options.cq_capacity) => {}
+        _ => return Err(ArgumentError("cq-capacity".to_string())),
+    }
     Ok(options)
 }
 

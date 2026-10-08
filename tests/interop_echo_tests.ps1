@@ -16,8 +16,10 @@ if (-not (Test-Path -LiteralPath $client)) { throw "client binary missing: $clie
 if (-not (Test-Path -LiteralPath $ServerPath)) { throw "server binary missing: $ServerPath" }
 
 if ($UdpPort -eq 0) { $UdpPort = $Port + 1 }
-$server = Start-Process -FilePath $ServerPath -ArgumentList '/p', 'tcp', '/s', "$Port", '/w', '120' -PassThru -WindowStyle Hidden
-$udpServer = Start-Process -FilePath $ServerPath -ArgumentList '/p', 'udp', '/s', "$UdpPort", '/w', '120' -PassThru -WindowStyle Hidden
+# -NoNewWindow keeps the launch on CreateProcess. WindowStyle/ShellExecute would route the
+# server through the shell and can raise a SmartScreen prompt for a freshly built binary.
+$server = Start-Process -FilePath $ServerPath -ArgumentList '/p', 'tcp', '/s', "$Port", '/w', '120' -PassThru -NoNewWindow
+$udpServer = Start-Process -FilePath $ServerPath -ArgumentList '/p', 'udp', '/s', "$UdpPort", '/w', '120' -PassThru -NoNewWindow
 try {
     Start-Sleep -Seconds 1
     $cases = @(
@@ -41,7 +43,8 @@ try {
         for ($attempt = 1; $attempt -le 3 -and -not $accepted; $attempt++) {
             $output = & $client @($case.Arguments) 2>&1
             $code = $LASTEXITCODE
-            $line = ($output | Where-Object { $_ -match '^client ' } | Select-Object -First 1)
+            # The terminal line is the reference's: it starts with "final " and carries the whole schema.
+            $line = ($output | Where-Object { $_ -match '^final ' } | Select-Object -First 1)
             $accepted = ($code -eq 0) -and $line -and
                 ($line -match ("echoed=" + $case.Echoes + " ")) -and
                 ($line -match 'corrupted=0') -and ($line -match 'lost=0 ')

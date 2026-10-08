@@ -275,7 +275,10 @@ impl Worker {
                 self.scheduler.on_connected(completion.index, now)
             }
             Operation::Send => {
-                if completion.bytes != self.payload_bytes {
+                // The transport re-posts the remainder of a partial native send, so a send
+                // completion always covers the whole attempt it was posted for.
+                let expected = self.scheduler.batch_bytes(completion.index);
+                if completion.bytes != expected {
                     crate::worker::trace::event_args(
                         "SHORT_SEND",
                         format_args!(
@@ -283,7 +286,7 @@ impl Worker {
                             completion.index,
                             completion.generation,
                             completion.bytes,
-                            self.payload_bytes
+                            expected
                         ),
                     );
                     outcome.failures = outcome.failures.saturating_add(1);
@@ -449,8 +452,8 @@ impl Worker {
         let mut failed_session: Option<u32> = None;
         for (position, step) in steps.iter().enumerate() {
             let step_index = match *step {
-                Step::Connect(index) | Step::Send(index) | Step::Close(index) => index,
-                Step::Receive { index, .. } => index,
+                Step::Connect(index) | Step::Close(index) => index,
+                Step::Send { index, .. } | Step::Receive { index, .. } => index,
             };
             if failed_session == Some(step_index) {
                 crate::worker::trace::event_args("STEP_SKIPPED_AFTER_FAILURE", format_args!("{step:?}"));
@@ -459,7 +462,7 @@ impl Worker {
 
             let result = match *step {
                 Step::Connect(index) => transport.connect(index),
-                Step::Send(index) => transport.send(index, self.payload_bytes),
+                Step::Send { index, bytes } => transport.send(index, bytes),
                 Step::Receive { index, bytes } => transport.receive(index, bytes),
                 Step::Close(index) => {
                     transport.close(index);
@@ -472,7 +475,7 @@ impl Worker {
                 Ok(()) => {
                     outcome.steps = outcome.steps.saturating_add(1);
                     crate::worker::trace::event_args("STEP_OK", format_args!("{step:?}"));
-                    if let Step::Send(index) = *step {
+                    if let Step::Send { index, .. } = *step {
                         if let Some(queue) = self.sent_at.get_mut(index as usize) {
                             queue.push_back(Instant::now());
                         }
@@ -489,8 +492,8 @@ impl Worker {
                     // successful posts remain counted and will be retired by completion.
                     for pending in &steps[position..] {
                         let pending_index = match *pending {
-                            Step::Connect(index) | Step::Send(index) | Step::Close(index) => index,
-                            Step::Receive { index, .. } => index,
+                            Step::Connect(index) | Step::Close(index) => index,
+                            Step::Send { index, .. } | Step::Receive { index, .. } => index,
                         };
                         if pending_index == step_index {
                             self.scheduler.rollback_unposted_step(*pending);

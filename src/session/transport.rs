@@ -59,6 +59,11 @@ struct SessionTransport {
     connect_outstanding: bool,
     send_outstanding: u32,
     receive_outstanding: u32,
+    /// Native TX slot and byte range of the send currently outstanding. A partial completion
+    /// re-posts the remainder of the same slot, so one attempt stays one outstanding RIOSend.
+    send_slot: u32,
+    send_posted_bytes: u32,
+    send_offset: u32,
     /// Exact length of the one posted RIOReceive; zero when no receive is outstanding.
     receive_posted_bytes: u32,
     socket: Option<SocketOwner>,
@@ -78,6 +83,9 @@ impl SessionTransport {
             connect_outstanding: false,
             send_outstanding: 0,
             receive_outstanding: 0,
+            send_slot: 0,
+            send_posted_bytes: 0,
+            send_offset: 0,
             receive_posted_bytes: 0,
             socket: None,
             request_queue: None,
@@ -144,6 +152,9 @@ impl SessionTransport {
         if self.receive_posted_bytes != 0 {
             return Err("generation drained with a stale receive length".to_string());
         }
+        if self.send_posted_bytes != 0 || self.send_offset != 0 {
+            return Err("generation drained with a stale send range".to_string());
+        }
         if self.overlapped.is_armed() {
             return Err("generation drained while ConnectEx OVERLAPPED is armed".to_string());
         }
@@ -173,8 +184,11 @@ pub struct RioTransport {
     send_buffer_bytes: u32,
     receive_buffer_bytes: u32,
     local_port: u16,
+    /// Outstanding sends one session may have. The reference holds exactly one, because an
+    /// attempt is a single native operation that carries the whole batch.
     max_send: u32,
-    payload_bytes: u32,
+    /// Registered bytes one attempt occupies: the payload repeated `batch_capacity` times.
+    batch_bytes: u32,
     shutdown_started: bool,
     resources_leaked: bool,
 }
@@ -191,12 +205,25 @@ impl RioTransport {
         }
         let payload_bytes = u32::try_from(payload.len())
             .map_err(|_| "payload is too large for a RIO_BUF".to_string())?;
-        let max_send = options.pipeline_depth.max(1);
+        // One attempt is one send plus one receive, whatever /k is: /k is the number of echo
+        // units an attempt carries, not the number of concurrent operations. UDP never batches.
+        let batch_capacity = if options.protocol == Protocol::Tcp {
+            options.pipeline_depth.max(1)
+        } else {
+            1
+        };
+        let max_send = 1u32;
+        let batch_bytes = u32::try_from(
+            u64::from(payload_bytes)
+                .checked_mul(u64::from(batch_capacity))
+                .ok_or_else(|| "attempt batch size overflow".to_string())?,
+        )
+        .map_err(|_| "attempt batch exceeds a RIO buffer".to_string())?;
         if u64::from(session_count) > u64::from(MAXIMUM_SESSION_INDEX) + 1 {
             return Err("session count exceeds request-context capacity".to_string());
         }
         if u64::from(max_send) > u64::from(MAXIMUM_SEND_SLOT) + 1 {
-            return Err("pipeline depth exceeds request-context send-slot capacity".to_string());
+            return Err("request-context send-slot capacity is too small".to_string());
         }
         if options.cq_capacity == 0 {
             return Err("completion queue capacity must be non-zero".to_string());
@@ -205,8 +232,8 @@ impl RioTransport {
         let probe = registered_socket(options.protocol).map_err(stage)?;
         let rio = RioFunctions::load(probe.raw()).map_err(stage)?;
 
-        // RQ reservations are charged against the shared CQ. With one receive and /k sends
-        // per session the sum is exact, not an estimate.
+        // RQ reservations are charged against the shared CQ. One receive plus one send per
+        // session makes the sum exact, not an estimate.
         let per_session = u64::from(MAX_RECEIVE)
             .checked_add(u64::from(max_send))
             .ok_or_else(|| "request queue reservation overflow".to_string())?;
@@ -215,19 +242,17 @@ impl RioTransport {
             .ok_or_else(|| "completion queue reservation overflow".to_string())?;
         if required_cq > u64::from(options.cq_capacity) {
             return Err(format!(
-                "completion queue capacity {} is smaller than the {required_cq} entries reserved by {session_count} sessions at /k {max_send}",
+                "completion queue capacity {} is smaller than the {required_cq} entries reserved by {session_count} sessions",
                 options.cq_capacity
             ));
         }
 
-        let send_slots = u64::from(session_count)
-            .checked_mul(u64::from(max_send))
-            .ok_or_else(|| "send slot count overflow".to_string())?;
+        // One registered window per session in each direction, each the size of a full attempt.
         let receive_bytes = u64::from(session_count)
-            .checked_mul(u64::from(payload_bytes))
+            .checked_mul(u64::from(batch_bytes))
             .ok_or_else(|| "receive arena size overflow".to_string())?;
-        let send_bytes = send_slots
-            .checked_mul(u64::from(payload_bytes))
+        let send_bytes = u64::from(session_count)
+            .checked_mul(u64::from(batch_bytes))
             .ok_or_else(|| "send arena size overflow".to_string())?;
         let required_memory = receive_bytes
             .checked_add(send_bytes)
@@ -237,8 +262,6 @@ impl RioTransport {
                 "RIO registered memory needs {required_memory} bytes (RX {receive_bytes} + TX {send_bytes}) but this worker budget is {memory_bytes}"
             ));
         }
-        let send_slots_u32 = u32::try_from(send_slots)
-            .map_err(|_| "too many TX slots for the registered arena".to_string())?;
 
         // Local declaration order is chosen for the constructor-error path too: Rust drops
         // locals in reverse order, giving CQ -> IOCP -> notification OVERLAPPED if anything
@@ -254,10 +277,17 @@ impl RioTransport {
         )
         .map_err(stage)?;
 
-        // RX sessions use disjoint slices of aggregated registrations; each concurrent TX
-        // slot has its own RIO_BUFFERID. The latter is required by the RIOSend buffer rules.
-        let receive_arena = Arena::create_receive(&rio, session_count, payload_bytes).map_err(stage)?;
-        let send_arena = Arena::create_send(&rio, send_slots_u32, &payload).map_err(stage)?;
+        // RX sessions use disjoint slices of aggregated registrations; each session's TX
+        // window has its own RIO_BUFFERID. The latter is required by the RIOSend buffer rules.
+        // A TX window holds the pattern repeated to the full attempt length, so the shorter
+        // final attempt of a finite quota is simply a shorter view of the same bytes.
+        let mut send_pattern = Vec::with_capacity(batch_bytes as usize);
+        for _ in 0..batch_capacity {
+            send_pattern.extend_from_slice(&payload);
+        }
+        let receive_arena =
+            Arena::create_receive(&rio, session_count, batch_bytes).map_err(stage)?;
+        let send_arena = Arena::create_send(&rio, session_count, &send_pattern).map_err(stage)?;
         let target = ipv4_endpoint(&options.host, options.remote_port).map_err(stage)?;
         let sessions = (0..session_count)
             .map(|_| SessionTransport::new(target, max_send))
@@ -284,7 +314,7 @@ impl RioTransport {
             receive_buffer_bytes: options.socket_buffer_bytes,
             local_port: options.local_port,
             max_send,
-            payload_bytes,
+            batch_bytes,
             shutdown_started: false,
             resources_leaked: false,
         })
@@ -520,8 +550,48 @@ impl RioTransport {
                 if session.send_outstanding == 0 {
                     return Err("send completion arrived with no send outstanding".to_string());
                 }
-                session.release_send_slot(context.slot)?;
                 session.send_outstanding -= 1;
+                // A native send may complete with a strict prefix. The reference re-posts the
+                // remainder of the same attempt, so the scheduler sees exactly one send
+                // completion per attempt and the request queue never exceeds one send.
+                let remainder = if status == 0 && !closing && bytes != 0 {
+                    let offset = session.send_offset.saturating_add(bytes);
+                    (offset < session.send_posted_bytes)
+                        .then_some((session.send_slot, offset, session.send_posted_bytes - offset))
+                } else {
+                    None
+                };
+                if let Some((send_slot, offset, remaining)) = remainder {
+                    let global_slot = self.tx_global_slot(context.index, send_slot)?;
+                    let buffer = self
+                        .send_arena
+                        .as_ref()
+                        .ok_or_else(|| "send arena is unavailable".to_string())?
+                        .view_from(global_slot, offset, remaining)
+                        .map_err(stage)?;
+                    self.sessions[slot_index]
+                        .queue()?
+                        .send(
+                            &self.rio,
+                            &buffer,
+                            encode_context(context.index, context.generation, send_slot, Operation::Send),
+                        )
+                        .map_err(stage)?;
+                    let slot = &mut self.sessions[slot_index];
+                    slot.send_outstanding += 1;
+                    slot.send_offset = offset;
+                    crate::worker::trace::event_args(
+                        "SEND_REPOST",
+                        format_args!(
+                            "session={} generation={} slot={send_slot} offset={offset} bytes={remaining}",
+                            context.index, context.generation
+                        ),
+                    );
+                    return Ok(());
+                }
+                session.send_offset = 0;
+                session.send_posted_bytes = 0;
+                session.release_send_slot(context.slot)?;
             }
             Operation::Receive => {
                 if session.receive_outstanding != 1 || session.receive_posted_bytes == 0 {
@@ -821,7 +891,7 @@ impl Transport for RioTransport {
         if self.sessions[slot_index].state != GenerationState::Active {
             return Err("send attempted outside an active generation".to_string());
         }
-        if bytes == 0 || bytes > self.payload_bytes {
+        if bytes == 0 || bytes > self.batch_bytes {
             return Err("invalid send length".to_string());
         }
         if self.sessions[slot_index].send_outstanding >= self.max_send {
@@ -854,6 +924,9 @@ impl Transport for RioTransport {
             return Err(error);
         }
         self.sessions[slot_index].send_outstanding += 1;
+        self.sessions[slot_index].send_slot = send_slot;
+        self.sessions[slot_index].send_posted_bytes = bytes;
+        self.sessions[slot_index].send_offset = 0;
         crate::worker::trace::event_args(
             "SEND_POST",
             format_args!(
@@ -875,7 +948,7 @@ impl Transport for RioTransport {
         if self.sessions[slot_index].receive_outstanding != 0 {
             return Err("second RIOReceive posted for the same session".to_string());
         }
-        if bytes == 0 || bytes > self.payload_bytes {
+        if bytes == 0 || bytes > self.batch_bytes {
             return Err("invalid receive length".to_string());
         }
 
@@ -923,7 +996,7 @@ impl Transport for RioTransport {
         if !self.completion_is_live(index, generation) {
             return &[];
         }
-        if length > self.payload_bytes {
+        if length > self.batch_bytes {
             return &[];
         }
         self.receive_arena

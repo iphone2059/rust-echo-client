@@ -15,7 +15,7 @@ const GENERATION_DRAIN_GRACE_MS: u64 = 5_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Connect(u32),
-    Send(u32),
+    Send { index: u32, bytes: u32 },
     Receive { index: u32, bytes: u32 },
     Close(u32),
 }
@@ -24,11 +24,15 @@ pub enum Step {
 struct Flow {
     /// Echo units requested from this session, including already verified units.
     requested: u64,
-    /// RIO send requests posted but not yet completed.
-    sends_in_flight: u32,
+    /// Echo units carried by the attempt currently posted; zero when no attempt is posted.
+    batch_units: u32,
+    /// The posted attempt's send has completed.
+    send_done: bool,
     /// Exactly one receive may be outstanding per session.
     receive_posted: bool,
-    /// The first send of this transport generation is immediate. `/i` spaces only later
+    /// The posted attempt's receive has been fully verified.
+    receive_done: bool,
+    /// The first attempt of this transport generation is immediate. `/i` spaces only later
     /// cycles, matching the baseline behaviour.
     started: bool,
 }
@@ -40,9 +44,7 @@ impl Flow {
     fn at_verified(verified: u64) -> Self {
         Self {
             requested: verified,
-            sends_in_flight: 0,
-            receive_posted: false,
-            started: false,
+            ..Self::default()
         }
     }
 }
@@ -57,7 +59,9 @@ pub struct Scheduler {
     interval_milliseconds: u32,
     reconnect_seconds: Option<u32>,
     protocol: Protocol,
-    depth: u32,
+    /// Echo units one attempt may carry: `/k` for TCP and a single unit for UDP, exactly as the
+    /// reference sizes one send/receive pair.
+    batch_capacity: u32,
     flows: Vec<Flow>,
 }
 
@@ -74,7 +78,11 @@ impl Scheduler {
             interval_milliseconds: options.interval_milliseconds,
             reconnect_seconds: options.reconnect_seconds,
             protocol: options.protocol,
-            depth: options.pipeline_depth.max(1),
+            batch_capacity: if options.protocol == Protocol::Tcp {
+                options.pipeline_depth.max(1)
+            } else {
+                1
+            },
             flows: vec![Flow::default(); count],
         }
     }
@@ -156,18 +164,40 @@ impl Scheduler {
         }
     }
 
+    /// Bytes one attempt carrying `units` echo units occupies in registered memory.
+    fn attempt_bytes(&self, units: u32) -> Option<u32> {
+        units.checked_mul(self.payload_bytes)
+    }
+
+    /// Bytes of the attempt currently posted for `index`, zero when none is posted. The worker
+    /// uses it to validate a send completion against the exact native request length.
+    pub fn batch_bytes(&self, index: u32) -> u32 {
+        self.flows
+            .get(index as usize)
+            .and_then(|flow| self.attempt_bytes(flow.batch_units))
+            .unwrap_or(0)
+    }
+
     fn can_request_more(&self, slot: usize) -> bool {
-        let Some(inflight) = self.inflight_echoes(slot) else {
-            return false;
-        };
-        // Two independent bounds must hold. `inflight` is the business pipeline, while
-        // `sends_in_flight` is the native RQ reservation. Receive completions are allowed to
-        // race ahead of send completions, so business progress alone must never overfill the
-        // request queue.
-        if inflight >= u64::from(self.depth) || self.flows[slot].sends_in_flight >= self.depth {
+        // Exactly one attempt at a time per session. The reference begins the next attempt only
+        // after the previous one's send and receive have both completed, which is what keeps the
+        // request queue at one outstanding receive plus one outstanding send per session.
+        if self.flows[slot].batch_units != 0 {
             return false;
         }
         self.limit == 0 || self.flows[slot].requested < self.limit
+    }
+
+    /// Echo units the next attempt may carry: the batch capacity, trimmed to the remaining finite
+    /// quota so the final attempt of a run may be shorter than `/k`.
+    fn granted_units(&self, slot: usize) -> u32 {
+        let capacity = u64::from(self.batch_capacity);
+        let granted = if self.limit == 0 {
+            capacity
+        } else {
+            capacity.min(self.limit.saturating_sub(self.flows[slot].requested))
+        };
+        granted.min(u64::from(u32::MAX)) as u32
     }
 
     fn post_one_send(&mut self, index: u32, steps: &mut Vec<Step>) -> bool {
@@ -175,33 +205,42 @@ impl Scheduler {
         if !self.can_request_more(slot) {
             return false;
         }
+        let granted = self.granted_units(slot);
+        if granted == 0 {
+            return false;
+        }
+        let Some(bytes) = self.attempt_bytes(granted) else {
+            self.statistics.fatal = true;
+            return false;
+        };
+        let Some(requested) = self.flows[slot].requested.checked_add(u64::from(granted)) else {
+            self.statistics.fatal = true;
+            return false;
+        };
         let flow = &mut self.flows[slot];
-        let Some(requested) = flow.requested.checked_add(1) else {
-            self.statistics.fatal = true;
-            return false;
-        };
-        let Some(sends) = flow.sends_in_flight.checked_add(1) else {
-            self.statistics.fatal = true;
-            return false;
-        };
         flow.requested = requested;
-        flow.sends_in_flight = sends;
+        flow.batch_units = granted;
+        flow.send_done = false;
+        flow.receive_done = false;
         flow.started = true;
-        self.statistics.attempted = self.statistics.attempted.saturating_add(1);
-        steps.push(Step::Send(index));
+        self.statistics.attempted = self.statistics.attempted.saturating_add(u64::from(granted));
+        steps.push(Step::Send { index, bytes });
         true
     }
 
     fn ensure_receive(&mut self, index: u32, steps: &mut Vec<Step>) {
         let slot = index as usize;
-        let Some(inflight) = self.inflight_echoes(slot) else {
+        let flow = self.flows[slot];
+        // A receive is posted once per attempt, and only for the bytes still missing after a
+        // partial completion. Nothing is posted while no attempt is in flight.
+        if flow.batch_units == 0 || flow.receive_posted || flow.receive_done {
+            return;
+        }
+        let Some(expected) = self.attempt_bytes(flow.batch_units) else {
             self.statistics.fatal = true;
             return;
         };
-        if inflight == 0 || self.flows[slot].receive_posted {
-            return;
-        }
-        let Some(bytes) = self.sessions[slot].receive_remaining(self.payload_bytes) else {
+        let Some(bytes) = self.sessions[slot].receive_remaining(expected) else {
             self.statistics.fatal = true;
             return;
         };
@@ -215,8 +254,7 @@ impl Scheduler {
             self.arm(index);
             return;
         }
-        let flow = self.flows[slot];
-        let busy = flow.sends_in_flight != 0 || flow.receive_posted;
+        let busy = self.flows[slot].batch_units != 0;
         self.sessions[slot].deadline = busy.then_some(now.saturating_add(self.timeout_milliseconds));
         self.arm(index);
     }
@@ -234,9 +272,9 @@ impl Scheduler {
             self.statistics.fatal = true;
             return steps;
         };
-        if inflight > u64::from(self.depth) {
+        if inflight > u64::from(self.batch_capacity) {
             self.statistics.fatal = true;
-            debug_assert!(false, "pipeline depth exceeded");
+            debug_assert!(false, "attempt batch exceeded its capacity");
             return steps;
         }
 
@@ -269,8 +307,7 @@ impl Scheduler {
                 return steps;
             }
         };
-        let flow = self.flows[slot];
-        let busy = flow.sends_in_flight != 0 || flow.receive_posted;
+        let busy = self.flows[slot].batch_units != 0;
         if self.limit != 0
             && self.sessions[slot].echoes >= self.limit
             && inflight == 0
@@ -298,11 +335,34 @@ impl Scheduler {
         if slot >= self.flows.len() || self.sessions[slot].state != SessionState::Active {
             return Vec::new();
         }
-        if self.flows[slot].sends_in_flight == 0 {
+        if self.flows[slot].batch_units == 0 || self.flows[slot].send_done {
             self.statistics.fatal = true;
             return Vec::new();
         }
-        self.flows[slot].sends_in_flight -= 1;
+        self.flows[slot].send_done = true;
+        self.finish_attempt(index, now)
+    }
+
+    /// Retires the posted attempt once both of its native operations have completed and starts
+    /// the next one. Nothing else may be posted for the session before that, because its request
+    /// queue holds exactly one outstanding receive and one outstanding send.
+    fn finish_attempt(&mut self, index: u32, now: u64) -> Vec<Step> {
+        let slot = index as usize;
+        let flow = self.flows[slot];
+        if flow.batch_units == 0 || !flow.send_done || !flow.receive_done || flow.receive_posted {
+            return Vec::new();
+        }
+        self.flows[slot].batch_units = 0;
+        self.flows[slot].send_done = false;
+        self.flows[slot].receive_done = false;
+        // `/i` spaces attempts, never the operations inside one attempt. A finished quota still
+        // falls through to top_up so the session can close instead of parking on a timer.
+        if self.interval_milliseconds != 0 && self.can_request_more(slot) {
+            self.sessions[slot].send_at =
+                Some(now.saturating_add(u64::from(self.interval_milliseconds)));
+            self.arm(index);
+            return Vec::new();
+        }
         self.top_up(index, now)
     }
 
@@ -315,17 +375,18 @@ impl Scheduler {
     /// every later step for that same session before classifying the generation as failed.
     pub fn rollback_unposted_step(&mut self, step: Step) {
         match step {
-            Step::Send(index) => {
+            Step::Send { index, .. } => {
                 let slot = index as usize;
                 let Some(flow) = self.flows.get_mut(slot) else {
                     self.statistics.fatal = true;
                     return;
                 };
-                let Some(sends) = flow.sends_in_flight.checked_sub(1) else {
+                let units = u64::from(flow.batch_units);
+                if units == 0 {
                     self.statistics.fatal = true;
                     return;
-                };
-                let Some(requested) = flow.requested.checked_sub(1) else {
+                }
+                let Some(requested) = flow.requested.checked_sub(units) else {
                     self.statistics.fatal = true;
                     return;
                 };
@@ -333,8 +394,10 @@ impl Scheduler {
                     self.statistics.fatal = true;
                     return;
                 }
-                flow.sends_in_flight = sends;
                 flow.requested = requested;
+                flow.batch_units = 0;
+                flow.send_done = false;
+                flow.receive_done = false;
             }
             Step::Receive { index, .. } => {
                 let slot = index as usize;
@@ -375,12 +438,18 @@ impl Scheduler {
             .received_bytes
             .saturating_add(chunk.len() as u64);
 
+        let units = self.flows[slot].batch_units;
+        if units == 0 {
+            self.statistics.fatal = true;
+            return Vec::new();
+        }
         // TCP is a byte stream and may complete with a strict prefix. UDP is
         // message-oriented, so Session rejects a short datagram instead of concatenating it
         // with the next datagram.
         let outcome = self.sessions[slot].on_received(
             chunk,
             payload,
+            units,
             now,
             self.timeout_milliseconds,
             self.protocol == Protocol::Tcp,
@@ -393,8 +462,16 @@ impl Scheduler {
             }
             ReceiveOutcome::Verified => {
                 crate::worker::trace::event_args("RECV_COMPLETE", format_args!("session={index}"));
-                self.statistics.echoes = self.statistics.echoes.saturating_add(1);
-                self.top_up(index, now)
+                let Some(bytes) = self.attempt_bytes(units) else {
+                    self.statistics.fatal = true;
+                    return Vec::new();
+                };
+                // Echoes and validated bytes are counted per attempt, so a batch of `units`
+                // echoes advances the identity by exactly that many units.
+                self.statistics.echoes = self.statistics.echoes.saturating_add(u64::from(units));
+                self.statistics.bytes = self.statistics.bytes.saturating_add(u64::from(bytes));
+                self.flows[slot].receive_done = true;
+                self.finish_attempt(index, now)
             }
             ReceiveOutcome::PeerClosed => self.on_transport_failure(index, now),
             ReceiveOutcome::Corrupted => self.on_corrupted_receive(index),
@@ -410,7 +487,10 @@ impl Scheduler {
             return Vec::new();
         }
         crate::worker::trace::event_args("RECV_CORRUPT", format_args!("session={index}"));
-        self.statistics.corrupted = self.statistics.corrupted.saturating_add(1);
+        // Integrity is judged per attempt: a corrupted batch is as many corrupted echoes as the
+        // batch carried, which is how the reference counts it.
+        let units = u64::from(self.flows[slot].batch_units.max(1));
+        self.statistics.corrupted = self.statistics.corrupted.saturating_add(units);
         let lost = match self.inflight_echoes(slot) {
             Some(inflight) => inflight.max(1),
             None => {
@@ -587,13 +667,41 @@ mod tests {
     }
 
     #[test]
-    fn business_pipeline_is_bounded_by_requested_minus_verified() {
+    fn one_attempt_carries_the_batch_and_one_send_receive_pair() {
+        // /k 4 with a 6-byte payload is a single 24-byte send plus one 24-byte receive whose
+        // expected bytes are four copies of the pattern.
         let mut scheduler = scheduler(4, 0, None);
         assert_eq!(scheduler.start(0), vec![Step::Connect(0)]);
         let steps = scheduler.on_connected(0, 1);
-        assert_eq!(steps.iter().filter(|s| matches!(s, Step::Send(0))).count(), 4);
+        assert_eq!(steps, vec![Step::Send { index: 0, bytes: 24 }, Step::Receive { index: 0, bytes: 24 }]);
         assert_eq!(scheduler.inflight_echoes(0), Some(4));
-        assert!(steps.iter().any(|s| matches!(s, Step::Receive { index: 0, bytes: 6 })));
+        assert_eq!(scheduler.statistics.attempted, 4);
+
+        let verified = scheduler.on_received(0, b"abcdefabcdefabcdefabcdef", b"abcdef", 2);
+        assert!(verified.is_empty());
+        assert_eq!(scheduler.statistics.echoes, 4);
+        assert_eq!(scheduler.statistics.bytes, 24);
+
+        // The attempt retires only once its send has completed too.
+        let next = scheduler.on_sent(0, 3);
+        assert_eq!(next, vec![Step::Send { index: 0, bytes: 24 }, Step::Receive { index: 0, bytes: 24 }]);
+    }
+
+    #[test]
+    fn final_attempt_is_trimmed_to_the_remaining_quota() {
+        // /k 4 with a quota of 6 grants 4 then 2, so the last attempt is shorter than /k.
+        let mut options = Options::default();
+        options.protocol = Protocol::Tcp;
+        options.pipeline_depth = 4;
+        options.echo_count = 6;
+        let mut scheduler = Scheduler::new(1, 6, &options);
+        scheduler.start(0);
+        let first = scheduler.on_connected(0, 1);
+        assert_eq!(first, vec![Step::Send { index: 0, bytes: 24 }, Step::Receive { index: 0, bytes: 24 }]);
+        scheduler.on_sent(0, 2);
+        let second = scheduler.on_received(0, b"abcdefabcdefabcdefabcdef", b"abcdef", 3);
+        assert_eq!(second, vec![Step::Send { index: 0, bytes: 12 }, Step::Receive { index: 0, bytes: 12 }]);
+        assert_eq!(scheduler.statistics.attempted, 6);
     }
 
     #[test]
@@ -628,7 +736,8 @@ mod tests {
         let close = scheduler.on_corrupted_receive(0);
         assert_eq!(close, vec![Step::Close(0)]);
         assert_eq!(scheduler.sessions[0].state, SessionState::Failed);
-        assert_eq!(scheduler.statistics.corrupted, 1);
+        // Integrity is counted per attempt: this attempt carried two echo units.
+        assert_eq!(scheduler.statistics.corrupted, 2);
         assert!(scheduler.statistics.lost >= 1);
         assert_eq!(scheduler.statistics.reconnects, 0);
     }
@@ -667,43 +776,49 @@ mod tests {
         assert_eq!(scheduler.poll(4, &mut expired), vec![Step::Connect(0)]);
         let steps = scheduler.on_connected(0, 5);
         assert!(!scheduler.statistics.fatal);
-        assert!(steps.iter().any(|step| matches!(step, Step::Send(0))));
+        assert!(steps.iter().any(|step| matches!(step, Step::Send { .. })));
         assert_eq!(scheduler.inflight_echoes(0), Some(1));
     }
 
     #[test]
-    fn receive_may_complete_before_send_without_exceeding_native_send_depth() {
+    fn receive_may_complete_before_send_without_posting_a_second_attempt() {
         let mut scheduler = scheduler(1, 0, None);
         scheduler.start(0);
         let initial = scheduler.on_connected(0, 0);
-        assert_eq!(initial.iter().filter(|step| matches!(step, Step::Send(0))).count(), 1);
+        assert_eq!(initial.iter().filter(|step| matches!(step, Step::Send { .. })).count(), 1);
 
         // RIO completion ordering between send and receive is not a business ordering
         // guarantee. Verify the echo first while the original send is still native-in-flight.
         let after_receive = scheduler.on_received(0, b"abcdef", b"abcdef", 1);
-        assert!(!after_receive.iter().any(|step| matches!(step, Step::Send(0))));
-        assert_eq!(scheduler.flows[0].sends_in_flight, 1);
+        assert!(!after_receive.iter().any(|step| matches!(step, Step::Send { .. })));
+        assert_eq!(scheduler.flows[0].batch_units, 1);
 
-        // Once that native send completion retires, the next business send may be posted.
+        // Once that native send completion retires, the next attempt may be posted.
         let after_send = scheduler.on_sent(0, 2);
-        assert!(after_send.iter().any(|step| matches!(step, Step::Send(0))));
-        assert_eq!(scheduler.flows[0].sends_in_flight, 1);
+        assert!(after_send.iter().any(|step| matches!(step, Step::Send { .. })));
+        assert_eq!(scheduler.flows[0].batch_units, 1);
         assert_eq!(scheduler.inflight_echoes(0), Some(1));
     }
 
     #[test]
-    fn interval_pacing_sends_first_cycle_immediately() {
+    fn interval_pacing_spaces_attempts_and_keeps_the_first_immediate() {
         let mut scheduler = scheduler(4, 25, None);
         scheduler.start(100);
         let first = scheduler.on_connected(0, 100);
-        assert_eq!(first.iter().filter(|step| matches!(step, Step::Send(0))).count(), 1);
-        assert!(first.iter().any(|step| matches!(step, Step::Receive { index: 0, bytes: 6 })));
-        assert_eq!(scheduler.sessions[0].send_at, Some(125));
+        assert_eq!(first.iter().filter(|step| matches!(step, Step::Send { .. })).count(), 1);
+        assert!(first.iter().any(|step| matches!(step, Step::Receive { index: 0, bytes: 24 })));
+        // The first attempt is immediate; the pause applies to the attempts after it.
+        assert_eq!(scheduler.sessions[0].send_at, None);
+
+        scheduler.on_sent(0, 101);
+        let paced = scheduler.on_received(0, b"abcdefabcdefabcdefabcdef", b"abcdef", 101);
+        assert!(paced.is_empty());
+        assert_eq!(scheduler.sessions[0].send_at, Some(126));
 
         let mut expired = Vec::new();
-        assert!(scheduler.poll(124, &mut expired).is_empty());
-        let second = scheduler.poll(125, &mut expired);
-        assert_eq!(second.iter().filter(|step| matches!(step, Step::Send(0))).count(), 1);
+        assert!(scheduler.poll(125, &mut expired).is_empty());
+        let second = scheduler.poll(126, &mut expired);
+        assert_eq!(second.iter().filter(|step| matches!(step, Step::Send { .. })).count(), 1);
     }
 
     #[test]

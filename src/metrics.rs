@@ -14,6 +14,9 @@ pub struct Statistics {
     pub echoes: u64,
     pub sent_bytes: u64,
     pub received_bytes: u64,
+    /// Echo bytes that were verified against the payload. The reference counts only validated
+    /// echoes here, while `received_bytes` counts everything the socket delivered.
+    pub bytes: u64,
     pub corrupted: u64,
     pub lost: u64,
     /// Attempts the scheduler claimed. The identity is attempted = pending + echoed + corrupted
@@ -40,6 +43,7 @@ impl Default for Statistics {
             echoes: 0,
             sent_bytes: 0,
             received_bytes: 0,
+            bytes: 0,
             corrupted: 0,
             lost: 0,
             attempted: 0,
@@ -63,6 +67,7 @@ impl Statistics {
         self.echoes = self.echoes.saturating_add(other.echoes);
         self.sent_bytes = self.sent_bytes.saturating_add(other.sent_bytes);
         self.received_bytes = self.received_bytes.saturating_add(other.received_bytes);
+        self.bytes = self.bytes.saturating_add(other.bytes);
         self.corrupted = self.corrupted.saturating_add(other.corrupted);
         self.lost = self.lost.saturating_add(other.lost);
         self.attempted = self.attempted.saturating_add(other.attempted);
@@ -136,14 +141,16 @@ impl Statistics {
         if self.elapsed_milliseconds == 0 {
             0.0
         } else {
-            let mib = self.received_bytes as f64 / (1024.0 * 1024.0);
+            let mib = self.bytes as f64 / (1024.0 * 1024.0);
             mib * 1_000.0 / self.elapsed_milliseconds as f64
         }
     }
 
-    /// Echoes that were asked for but never completed. A controlled stop is not a loss.
-    pub fn unclaimed(&self, limit: u64, controlled_stop: bool) -> u64 {
-        unclaimed_echoes(limit, self.echoes, controlled_stop)
+    /// Echoes that were asked for but never claimed. `/n` is a per-session quota, so the run
+    /// described by the command line is `/n` times the session count. A controlled stop is not a
+    /// loss.
+    pub fn unclaimed(&self, limit: u64, sessions: u32, controlled_stop: bool) -> u64 {
+        unclaimed_echoes(limit.saturating_mul(u64::from(sessions)), self.attempted, controlled_stop)
     }
 
     pub fn exit_code(&self, controlled_stop: bool) -> ExitCode {
@@ -183,7 +190,7 @@ p50_us~{} p99_us~{} p999_us~{} mean_us={} max_us~{} latency_sample=batch",
             self.cancelled,
             self.sent_bytes,
             self.received_bytes,
-            self.received_bytes,
+            self.bytes,
             self.connections,
             self.reconnects,
             self.network_failures,
