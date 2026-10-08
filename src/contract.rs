@@ -12,6 +12,17 @@ pub mod token {
     pub const INVALID_NUMBER: &str = "invalid-number";
     pub const OUT_OF_RANGE: &str = "out-of-range";
     pub const UNKNOWN_SWITCH: &str = "unknown-switch";
+    pub const UNEXPECTED_VALUE: &str = "unexpected-value";
+    pub const MISSING_VALUE: &str = "missing-value";
+    pub const CONFLICTING_PAYLOAD: &str = "conflicting-payload";
+    pub const LOCAL_PORT_CONFLICT: &str = "local-port-conflict";
+    pub const QUOTA_OVERFLOW: &str = "quota-overflow";
+    pub const PAYLOAD_SIZE: &str = "payload-size";
+    pub const MEMORY_CAPACITY: &str = "memory-capacity";
+    pub const CQ_CAPACITY: &str = "cq-capacity";
+    pub const MISSING_TARGET: &str = "missing-target";
+    pub const MISSING_PROTOCOL: &str = "missing-protocol";
+    pub const UNEXPECTED_TARGET: &str = "unexpected-target";
 }
 
 /// Usage text, one entry per line; printed on stdout for a valid /h command line.
@@ -93,14 +104,18 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     let mut literal = false;
     let mut binary = false;
     let mut printable = false;
+    let mut saw_pipeline = false;
+    // A second positional is reported after the cross-field rules, exactly as the reference does,
+    // so the worker split still wins when both are wrong.
+    let mut saw_extra_target = false;
     let mut index = 1;
     while index < arguments.len() {
         let token = arguments[index].clone();
         index += 1;
         let Some(offset) = switch_offset(&token) else {
             if !options.host.is_empty() {
-                // A second positional is its own contract violation in the reference.
-                return Err(ArgumentError("unexpected-target".to_string()));
+                saw_extra_target = true;
+                continue;
             }
             if token.is_empty() {
                 return Err(ArgumentError("target host is empty".to_string()));
@@ -113,15 +128,13 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         };
         let rest = &token[offset..];
         let (name, inline) = match rest.split_once('=') {
-            Some((_name, value)) if value.is_empty() => {
-                return Err(ArgumentError("switch requires a non-empty inline value".to_string()));
-            }
             Some((name, value)) => (name.to_ascii_lowercase(), Some(value.to_string())),
             None => (rest.to_ascii_lowercase(), None),
         };
         if matches!(name.as_str(), "q" | "quiet" | "stats" | "h" | "help") {
             if inline.is_some() {
-                return Err(ArgumentError("flag switch does not accept a value".to_string()));
+                // A flag never takes a value, and an empty one is still a value.
+                return Err(ArgumentError(token::UNEXPECTED_VALUE.to_string()));
             }
             match name.as_str() {
                 "q" | "quiet" => options.quiet = true,
@@ -145,13 +158,14 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             return Err(ArgumentError(token::UNKNOWN_SWITCH.to_string()));
         }
         let value = match inline {
-            Some(value) => value,
+            Some(value) if !value.is_empty() => value,
+            Some(_) => return Err(ArgumentError(token::MISSING_VALUE.to_string())),
             None => {
                 if index >= arguments.len()
                     || arguments[index].is_empty()
                     || switch_offset(&arguments[index]).is_some()
                 {
-                    return Err(ArgumentError("switch requires a non-empty value".to_string()));
+                    return Err(ArgumentError(token::MISSING_VALUE.to_string()));
                 }
                 let value = arguments[index].clone();
                 index += 1;
@@ -159,10 +173,12 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             }
         };
         if name == "p" {
+            // The reference matches the protocol keyword itself and reports the parse failure as
+            // an out-of-range value, not as a protocol-specific message.
             options.protocol = match value.to_ascii_lowercase().as_str() {
                 "tcp" => Protocol::Tcp,
                 "udp" => Protocol::Udp,
-                _ => return Err(ArgumentError("/p requires tcp or udp".to_string())),
+                _ => return Err(ArgumentError(token::OUT_OF_RANGE.to_string())),
             };
             continue;
         }
@@ -225,6 +241,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
                 if options.protocol == Protocol::Udp {
                     return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
                 }
+                saw_pipeline = true;
                 options.pipeline_depth = number as u32;
             }
             "w" => options.run_seconds = number as u32,
@@ -238,7 +255,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     }
     // The datagram path has no /k; a /k that appeared before /p udp is rejected here, before the
     // help short-circuit, so the diagnostic does not depend on the order of the switches.
-    if options.protocol == Protocol::Udp && options.pipeline_depth != 1 {
+    if options.protocol == Protocol::Udp && saw_pipeline {
         return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
     }
     // The worker split is validated before the mandatory arguments, which is why
@@ -246,15 +263,18 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     if options.worker_count > options.session_count {
         return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
     }
+    if saw_extra_target {
+        return Err(ArgumentError(token::UNEXPECTED_TARGET.to_string()));
+    }
     // /h suppresses only the two mandatory-argument checks. Every other rule, including the
     // capacity budgets, still applies exactly as it does without /h.
     // The baseline reports the missing target first and the missing protocol second, so a bare
     // invocation and a host-only invocation produce different diagnostics.
     if !options.help && options.host.is_empty() {
-        return Err(ArgumentError("missing-target".to_string()));
+        return Err(ArgumentError(token::MISSING_TARGET.to_string()));
     }
     if !options.help && options.protocol == Protocol::None {
-        return Err(ArgumentError("missing-protocol".to_string()));
+        return Err(ArgumentError(token::MISSING_PROTOCOL.to_string()));
     }
     if !options.help && options.host.parse::<std::net::Ipv4Addr>().is_err() {
         return Err(ArgumentError(
@@ -263,17 +283,17 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     }
     let payload_switches = [literal, binary, printable].iter().filter(|flag| **flag).count();
     if payload_switches > 1 {
-        return Err(ArgumentError(
-            "/d, /z and /zt are mutually exclusive".to_string(),
-        ));
+        return Err(ArgumentError(token::CONFLICTING_PAYLOAD.to_string()));
     }
-    if options.local_port != 0 && options.session_count != 1 {
-        return Err(ArgumentError("a fixed local port requires /c 1".to_string()));
+    if options.local_port != 0
+        && (options.session_count != 1
+            || (options.protocol == Protocol::Tcp && options.reconnect_seconds.is_some()))
+    {
+        return Err(ArgumentError(token::LOCAL_PORT_CONFLICT.to_string()));
     }
-    if options.local_port != 0 && options.protocol == Protocol::Tcp && options.reconnect_seconds.is_some() {
-        return Err(ArgumentError(
-            "TCP fixed local port does not allow /rc".to_string(),
-        ));
+    // The run the command line describes may not exceed the quota the engine can represent.
+    if options.session_count != 0 && options.echo_count > u64::MAX / u64::from(options.session_count) {
+        return Err(ArgumentError(token::QUOTA_OVERFLOW.to_string()));
     }
     // The effective payload length is known before any session exists: the counter payloads carry
     // their own /z or /zt length, while the literal and default texts are measured in UTF-8 bytes
@@ -290,7 +310,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         }
     };
     if options.protocol == Protocol::Udp && pattern_bytes > MAXIMUM_UDP_PAYLOAD_BYTES {
-        return Err(ArgumentError("UDP payload exceeds 65507 bytes".to_string()));
+        return Err(ArgumentError(token::PAYLOAD_SIZE.to_string()));
     }
     // Nothing else can be validated without a protocol, which is how /h alone succeeds.
     if options.protocol == Protocol::None {
@@ -308,7 +328,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             .checked_mul(u64::from(options.pipeline_depth))
             .filter(|bytes| *bytes <= crate::types::MAXIMUM_TCP_BATCH_BYTES)
         else {
-            return Err(ArgumentError("payload-size".to_string()));
+            return Err(ArgumentError(token::PAYLOAD_SIZE.to_string()));
         };
         let storage = batch
             .checked_mul(u64::from(options.session_count))
@@ -319,14 +339,14 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         match (storage, per_worker) {
             (Some(storage), Some(per_worker))
                 if storage <= options.memory_bytes && per_worker <= u64::from(u32::MAX) => {}
-            _ => return Err(ArgumentError("memory-capacity".to_string())),
+            _ => return Err(ArgumentError(token::MEMORY_CAPACITY.to_string())),
         }
     }
     // One attempt is one receive plus one send whatever /k is, so the largest shard reserves exactly
     // two operations per session against the completion queue.
     match shard.checked_mul(2) {
         Some(reserved) if reserved <= u64::from(options.cq_capacity) => {}
-        _ => return Err(ArgumentError("cq-capacity".to_string())),
+        _ => return Err(ArgumentError(token::CQ_CAPACITY.to_string())),
     }
     Ok(options)
 }
@@ -380,6 +400,104 @@ mod tests {
         assert_eq!(options.echo_count, 0);
         let reconnect = parse(&args(&["127.0.0.1", "/p", "udp", "/rc"])).expect("valid");
         assert_eq!(reconnect.reconnect_seconds, Some(1));
+    }
+
+    fn error_token(arguments: &[&str]) -> String {
+        parse(&args(arguments))
+            .expect_err("expected a rejected command line")
+            .0
+    }
+
+    /// Every case below is a measured reference diagnostic, so the tokens are the contract rather
+    /// than a paraphrase of it.
+    #[test]
+    fn diagnostics_use_the_reference_tokens() {
+        assert_eq!(error_token(&[]), token::MISSING_TARGET);
+        assert_eq!(error_token(&["127.0.0.1"]), token::MISSING_PROTOCOL);
+        assert_eq!(error_token(&["/p", "tcp"]), token::MISSING_TARGET);
+        assert_eq!(
+            error_token(&["127.0.0.1", "127.0.0.2", "/p", "tcp"]),
+            token::UNEXPECTED_TARGET
+        );
+        assert_eq!(
+            error_token(&["/c", "1", "/threads", "2", "/p", "tcp"]),
+            token::OUT_OF_RANGE
+        );
+        assert_eq!(
+            error_token(&["127.0.0.1", "/p", "tcp", "/d", "x", "/z", "8"]),
+            token::CONFLICTING_PAYLOAD
+        );
+        assert_eq!(
+            error_token(&["127.0.0.1", "/p", "udp", "/k", "1"]),
+            token::PROTOCOL_OPTION
+        );
+        // The switch was supplied even though its value is the default, which is what the
+        // reference keys on.
+        assert_eq!(
+            error_token(&["127.0.0.1", "/k", "1", "/p", "udp"]),
+            token::PROTOCOL_OPTION
+        );
+        assert_eq!(
+            error_token(&["127.0.0.1", "/p", "tcp", "/l", "7000", "/c", "2"]),
+            token::LOCAL_PORT_CONFLICT
+        );
+        assert_eq!(
+            error_token(&["127.0.0.1", "/p", "tcp", "/l", "7000", "/rc", "1"]),
+            token::LOCAL_PORT_CONFLICT
+        );
+        assert_eq!(
+            error_token(&["127.0.0.1", "/p", "udp", "/z", "65508"]),
+            token::PAYLOAD_SIZE
+        );
+        assert_eq!(
+            error_token(&["127.0.0.1", "/p", "tcp", "/k", "65536", "/z", "65536"]),
+            token::PAYLOAD_SIZE
+        );
+        assert_eq!(
+            error_token(&[
+                "127.0.0.1",
+                "/p",
+                "tcp",
+                "/n",
+                "18446744073709551615",
+                "/c",
+                "1048576"
+            ]),
+            token::QUOTA_OVERFLOW
+        );
+        assert_eq!(
+            error_token(&["127.0.0.1", "/p", "tcp", "/c", "200", "/threads", "4", "/cq", "64"]),
+            token::CQ_CAPACITY
+        );
+        assert_eq!(
+            error_token(&[
+                "127.0.0.1",
+                "/p",
+                "tcp",
+                "/k",
+                "2",
+                "/z",
+                "300000",
+                "/memory",
+                "1048576"
+            ]),
+            token::MEMORY_CAPACITY
+        );
+        assert_eq!(error_token(&["127.0.0.1", "/p", "sctp"]), token::OUT_OF_RANGE);
+        assert_eq!(error_token(&["/q=1"]), token::UNEXPECTED_VALUE);
+        assert_eq!(error_token(&["/r="]), token::MISSING_VALUE);
+        assert_eq!(error_token(&["/r"]), token::MISSING_VALUE);
+        assert_eq!(error_token(&["/b=x"]), token::INVALID_NUMBER);
+        assert_eq!(error_token(&["/zzz"]), token::UNKNOWN_SWITCH);
+        assert_eq!(error_token(&["127.0.0.1", "/p", "tcp", "/k", "0"]), token::OUT_OF_RANGE);
+        assert_eq!(error_token(&["127.0.0.1", "/p", "tcp", "/cq", "63"]), token::OUT_OF_RANGE);
+        // /h suppresses only the mandatory arguments; the budgets still apply.
+        assert_eq!(
+            error_token(&["/h", "/p", "tcp", "/c", "200", "/threads", "4", "/cq", "64"]),
+            token::CQ_CAPACITY
+        );
+        assert_eq!(error_token(&["/h", "/d", "x", "/z", "8"]), token::CONFLICTING_PAYLOAD);
+        assert!(parse(&args(&["/h", "/p", "tcp", "/n", "1", "/d", "x"])).is_ok());
     }
 
     #[test]

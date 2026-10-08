@@ -220,13 +220,13 @@ function Invoke-Test {
         if ($WithPeer) {
             $peerArgs = @('127.0.0.1', '/p', $Protocol, '/r', [string]$port, '/n', '20', '/z', '256', '/q')
             if ($Component -eq 'client') { $peerArgs = @('/p', $Protocol, '/s', [string]$port, '/q') }
-            $peerProcess = Start-Process -FilePath $Peer -ArgumentList $peerArgs -RedirectStandardOutput $peerOut -RedirectStandardError $peerErr -PassThru -WindowStyle Hidden
+            $peerProcess = Start-Process -FilePath $Peer -ArgumentList $peerArgs -RedirectStandardOutput $peerOut -RedirectStandardError $peerErr -PassThru -NoNewWindow
             Wait-ForServer -Port $port -ForProtocol $Protocol | Out-Null
         }
         if ($Component -eq 'client' -and (Test-Feature 'notify-diagnostics')) { $env:CEC_DIAG_FILE = $diagFile }
         if ($Component -eq 'server' -and (Test-Feature 'notify-diagnostics')) { $env:CES_DIAG_FILE = $diagFile }
         $quoted = @($arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } })
-        $process = Start-Process -FilePath $Executable -ArgumentList $quoted -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -WindowStyle Hidden
+        $process = Start-Process -FilePath $Executable -ArgumentList $quoted -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -NoNewWindow
         $finished = $process.WaitForExit($TimeoutMs)
         if ($finished) { $exit = $process.ExitCode } else { $process.Kill($true) | Out-Null }
         $stdout = Read-TextFile -Path $outFile
@@ -300,7 +300,7 @@ function Invoke-StopTest {
     $failure = ''
     try {
         if (Test-Feature 'notify-diagnostics') { $env:CES_DIAG_FILE = $diagFile }
-        $server = Start-Process -FilePath $Executable -ArgumentList @('/p', $Protocol, '/s', [string]$port, '/w', '5', '/q', '/stats') -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -WindowStyle Hidden
+        $server = Start-Process -FilePath $Executable -ArgumentList @('/p', $Protocol, '/s', [string]$port, '/w', '5', '/q', '/stats') -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -NoNewWindow
         Wait-ForServer -Port $port -ForProtocol $Protocol | Out-Null
         $arguments = @($PeerArguments | ForEach-Object { $_ -replace '@PORT@', [string]$port })
         # The peer's /n is the quota the case expects it to complete on a reliable transport.
@@ -315,7 +315,7 @@ function Invoke-StopTest {
         # leaves one partial echo on the server and none on the peer, and UDP may lose datagrams.
         $strictQuota = ($Protocol -eq 'tcp') -and ($quota -gt 0) -and ($Category -in @('TCP','CAPACITY','ADMISSION','RESET'))
         $quoted = @($arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } })
-        $client = Start-Process -FilePath $Peer -ArgumentList $quoted -RedirectStandardOutput $peerOut -RedirectStandardError $peerErr -PassThru -WindowStyle Hidden
+        $client = Start-Process -FilePath $Peer -ArgumentList $quoted -RedirectStandardOutput $peerOut -RedirectStandardError $peerErr -PassThru -NoNewWindow
         $clientDone = $client.WaitForExit($TimeoutMs)
         if ($clientDone) { $peerExit = $client.ExitCode; $peerOk = $true }
         if (-not $clientDone) { $client.Kill($true) | Out-Null }
