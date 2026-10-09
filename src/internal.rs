@@ -1113,7 +1113,6 @@ pub mod worker {
     //! never posts an extra receive behind the scheduler's back, and always asks the transport to
     //! quiesce before the worker thread returns.
 
-    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
@@ -1232,7 +1231,9 @@ pub mod worker {
         started_at: Instant,
         /// One timestamp per business echo in post order. TCP echo ordering makes this exact for
         /// TCP; for UDP it is a best-effort FIFO sample because identical datagrams carry no ID.
-        sent_at: Vec<VecDeque<Instant>>,
+        /// When the attempt each session has in flight was posted. One attempt at a time means
+        /// one sample slot, so the latency path never allocates.
+        attempt_started: Vec<Option<Instant>>,
     }
 
     impl Worker {
@@ -1247,7 +1248,7 @@ pub mod worker {
                 run_seconds: options.run_seconds,
                 run_deadline: None,
                 started_at: Instant::now(),
-                sent_at: (0..session_count).map(|_| VecDeque::new()).collect(),
+                attempt_started: (0..session_count).map(|_| None).collect(),
             }
         }
 
@@ -1269,16 +1270,18 @@ pub mod worker {
         }
 
         fn clear_latency_queue(&mut self, index: u32) {
-            if let Some(queue) = self.sent_at.get_mut(index as usize) {
-                queue.clear();
+            if let Some(started) = self.attempt_started.get_mut(index as usize) {
+                *started = None;
             }
         }
 
         fn record_verified_latency(&mut self, index: u32) {
-            let Some(queue) = self.sent_at.get_mut(index as usize) else {
+            // Exactly one attempt is in flight per session, so the sample is the time that attempt
+            // took: no queue is needed, and the hot path performs one store and one load.
+            let Some(started) = self.attempt_started.get_mut(index as usize) else {
                 return;
             };
-            let Some(sent) = queue.pop_front() else {
+            let Some(sent) = started.take() else {
                 return;
             };
             let micros = Instant::now()
@@ -1589,8 +1592,8 @@ pub mod worker {
                         outcome.steps = outcome.steps.saturating_add(1);
                         crate::worker::trace::event_args("STEP_OK", format_args!("{step:?}"));
                         if let Step::Send { index, .. } = *step {
-                            if let Some(queue) = self.sent_at.get_mut(index as usize) {
-                                queue.push_back(Instant::now());
+                            if let Some(started) = self.attempt_started.get_mut(index as usize) {
+                                *started = Some(Instant::now());
                             }
                         }
                     }
