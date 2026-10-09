@@ -4,8 +4,10 @@
 use crate::contract::{classify_result, unclaimed_echoes};
 use crate::types::ExitCode;
 
-pub const LATENCY_BUCKET_MICROS: u32 = 64;
-pub const LATENCY_BUCKETS: usize = 512;
+/// The reference buckets latency by the power of two below the sample, so bin i means
+/// [2^i, 2^(i+1)) microseconds and the reported value is that lower bound rather than the
+/// sample. Sixty-four bins cover the whole u32 range because the index is clamped.
+pub const LATENCY_BUCKETS: usize = 64;
 
 /// Counters accumulated by the workers. Nothing here is shared: each worker owns its own
 /// instance and the run merges them at the end.
@@ -30,7 +32,6 @@ pub struct Statistics {
     pub network_failures: u64,
     pub fatal: bool,
     pub latency_buckets: [u32; LATENCY_BUCKETS],
-    pub latency_overflow: u32,
     pub latency_samples: u64,
     pub latency_sum_us: u64,
     pub latency_max_us: u32,
@@ -53,7 +54,6 @@ impl Default for Statistics {
             network_failures: 0,
             fatal: false,
             latency_buckets: [0; LATENCY_BUCKETS],
-            latency_overflow: 0,
             latency_samples: 0,
             latency_sum_us: 0,
             latency_max_us: 0,
@@ -79,46 +79,57 @@ impl Statistics {
         for (target, source) in self.latency_buckets.iter_mut().zip(other.latency_buckets) {
             *target = target.saturating_add(source);
         }
-        self.latency_overflow = self.latency_overflow.saturating_add(other.latency_overflow);
         self.latency_samples = self.latency_samples.saturating_add(other.latency_samples);
         self.latency_sum_us = self.latency_sum_us.saturating_add(other.latency_sum_us);
         self.latency_max_us = self.latency_max_us.max(other.latency_max_us);
         self.elapsed_milliseconds = self.elapsed_milliseconds.max(other.elapsed_milliseconds);
     }
 
-    /// Records one echo round trip. The bucket index is clamped through the overflow bucket
-    /// so an unexpectedly slow sample cannot write past the histogram.
+    /// Records one completed attempt, which is one latency sample because the histogram samples
+    /// batches rather than echoes. The bucket is the reference's: the power of two below the
+    /// sample, with the index clamped so no sample can write past the histogram. A zero sample
+    /// keeps the reference's unsigned underflow, which lands in the last bucket.
     pub fn record_latency(&mut self, micros: u32) {
         self.latency_samples = self.latency_samples.saturating_add(1);
         self.latency_sum_us = self.latency_sum_us.saturating_add(u64::from(micros));
         self.latency_max_us = self.latency_max_us.max(micros);
-        let bucket = (micros / LATENCY_BUCKET_MICROS) as usize;
-        if bucket < LATENCY_BUCKETS {
-            self.latency_buckets[bucket] = self.latency_buckets[bucket].saturating_add(1);
+        let bucket = if micros == 0 {
+            LATENCY_BUCKETS - 1
         } else {
-            self.latency_overflow = self.latency_overflow.saturating_add(1);
-        }
+            ((u32::BITS - 1 - micros.leading_zeros()) as usize).min(LATENCY_BUCKETS - 1)
+        };
+        self.latency_buckets[bucket] = self.latency_buckets[bucket].saturating_add(1);
     }
 
-    /// Percentile from the histogram: the upper edge of the first bucket that crosses the
-    /// requested fraction of samples.
-    pub fn percentile(&self, numerator: u64, denominator: u64) -> u32 {
-        if self.latency_samples == 0 || denominator == 0 {
+    /// Percentile from the histogram: the lower bound of the first bucket that crosses the
+    /// requested fraction of samples, which is what the reference's "~" marks as approximate.
+    pub fn percentile(&self, numerator: u64, denominator: u64) -> u64 {
+        let total = self.sample_count();
+        if total == 0 || numerator == 0 || denominator == 0 || numerator > denominator {
             return 0;
         }
-        let target = self
-            .latency_samples
+        // ceil(total * numerator / denominator) without overflowing the product.
+        let quotient = total / denominator;
+        let remainder = total % denominator;
+        let target = quotient
             .saturating_mul(numerator)
-            .div_ceil(denominator);
+            .saturating_add(remainder.saturating_mul(numerator).div_ceil(denominator));
         let mut seen = 0u64;
         for (index, count) in self.latency_buckets.iter().enumerate() {
             seen = seen.saturating_add(u64::from(*count));
             if seen >= target {
-                return (index as u32 + 1) * LATENCY_BUCKET_MICROS;
+                return 1u64 << index.min(63);
             }
         }
-        // Only the overflow bucket is left, so the maximum observed is the honest answer.
-        self.latency_max_us
+        0
+    }
+
+    pub fn sample_count(&self) -> u64 {
+        let mut total = 0u64;
+        for count in self.latency_buckets {
+            total = total.saturating_add(u64::from(count));
+        }
+        total
     }
 
     pub fn mean_latency_us(&self) -> u32 {
@@ -200,7 +211,43 @@ p50_us~{} p99_us~{} p999_us~{} mean_us={} max_us~{} latency_sample=batch",
             self.percentile(99, 100),
             self.percentile(999, 1_000),
             self.mean_latency_us(),
-            self.latency_max_us
+            // The reference reports the maximum as the same histogram percentile, so this field is
+            // a bucket lower bound like the others rather than the exact maximum observed.
+            self.percentile(1, 1)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_buckets_follow_the_reference() {
+        let mut statistics = Statistics::default();
+        // One sample per completed attempt, bucketed by the power of two below it: 3 us lands in
+        // bin 1 and 5 us in bin 2.
+        statistics.record_latency(3);
+        statistics.record_latency(5);
+        assert_eq!(statistics.sample_count(), 2);
+        // ceil(2 * 50 / 100) = 1, so the first non-empty bucket answers the median.
+        assert_eq!(statistics.percentile(50, 100), 2);
+        // The maximum uses the same percentile rule, so it is a bucket lower bound as well.
+        assert_eq!(statistics.percentile(1, 1), 4);
+        assert_eq!(statistics.mean_latency_us(), 4);
+        // An empty histogram reports zero rather than the first bucket.
+        assert_eq!(Statistics::default().percentile(50, 100), 0);
+    }
+
+    #[test]
+    fn latency_clamps_extreme_samples_into_the_last_bucket() {
+        let mut statistics = Statistics::default();
+        // A zero sample keeps the reference's unsigned underflow, and a sample beyond the
+        // histogram is clamped, so both land in the last bucket whose lower bound is 2^63.
+        statistics.record_latency(0);
+        statistics.record_latency(u32::MAX);
+        assert_eq!(statistics.sample_count(), 2);
+        assert_eq!(statistics.percentile(1, 1), 1u64 << 63);
+        assert_eq!(statistics.percentile(50, 100), 1u64 << 31);
     }
 }

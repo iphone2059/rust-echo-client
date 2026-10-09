@@ -276,11 +276,9 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     if !options.help && options.protocol == Protocol::None {
         return Err(ArgumentError(token::MISSING_PROTOCOL.to_string()));
     }
-    if !options.help && options.host.parse::<std::net::Ipv4Addr>().is_err() {
-        return Err(ArgumentError(
-            "target must be an IPv4 address literal".to_string(),
-        ));
-    }
+    // The target is not required to be a literal: the reference resolves it with GetAddrInfoW
+    // after parsing, so a name is accepted here and an unresolvable one is a network failure
+    // rather than a usage error.
     let payload_switches = [literal, binary, printable].iter().filter(|flag| **flag).count();
     if payload_switches > 1 {
         return Err(ArgumentError(token::CONFLICTING_PAYLOAD.to_string()));
@@ -507,7 +505,8 @@ mod tests {
         assert!(parse(&args(&["127.0.0.1", "/p", "tcp", "/q=1"])).is_err());
         assert!(parse(&args(&["127.0.0.1", "/p", "tcp", "second-host"])).is_err());
         assert!(parse(&args(&["/p", "tcp"])).is_err());
-        assert!(parse(&args(&["localhost", "/p", "tcp"])).is_err());
+        // A name is a legal target: resolution, not parsing, decides whether it works.
+        assert!(parse(&args(&["localhost", "/p", "tcp"])).is_ok());
         assert!(parse(&args(&["127.0.0.1", "/p", "tcp", "/d", "x", "/z", "16"])).is_err());
         assert!(parse(&args(&["127.0.0.1", "/p", "tcp", "/l", "7001", "/c", "2"])).is_err());
         assert!(parse(&args(&["127.0.0.1", "/p", "tcp", "/l", "7001", "/rc", "1"])).is_err());
