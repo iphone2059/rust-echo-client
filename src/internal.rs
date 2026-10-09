@@ -1170,6 +1170,11 @@ pub mod worker {
             self.drain(budget)
         }
 
+        /// Takes back the batch the previous `wait_and_drain` handed out so the transport can
+        /// reuse its buffer. Without this the buffer is freed every loop iteration, which the
+        /// datagram path pays once per round trip.
+        fn recycle(&mut self, _completions: Vec<Completion>) {}
+
         /// Quiesces native I/O and releases resources in a safe order.
         fn shutdown(&mut self) -> Result<(), String> {
             Ok(())
@@ -1499,12 +1504,14 @@ pub mod worker {
                     }
                 };
 
-                for completion in completions {
+                for position in 0..completions.len() {
+                    let completion = completions[position];
                     self.handle_completion(completion, now, transport, &mut outcome);
                     if self.scheduler.statistics().fatal {
                         break;
                     }
                 }
+                transport.recycle(completions);
 
                 if self.report_seconds != 0 && !self.quiet {
                     let reported_at = clock.now_milliseconds();

@@ -1341,6 +1341,13 @@ pub mod transport {
             Ok(completions)
         }
 
+        fn recycle(&mut self, mut completions: Vec<Completion>) {
+            // Keep the capacity the batch grew to: the next wait_and_drain reuses this buffer
+            // instead of allocating and growing a new one on every round trip.
+            completions.clear();
+            self.pending = completions;
+        }
+
         fn shutdown(&mut self) -> Result<(), String> {
             self.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
         }
