@@ -142,9 +142,10 @@ pub mod session {
         }
 
         /// Validates received bytes against the attempt's expected payload. One attempt carries
-        /// `units` copies of `pattern`, so the expected byte at any offset is the pattern byte at
-        /// that offset modulo the pattern length. That keeps the comparison allocation-free while
-        /// still requiring the exact bytes at the exact offsets.
+        /// `units` copies of `pattern`, so the bytes at any offset are the pattern's bytes at that
+        /// offset modulo the pattern length. The comparison walks whole slices of the pattern and
+        /// compares them with slice equality, which is a memcmp: comparing byte by byte with a
+        /// modulo each would dominate the run for the 32 KiB attempts that /k 8 /z 4096 posts.
         pub fn on_received(
             &mut self,
             chunk: &[u8],
@@ -177,12 +178,17 @@ pub mod session {
             if end as u64 > total {
                 return ReceiveOutcome::Corrupted;
             }
-            if chunk
-                .iter()
-                .enumerate()
-                .any(|(offset, byte)| *byte != pattern[(start + offset) % pattern.len()])
-            {
-                return ReceiveOutcome::Corrupted;
+            let pattern_length = pattern.len();
+            let mut offset = start;
+            let mut rest = chunk;
+            while !rest.is_empty() {
+                let within = offset % pattern_length;
+                let take = (pattern_length - within).min(rest.len());
+                if rest[..take] != pattern[within..within + take] {
+                    return ReceiveOutcome::Corrupted;
+                }
+                offset += take;
+                rest = &rest[take..];
             }
 
             self.received = end as u32;
