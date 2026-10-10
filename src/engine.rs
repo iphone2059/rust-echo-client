@@ -843,6 +843,9 @@ pub mod transport {
             }
 
             let closing = session.state == GenerationState::Closing;
+        // A send that had to be re-posted reports the whole attempt, not its last segment:
+        // the worker checks the completion against the batch it posted.
+        let mut reported_bytes = bytes;
             match context.operation {
                 Operation::Connect => {
                     if !session.connect_outstanding {
@@ -894,6 +897,7 @@ pub mod transport {
                         );
                         return Ok(());
                     }
+                reported_bytes = session.send_offset.saturating_add(bytes);
                     session.send_offset = 0;
                     session.send_posted_bytes = 0;
                     session.release_send_slot(context.slot)?;
@@ -926,7 +930,7 @@ pub mod transport {
                     slot: context.slot,
                     operation: context.operation,
                     status,
-                    bytes,
+                    bytes: reported_bytes,
                 });
             }
 
