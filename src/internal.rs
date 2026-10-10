@@ -1629,6 +1629,7 @@ pub mod worker {
     mod tests {
         use super::*;
         use crate::native::completion::NO_SEND_SLOT;
+        use std::collections::VecDeque;
 
         #[derive(Default)]
         struct TestClock {
