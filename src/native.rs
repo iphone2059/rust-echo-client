@@ -9,15 +9,15 @@
 use core::ffi::c_void;
 use core::mem::size_of;
 
-use windows::Win32::winsock2::WSAGetLastError;
 use windows::Win32::mswsock::{LPFN_CONNECTEX, RIO_EXTENSION_FUNCTION_TABLE};
+use windows::Win32::winsock2::WSAGetLastError;
 use windows::Win32::winsock2::{
-    SOCKET, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO, WSACleanup, WSADATA, WSASocketW,
-    WSAStartup, WSAIoctl, closesocket, setsockopt, INVALID_SOCKET,
+    INVALID_SOCKET, SOCKET, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO, WSACleanup, WSADATA,
+    WSAIoctl, WSASocketW, WSAStartup, closesocket, setsockopt,
 };
 use windows::Win32::ws2::{
     AF_INET, IPPROTO_TCP, IPPROTO_UDP, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SO_RCVBUF,
-    SO_SNDBUF, SOL_SOCKET, SOCK_DGRAM, SOCK_STREAM, TCP_NODELAY,
+    SO_SNDBUF, SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, TCP_NODELAY,
 };
 use windows::core::GUID;
 
@@ -33,7 +33,10 @@ pub struct NativeError {
 impl NativeError {
     pub(crate) fn winsock_last(stage: &'static str) -> Self {
         // The code is captured at the failing call site; GetLastError is never read later.
-        Self { stage, code: unsafe { WSAGetLastError() } }
+        Self {
+            stage,
+            code: unsafe { WSAGetLastError() },
+        }
     }
 }
 
@@ -47,7 +50,10 @@ impl Winsock {
         let mut data = WSADATA::default();
         let status = unsafe { WSAStartup(0x0202, &mut data) };
         if status != 0 {
-            return Err(NativeError { stage: "WSAStartup", code: status });
+            return Err(NativeError {
+                stage: "WSAStartup",
+                code: status,
+            });
         }
         Ok(Self { started: true })
     }
@@ -102,14 +108,15 @@ pub fn registered_socket(protocol: Protocol) -> Result<SocketOwner, NativeError>
         Protocol::Udp => (SOCK_DGRAM, IPPROTO_UDP),
         Protocol::None => {
             // 87 = ERROR_INVALID_PARAMETER, matching the baseline's rejected-protocol path.
-            return Err(NativeError { stage: "registered_socket(protocol)", code: 87 });
+            return Err(NativeError {
+                stage: "registered_socket(protocol)",
+                code: 87,
+            });
         }
     };
     // The bindings expose the WSA_FLAG_* constants as i32; dwflags is u32.
     let flags = (WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO) as u32;
-    let socket = unsafe {
-        WSASocketW(AF_INET, kind, transport, None, Default::default(), flags)
-    };
+    let socket = unsafe { WSASocketW(AF_INET, kind, transport, None, Default::default(), flags) };
     if socket == INVALID_SOCKET {
         return Err(NativeError::winsock_last("WSASocketW(AF_INET, registered)"));
     }
@@ -170,6 +177,7 @@ const WSAID_MULTIPLE_RIO: GUID = GUID::from_u128(0x8509_e081_96dd_4005_b165_9e2e
 
 /// The RIO entry points. RIO is never imported as a flat symbol: every function is
 /// reached through this table, which the provider fills in for the running stack.
+#[derive(Clone, Copy)]
 pub struct RioFunctions {
     table: RIO_EXTENSION_FUNCTION_TABLE,
 }
@@ -200,7 +208,25 @@ impl RioFunctions {
             ));
         }
         if returned != expected || table.cbSize != expected {
-            return Err(NativeError { stage: "RIO table size", code: 13 });
+            return Err(NativeError {
+                stage: "RIO table size",
+                code: 13,
+            });
+        }
+        if table.RIOReceive.is_none()
+            || table.RIOSend.is_none()
+            || table.RIOCreateCompletionQueue.is_none()
+            || table.RIOCloseCompletionQueue.is_none()
+            || table.RIOCreateRequestQueue.is_none()
+            || table.RIORegisterBuffer.is_none()
+            || table.RIODeregisterBuffer.is_none()
+            || table.RIODequeueCompletion.is_none()
+            || table.RIONotify.is_none()
+        {
+            return Err(NativeError {
+                stage: "RIO table entry points",
+                code: 13,
+            });
         }
         Ok(Self { table })
     }
@@ -238,8 +264,11 @@ pub fn load_connect_ex(socket: SOCKET) -> Result<LPFN_CONNECTEX, NativeError> {
     if status != 0 {
         return Err(NativeError::winsock_last("WSAIoctl(WSAID_CONNECTEX)"));
     }
-    if function.is_none() {
-        return Err(NativeError { stage: "ConnectEx entry point", code: 13 });
+    if function.is_none() || returned != size_of::<LPFN_CONNECTEX>() as u32 {
+        return Err(NativeError {
+            stage: "ConnectEx entry point",
+            code: 13,
+        });
     }
     Ok(function)
 }
@@ -248,21 +277,20 @@ pub fn load_connect_ex(socket: SOCKET) -> Result<LPFN_CONNECTEX, NativeError> {
 // overlapped storage, the registered arena and the endpoint helpers are submodules of this module.
 
 pub mod arena {
-    //! Registered RIO memory pools.
+    //! One worker-owned virtual allocation for both directions of registered RIO memory.
     //!
-    //! Receive and send have deliberately different registration layouts:
-    //! * RX: aggregated registrations with non-overlapping per-session slices. RIO receive permits
-    //!   other portions of the same registered buffer to be used while one slice is pending.
-    //! * TX: one registration per pipeline slot. RIOSend reserves the *entire registration* for
-    //!   the duration of an outstanding send, so concurrent sends cannot share a BufferId.
+    //! TX windows precede RX windows, and each session has a disjoint window in each region.
+    //! RX uses one registration. TX uses one registration per concurrent send window: the
+    //! documented RIOSend contract prohibits using any other portion of its registration while
+    //! the send is pending, even when those portions would otherwise be disjoint.
 
     use core::ffi::c_void;
 
     use windows::Win32::memoryapi::{VirtualAlloc, VirtualFree};
     use windows::Win32::mswsockdef::RIO_BUF;
 
-    use crate::native::{NativeError, RioFunctions};
     use crate::native::rio::RegisteredBuffer;
+    use crate::native::{NativeError, RioFunctions};
 
     const MEM_COMMIT: u32 = 0x0000_1000;
     const MEM_RESERVE: u32 = 0x0000_2000;
@@ -296,188 +324,97 @@ pub mod arena {
         (end <= total).then_some(offset)
     }
 
-    /// Ownership container for the RIO registrations backing the pool. RX stores a small
-    /// set of aggregated registrations; TX stores one registration per concurrent send slot.
-    type Registrations = Vec<RegisteredBuffer>;
+    fn checked_worker_bytes(slots: u32, stride: u32) -> Option<u32> {
+        if slots == 0 || stride == 0 {
+            return None;
+        }
+        slots.checked_mul(stride)?.checked_mul(2)
+    }
 
-    /// A fixed-stride VirtualAlloc pool with aggregated RX registrations or one TX registration
-    /// per slot. Registrations are always destroyed before the backing pages are released.
+    /// A fixed-stride worker arena. Its complete TX/RX footprint fits in a DWORD, matching the
+    /// reference's worker storage budget. All registrations retire before the sole page owner.
     pub struct Arena {
         base: *mut u8,
         bytes: usize,
         stride: u32,
         slots: u32,
-        registrations: Option<Registrations>,
-        views: Vec<RIO_BUF>,
+        receive_offset: usize,
+        send_registrations: Vec<RegisteredBuffer>,
+        receive_registration: Option<RegisteredBuffer>,
     }
 
     impl Arena {
-        /// Receive pool: registrations are aggregated, while every session gets a disjoint
-        /// RIO_BUF slice. This minimizes registration overhead without crossing the DWORD limit.
-        pub fn create_receive(
+        /// Fill each TX window directly from the payload, avoiding an intermediate batch copy.
+        /// Construction failures use the same deregister-before-unmap ownership order as Drop.
+        pub fn create_worker(
             rio: &RioFunctions,
             slots: u32,
             stride: u32,
-        ) -> Result<Self, NativeError> {
-            let (base, bytes) = Self::allocate(slots, stride)?;
-            let slots_per_chunk = (u32::MAX / stride).max(1);
-            let mut registrations = Vec::new();
-            let mut views = Vec::with_capacity(slots as usize);
-            let mut first_slot = 0u32;
-
-            while first_slot < slots {
-                let chunk_slots = (slots - first_slot).min(slots_per_chunk);
-                let Some(chunk_offset) = (first_slot as usize).checked_mul(stride as usize) else {
-                    drop(registrations);
-                    release_pages_checked(base);
-                    return Err(NativeError {
-                        stage: "receive arena chunk offset overflow",
-                        code: 13,
-                    });
-                };
-                let Some(chunk_bytes_u32) = chunk_slots.checked_mul(stride) else {
-                    drop(registrations);
-                    release_pages_checked(base);
-                    return Err(NativeError {
-                        stage: "receive arena chunk length overflow",
-                        code: 13,
-                    });
-                };
-                let chunk = unsafe {
-                    core::slice::from_raw_parts_mut(base.add(chunk_offset), chunk_bytes_u32 as usize)
-                };
-                let registration = match RegisteredBuffer::register(rio, chunk) {
-                    Ok(registration) => registration,
-                    Err(error) => {
-                        drop(registrations);
-                        release_pages_checked(base);
-                        return Err(error);
-                    }
-                };
-
-                for local_slot in 0..chunk_slots {
-                    let Some(offset) = local_slot.checked_mul(stride) else {
-                        drop(registration);
-                        drop(registrations);
-                        release_pages_checked(base);
-                        return Err(NativeError {
-                            stage: "receive arena RIO offset overflow",
-                            code: 13,
-                        });
-                    };
-                    let view = match registration.slice(offset, stride) {
-                        Ok(view) => view,
-                        Err(error) => {
-                            drop(registration);
-                            drop(registrations);
-                            release_pages_checked(base);
-                            return Err(error);
-                        }
-                    };
-                    views.push(view);
-                }
-                registrations.push(registration);
-                first_slot += chunk_slots;
-            }
-
-            Ok(Self {
-                base,
-                bytes,
-                stride,
-                slots,
-                registrations: Some(registrations),
-                views,
-            })
-        }
-
-        /// Send pool: every pipeline slot has its own BufferId and a private payload copy.
-        pub fn create_send(
-            rio: &RioFunctions,
-            slots: u32,
             payload: &[u8],
         ) -> Result<Self, NativeError> {
-            let stride = u32::try_from(payload.len()).map_err(|_| NativeError {
-                stage: "send arena payload length",
-                code: 13,
-            })?;
-            if stride == 0 {
+            if payload.is_empty() || stride as usize % payload.len() != 0 {
                 return Err(NativeError {
-                    stage: "send arena payload length",
+                    stage: "worker arena payload dimensions",
                     code: 13,
                 });
             }
-            let (base, bytes) = Self::allocate(slots, stride)?;
-            let mut registrations = Vec::with_capacity(slots as usize);
-            let mut views = Vec::with_capacity(slots as usize);
-
-            for slot in 0..slots as usize {
-                let Some(offset) = checked_slot_offset(slot, stride as usize, bytes) else {
-                    drop(registrations);
-                    release_pages_checked(base);
-                    return Err(NativeError {
-                        stage: "send arena slot offset",
-                        code: 13,
-                    });
-                };
-                let slice = unsafe { core::slice::from_raw_parts_mut(base.add(offset), stride as usize) };
-                slice.copy_from_slice(payload);
-                let registration = match RegisteredBuffer::register(rio, slice) {
-                    Ok(registration) => registration,
-                    Err(error) => {
-                        drop(registrations);
-                        release_pages_checked(base);
-                        return Err(error);
-                    }
-                };
-                let view = match registration.slice(0, stride) {
-                    Ok(view) => view,
-                    Err(error) => {
-                        drop(registration);
-                        drop(registrations);
-                        release_pages_checked(base);
-                        return Err(error);
-                    }
-                };
-                registrations.push(registration);
-                views.push(view);
-            }
-
-            Ok(Self {
-                base,
-                bytes,
-                stride,
-                slots,
-                registrations: Some(registrations),
-                views,
-            })
-        }
-
-        fn allocate(slots: u32, stride: u32) -> Result<(*mut u8, usize), NativeError> {
-            if slots == 0 || stride == 0 {
-                return Err(NativeError {
-                    stage: "registered arena dimensions",
-                    code: 13,
-                });
-            }
-            let bytes = checked_pool_bytes(slots as usize, stride as usize).ok_or(NativeError {
-                stage: "registered arena size overflow",
-                code: 13,
-            })?;
+            let bytes = checked_worker_bytes(slots, stride).ok_or(NativeError {
+                stage: "worker arena DWORD capacity",
+                code: 8,
+            })? as usize;
+            let receive_offset = bytes / 2;
+            let mut send_registrations = Vec::new();
+            send_registrations
+                .try_reserve_exact(slots as usize)
+                .map_err(|_| NativeError {
+                    stage: "worker arena registration allocation",
+                    code: 8,
+                })?;
             if bytes > isize::MAX as usize {
                 return Err(NativeError {
-                    stage: "registered arena exceeds Rust pointer-offset range",
+                    stage: "worker arena exceeds Rust pointer-offset range",
                     code: 13,
                 });
             }
-            let base = unsafe { VirtualAlloc(None, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }
-                as *mut u8;
+            let base =
+                unsafe { VirtualAlloc(None, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }
+                    as *mut u8;
             if base.is_null() {
                 return Err(NativeError {
-                    stage: "VirtualAlloc(registered arena)",
+                    stage: "VirtualAlloc(worker arena)",
                     code: unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
                 });
             }
-            Ok((base, bytes))
+            let mut arena = Self {
+                base,
+                bytes,
+                stride,
+                slots,
+                receive_offset,
+                send_registrations,
+                receive_registration: None,
+            };
+            for slot in 0..slots as usize {
+                let offset = checked_slot_offset(slot, stride as usize, receive_offset).ok_or(
+                    NativeError {
+                        stage: "worker arena send slot bounds",
+                        code: 13,
+                    },
+                )?;
+                let send =
+                    unsafe { core::slice::from_raw_parts_mut(base.add(offset), stride as usize) };
+                for unit in send.chunks_exact_mut(payload.len()) {
+                    unit.copy_from_slice(payload);
+                }
+                arena
+                    .send_registrations
+                    .push(RegisteredBuffer::register(rio, send)?);
+            }
+            let receive = unsafe {
+                core::slice::from_raw_parts_mut(base.add(receive_offset), receive_offset)
+            };
+            arena.receive_registration = Some(RegisteredBuffer::register(rio, receive)?);
+            Ok(arena)
         }
 
         pub fn slots(&self) -> u32 {
@@ -492,50 +429,74 @@ pub mod arena {
             self.bytes
         }
 
-        pub fn view(&self, slot: u32, length: u32) -> Result<RIO_BUF, NativeError> {
-            if self.registrations.is_none() || slot >= self.slots || length == 0 || length > self.stride {
-                return Err(NativeError {
-                    stage: "registered arena view bounds",
-                    code: 13,
-                });
-            }
-            let mut view = self.views[slot as usize];
-            view.Length = length;
-            Ok(view)
+        pub fn send_view(&self, slot: u32, length: u32) -> Result<RIO_BUF, NativeError> {
+            self.send_view_from(slot, 0, length)
         }
 
         /// A view of part of a slot, used to re-post the remainder of a partially completed send.
-        pub fn view_from(&self, slot: u32, offset: u32, length: u32) -> Result<RIO_BUF, NativeError> {
-            let mut view = self.view(slot, length)?;
-            if u64::from(offset).saturating_add(u64::from(length)) > u64::from(self.stride) {
-                return Err(NativeError {
-                    stage: "registered arena view offset bounds",
+        pub fn send_view_from(
+            &self,
+            slot: u32,
+            offset: u32,
+            length: u32,
+        ) -> Result<RIO_BUF, NativeError> {
+            let registration = self
+                .send_registrations
+                .get(slot as usize)
+                .ok_or(NativeError {
+                    stage: "worker arena send view bounds",
                     code: 13,
-                });
-            }
-            view.Offset = view.Offset.wrapping_add(offset);
-            Ok(view)
+                })?;
+            registration.slice(offset, length)
+        }
+
+        pub fn receive_view(&self, slot: u32, length: u32) -> Result<RIO_BUF, NativeError> {
+            let offset =
+                checked_slot_offset(slot as usize, self.stride as usize, self.receive_offset)
+                    .filter(|_| length != 0 && length <= self.stride)
+                    .ok_or(NativeError {
+                        stage: "worker arena receive view bounds",
+                        code: 13,
+                    })?;
+            self.receive_registration
+                .as_ref()
+                .ok_or(NativeError {
+                    stage: "worker arena receive registration unavailable",
+                    code: 13,
+                })?
+                .slice(offset as u32, length)
         }
 
         /// Reads bytes written by a completed receive. The caller must only call this after the
         /// corresponding completion has been dequeued and before that slot is reposted.
-        pub fn read(&self, slot: u32, length: u32) -> &[u8] {
-            if self.registrations.is_none() || slot >= self.slots || length == 0 || length > self.stride {
+        pub fn read_receive(&self, slot: u32, length: u32) -> &[u8] {
+            if self.receive_registration.is_none()
+                || slot >= self.slots
+                || length == 0
+                || length > self.stride
+            {
                 return &[];
             }
-            let offset = match checked_slot_offset(slot as usize, self.stride as usize, self.bytes) {
-                Some(offset) => offset,
-                None => return &[],
-            };
-            unsafe { core::slice::from_raw_parts(self.base.add(offset), length as usize) }
+            let offset =
+                match checked_slot_offset(slot as usize, self.stride as usize, self.receive_offset)
+                {
+                    Some(offset) => offset,
+                    None => return &[],
+                };
+            unsafe {
+                core::slice::from_raw_parts(
+                    self.base.add(self.receive_offset + offset),
+                    length as usize,
+                )
+            }
         }
     }
 
     impl Drop for Arena {
         fn drop(&mut self) {
-            self.views.clear();
             // Deregister every BufferId while its virtual memory is still mapped.
-            drop(self.registrations.take());
+            self.send_registrations.clear();
+            drop(self.receive_registration.take());
             release_pages_checked(self.base);
         }
     }
@@ -553,37 +514,160 @@ pub mod arena {
             assert_eq!(checked_slot_offset(3, 1024, 4096), Some(3072));
             assert_eq!(checked_slot_offset(4, 1024, 4096), None);
         }
+
+        #[test]
+        fn worker_footprint_reserves_both_directions_and_fits_dword() {
+            assert_eq!(checked_worker_bytes(4, 1024), Some(8192));
+            assert_eq!(checked_worker_bytes(0, 1024), None);
+            assert_eq!(checked_worker_bytes(4, 0), None);
+            assert_eq!(checked_worker_bytes(1, u32::MAX / 2), Some(u32::MAX - 1));
+            assert_eq!(checked_worker_bytes(1, u32::MAX / 2 + 1), None);
+            assert_eq!(checked_worker_bytes(u32::MAX, 2), None);
+        }
     }
 }
 
 pub mod clock {
-    //! Production clock: real time from GetTickCount64.
+    //! Production clock: the reference's raw high-resolution performance counter. Deadlines
+    //! keep tick precision; only the blocking IOCP wait is rounded up to milliseconds.
     //!
     //! The blocking wait lives in the transport (Transport::wait_and_drain), because only that
     //! layer can see both the completion port and the RIO completion queue.
 
-    use windows::Win32::sysinfoapi::GetTickCount64;
+    use windows::Win32::errhandlingapi::GetLastError;
+    use windows::Win32::profileapi::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    use windows::Win32::winnt::LARGE_INTEGER;
 
+    use crate::native::NativeError;
     use crate::worker::Clock;
 
+    fn ticks_to_milliseconds(ticks: u64, frequency: u64) -> u64 {
+        // Keep the ordinary path to one native-width division; use wider arithmetic only
+        // when the scaled counter would overflow, and never wrap a deadline backwards.
+        if let Some(scaled) = ticks.checked_mul(1_000) {
+            scaled / frequency
+        } else {
+            ((u128::from(ticks) * 1_000) / u128::from(frequency)).min(u128::from(u64::MAX)) as u64
+        }
+    }
+
+    pub(crate) fn milliseconds_to_ticks(milliseconds: u64, frequency: u64) -> u64 {
+        if let Some(scaled) = milliseconds.checked_mul(frequency) {
+            scaled.div_ceil(1_000)
+        } else {
+            (u128::from(milliseconds) * u128::from(frequency))
+                .div_ceil(1_000)
+                .min(u128::from(u64::MAX)) as u64
+        }
+    }
+
+    pub(crate) fn ticks_to_wait_milliseconds(ticks: u64, frequency: u64) -> u64 {
+        if let Some(scaled) = ticks.checked_mul(1_000) {
+            scaled.div_ceil(frequency)
+        } else {
+            (u128::from(ticks) * 1_000)
+                .div_ceil(u128::from(frequency))
+                .min(u128::from(u64::MAX)) as u64
+        }
+    }
+
+    fn counter() -> Result<u64, NativeError> {
+        let mut value = LARGE_INTEGER::default();
+        if !unsafe { QueryPerformanceCounter(&mut value) }.as_bool() {
+            return Err(NativeError {
+                stage: "QueryPerformanceCounter(client timer)",
+                code: unsafe { GetLastError() } as i32,
+            });
+        }
+        u64::try_from(unsafe { value.QuadPart }).map_err(|_| NativeError {
+            stage: "QueryPerformanceCounter(client timer value)",
+            code: 13,
+        })
+    }
+
     /// Real time for the worker loop.
-    #[derive(Debug, Default)]
-    pub struct RioClock;
+    #[derive(Debug)]
+    pub struct RioClock {
+        ticks_per_second: u64,
+    }
 
     impl RioClock {
-        pub fn new() -> Self {
-            Self
+        pub fn new() -> Result<Self, NativeError> {
+            let mut frequency = LARGE_INTEGER::default();
+            if !unsafe { QueryPerformanceFrequency(&mut frequency) }.as_bool() {
+                return Err(NativeError {
+                    stage: "QueryPerformanceFrequency(client timer)",
+                    code: unsafe { GetLastError() } as i32,
+                });
+            }
+            let ticks_per_second = unsafe { frequency.QuadPart };
+            if ticks_per_second <= 0 {
+                return Err(NativeError {
+                    stage: "QueryPerformanceFrequency(client timer value)",
+                    code: 13,
+                });
+            }
+            // Check the counter before any session has posted native I/O.
+            counter()?;
+            Ok(Self {
+                ticks_per_second: ticks_per_second as u64,
+            })
         }
     }
 
     impl Clock for RioClock {
         fn now_milliseconds(&mut self) -> u64 {
-            unsafe { GetTickCount64() }
+            ticks_to_milliseconds(self.now_ticks(), self.ticks_per_second)
+        }
+
+        fn ticks_per_second(&self) -> u64 {
+            self.ticks_per_second
+        }
+
+        fn now_ticks(&mut self) -> u64 {
+            // The worker boundary catches a panic, requests fatal stop for its peers and joins
+            // them. A failed timer must never silently switch to a different clock domain.
+            counter().unwrap_or_else(|error| {
+                panic!("{} failed: native_error={}", error.stage, error.code)
+            })
         }
 
         fn wait(&mut self, _milliseconds: u32) {
             // Intentionally empty: the transport performs the blocking wait so that ConnectEx
             // completions and RIO completions are observed together.
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{milliseconds_to_ticks, ticks_to_milliseconds, ticks_to_wait_milliseconds};
+
+        #[test]
+        fn performance_counter_preserves_millisecond_boundaries() {
+            assert_eq!(ticks_to_milliseconds(0, 1_000_000), 0);
+            assert_eq!(ticks_to_milliseconds(999, 1_000_000), 0);
+            assert_eq!(ticks_to_milliseconds(1_000, 1_000_000), 1);
+            assert_eq!(ticks_to_milliseconds(1_999, 1_000_000), 1);
+            assert_eq!(ticks_to_milliseconds(2_000, 1_000_000), 2);
+        }
+
+        #[test]
+        fn large_counter_values_do_not_wrap_the_clock() {
+            assert_eq!(ticks_to_milliseconds(u64::MAX, 1_000), u64::MAX);
+            assert_eq!(ticks_to_milliseconds(u64::MAX, 1), u64::MAX);
+            assert_eq!(ticks_to_milliseconds(u64::MAX, u64::MAX), 1_000);
+        }
+
+        #[test]
+        fn tick_deadlines_and_waits_round_up_without_overflow() {
+            assert_eq!(milliseconds_to_ticks(1, 1_000_000), 1_000);
+            assert_eq!(milliseconds_to_ticks(1, 1_001), 2);
+            assert_eq!(milliseconds_to_ticks(u64::MAX, u64::MAX), u64::MAX);
+            assert_eq!(ticks_to_wait_milliseconds(0, 1_000_000), 0);
+            assert_eq!(ticks_to_wait_milliseconds(1, 1_000_000), 1);
+            assert_eq!(ticks_to_wait_milliseconds(1_001, 1_000_000), 2);
+            assert_eq!(ticks_to_wait_milliseconds(u64::MAX, 1), u64::MAX);
+            assert_eq!(ticks_to_wait_milliseconds(u64::MAX, u64::MAX), 1_000);
         }
     }
 }
@@ -670,8 +754,7 @@ pub mod completion {
         let value = (operation as u64)
             | ((u64::from(index) & SESSION_MASK) << OP_BITS)
             | ((u64::from(slot) & SLOT_MASK) << (OP_BITS + SESSION_BITS))
-            | ((u64::from(generation) & GENERATION_MASK)
-                << (OP_BITS + SESSION_BITS + SLOT_BITS));
+            | ((u64::from(generation) & GENERATION_MASK) << (OP_BITS + SESSION_BITS + SLOT_BITS));
         value as usize as *mut c_void
     }
 
@@ -684,8 +767,7 @@ pub mod completion {
         let operation = Operation::from_tag(context & OP_MASK)?;
         let index = (context >> OP_BITS) & SESSION_MASK;
         let slot = (context >> (OP_BITS + SESSION_BITS)) & SLOT_MASK;
-        let generation =
-            (context >> (OP_BITS + SESSION_BITS + SLOT_BITS)) & GENERATION_MASK;
+        let generation = (context >> (OP_BITS + SESSION_BITS + SLOT_BITS)) & GENERATION_MASK;
 
         if generation == 0 {
             return None;
@@ -837,8 +919,8 @@ pub mod endpoint {
     use core::mem::{size_of, zeroed};
     use core::ptr;
 
-    use windows::Win32::mswsock::LPFN_CONNECTEX;
     use windows::Win32::minwinbase::OVERLAPPED;
+    use windows::Win32::mswsock::LPFN_CONNECTEX;
     use windows::Win32::winsock2::{SOCKET, bind, setsockopt};
     use windows::Win32::ws2::{
         ADDRINFOW, AF_INET, FreeAddrInfoW, GetAddrInfoW, PADDRINFOW, SOCKADDR, SOCKADDR_IN,
@@ -865,7 +947,11 @@ pub mod endpoint {
     /// The first answer is copied out, matching the reference's single `memcpy`.
     pub fn resolve_ipv4(host: &str, port: u16) -> Result<SOCKADDR_IN, i32> {
         let mut node: Vec<u16> = host.encode_utf16().chain(core::iter::once(0)).collect();
-        let mut service: Vec<u16> = port.to_string().encode_utf16().chain(core::iter::once(0)).collect();
+        let mut service: Vec<u16> = port
+            .to_string()
+            .encode_utf16()
+            .chain(core::iter::once(0))
+            .collect();
         let mut hints: ADDRINFOW = unsafe { zeroed() };
         hints.ai_family = AF_INET as _;
         let mut results: PADDRINFOW = core::ptr::null_mut();
@@ -887,11 +973,7 @@ pub mod endpoint {
                 FreeAddrInfoW(Some(results));
                 return Err(WSAEINVAL_LIKE);
             }
-            core::ptr::copy_nonoverlapping(
-                first.ai_addr as *const SOCKADDR_IN,
-                &mut address,
-                1,
-            );
+            core::ptr::copy_nonoverlapping(first.ai_addr as *const SOCKADDR_IN, &mut address, 1);
             FreeAddrInfoW(Some(results));
         }
         Ok(address)
@@ -918,9 +1000,18 @@ pub mod endpoint {
     /// `port == 0`. ConnectEx requires a bound socket, so TCP must not defer this step.
     pub fn bind_local(socket: SOCKET, port: u16) -> Result<(), NativeError> {
         let address = local_endpoint(port);
-        let status = unsafe { bind(socket, sockaddr_ptr(&address), size_of::<SOCKADDR_IN>() as i32) };
+        let status = unsafe {
+            bind(
+                socket,
+                sockaddr_ptr(&address),
+                size_of::<SOCKADDR_IN>() as i32,
+            )
+        };
         if status != 0 {
-            return Err(NativeError { stage: "bind(local port)", code: unsafe { windows::Win32::winsock2::WSAGetLastError() } });
+            return Err(NativeError {
+                stage: "bind(local port)",
+                code: unsafe { windows::Win32::winsock2::WSAGetLastError() },
+            });
         }
         Ok(())
     }
@@ -928,7 +1019,13 @@ pub mod endpoint {
     /// Sets the default peer of a datagram socket. UDP connect performs no network round trip,
     /// so it is synchronous; afterwards RIOReceive/RIOSend work without explicit addresses.
     pub fn connect_udp(socket: SOCKET, target: &SOCKADDR_IN) -> Result<(), NativeError> {
-        let status = unsafe { windows::Win32::winsock2::connect(socket, sockaddr_ptr(target), size_of::<SOCKADDR_IN>() as i32) };
+        let status = unsafe {
+            windows::Win32::winsock2::connect(
+                socket,
+                sockaddr_ptr(target),
+                size_of::<SOCKADDR_IN>() as i32,
+            )
+        };
         if status != 0 {
             return Err(NativeError {
                 stage: "connect(udp peer)",
@@ -947,7 +1044,10 @@ pub mod endpoint {
         target: &SOCKADDR_IN,
         overlapped: *mut OVERLAPPED,
     ) -> Result<(), NativeError> {
-        let connect = connect_ex.ok_or(NativeError { stage: "ConnectEx entry point", code: 13 })?;
+        let connect = connect_ex.ok_or(NativeError {
+            stage: "ConnectEx entry point",
+            code: 13,
+        })?;
         let ok = unsafe {
             connect(
                 socket,
@@ -967,7 +1067,10 @@ pub mod endpoint {
         if code == 997 {
             Ok(())
         } else {
-            Err(NativeError { stage: "ConnectEx", code })
+            Err(NativeError {
+                stage: "ConnectEx",
+                code,
+            })
         }
     }
 
@@ -1131,14 +1234,16 @@ pub mod rio {
     use core::ptr;
 
     use windows::Win32::ioapiset::CreateIoCompletionPort;
-    use windows::Win32::{HANDLE, INVALID_HANDLE_VALUE};
     use windows::Win32::mswsock::{
         LPFN_RIOCLOSECOMPLETIONQUEUE, LPFN_RIODEREGISTERBUFFER, RIO_EVENT_COMPLETION,
-        RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION,
-        RIO_NOTIFICATION_COMPLETION_0, RIO_NOTIFICATION_COMPLETION_0_1,
+        RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION, RIO_NOTIFICATION_COMPLETION_0,
+        RIO_NOTIFICATION_COMPLETION_0_1,
     };
-    use windows::Win32::mswsockdef::{RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_RQ, RIORESULT};
+    use windows::Win32::mswsockdef::{
+        RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_INVALID_BUFFERID, RIO_RQ, RIORESULT,
+    };
     use windows::Win32::winsock2::SOCKET;
+    use windows::Win32::{HANDLE, INVALID_HANDLE_VALUE};
 
     use crate::native::{NativeError, RioFunctions};
 
@@ -1151,7 +1256,7 @@ pub mod rio {
         pub fn create() -> Result<Self, NativeError> {
             // NumberOfConcurrentThreads == 0 asks Windows to use its processor-count default.
             // This client still owns the worker threads that call GetQueuedCompletionStatus.
-            let handle = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 0) };
+            let handle = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) };
             // CreateIoCompletionPort reports failure with a null handle (not
             // INVALID_HANDLE_VALUE), and the reason has to be captured at the call site.
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
@@ -1196,10 +1301,10 @@ pub mod rio {
             completion_key: *mut c_void,
             overlapped: *mut c_void,
         ) -> Result<Self, NativeError> {
-            let create = rio
-                .table()
-                .RIOCreateCompletionQueue
-                .ok_or(NativeError { stage: "RIOCreateCompletionQueue entry point", code: 13 })?;
+            let create = rio.table().RIOCreateCompletionQueue.ok_or(NativeError {
+                stage: "RIOCreateCompletionQueue entry point",
+                code: 13,
+            })?;
             let mut notification = RIO_NOTIFICATION_COMPLETION::default();
             notification.Type = RIO_IOCP_COMPLETION;
             notification.Anonymous = RIO_NOTIFICATION_COMPLETION_0 {
@@ -1209,7 +1314,12 @@ pub mod rio {
                     Overlapped: overlapped,
                 },
             };
-            let queue = unsafe { create(capacity, &mut notification as *mut RIO_NOTIFICATION_COMPLETION) };
+            let queue = unsafe {
+                create(
+                    capacity,
+                    &mut notification as *mut RIO_NOTIFICATION_COMPLETION,
+                )
+            };
             if queue.is_null() {
                 // The table entry reports through its return value; the reason is captured here
                 // rather than being replaced by a placeholder code.
@@ -1238,28 +1348,40 @@ pub mod rio {
         /// busy worker never pays for a redundant RIONotify.
         pub fn arm(&mut self, rio: &RioFunctions) -> Result<(), NativeError> {
             if self.armed {
-                return Ok(());
+                return Err(NativeError {
+                    stage: "RIO notification duplicate arm",
+                    code: 5023,
+                });
             }
-            let notify = rio
-                .table()
-                .RIONotify
-                .ok_or(NativeError { stage: "RIONotify entry point", code: 13 })?;
+            let notify = rio.table().RIONotify.ok_or(NativeError {
+                stage: "RIONotify entry point",
+                code: 13,
+            })?;
             // Only ERROR_SUCCESS is accepted: any other status leaves the queue unarmed and
             // the caller must not assume a wake-up is coming.
             let status = unsafe { notify(self.queue) };
-            // WSAEALREADY (10037) means a notification is already pending for this queue: the
-            // queue is armed, which is exactly the requested state. Treating it as a failure
-            // would kill sessions that are merely re-arming after an unrelated delivery.
-            if status != 0 && status != WSAEALREADY {
-                return Err(NativeError { stage: "RIONotify", code: status });
+            // WSAEALREADY means our ownership state disagrees with the provider. Keep it as an
+            // internal error instead of taking ownership of an untracked notification.
+            if status != 0 {
+                return Err(NativeError {
+                    stage: "RIONotify",
+                    code: status,
+                });
             }
             self.armed = true;
             Ok(())
         }
 
         /// A delivery clears the armed state; the next queued operation re-arms it.
-        pub fn on_delivery(&mut self) {
+        pub fn on_delivery(&mut self) -> Result<(), NativeError> {
+            if !self.armed {
+                return Err(NativeError {
+                    stage: "RIO notification delivery transition",
+                    code: 5023,
+                });
+            }
             self.armed = false;
+            Ok(())
         }
 
         pub fn is_armed(&self) -> bool {
@@ -1273,21 +1395,32 @@ pub mod rio {
             rio: &RioFunctions,
             results: &mut [RIORESULT],
         ) -> Result<u32, NativeError> {
-            let dequeue = rio
-                .table()
-                .RIODequeueCompletion
-                .ok_or(NativeError { stage: "RIODequeueCompletion entry point", code: 13 })?;
-            let capacity = u32::try_from(results.len())
-                .map_err(|_| NativeError { stage: "RIODequeueCompletion capacity", code: 13 })?;
-            if capacity == 0 || capacity > self.capacity {
-                return Err(NativeError { stage: "RIODequeueCompletion capacity", code: 13 });
+            let dequeue = rio.table().RIODequeueCompletion.ok_or(NativeError {
+                stage: "RIODequeueCompletion entry point",
+                code: 13,
+            })?;
+            let capacity = u32::try_from(results.len()).map_err(|_| NativeError {
+                stage: "RIODequeueCompletion capacity",
+                code: 13,
+            })?;
+            if capacity == 0 {
+                return Err(NativeError {
+                    stage: "RIODequeueCompletion capacity",
+                    code: 13,
+                });
             }
             let count = unsafe { dequeue(self.queue, results.as_mut_ptr(), capacity) };
             if count == u32::MAX {
-                return Err(NativeError { stage: "RIODequeueCompletion(RIO_CORRUPT_CQ)", code: 13 });
+                return Err(NativeError {
+                    stage: "RIODequeueCompletion(RIO_CORRUPT_CQ)",
+                    code: 13,
+                });
             }
             if count > capacity {
-                return Err(NativeError { stage: "RIODequeueCompletion count", code: 13 });
+                return Err(NativeError {
+                    stage: "RIODequeueCompletion count",
+                    code: 13,
+                });
             }
             Ok(count)
         }
@@ -1314,17 +1447,23 @@ pub mod rio {
 
     impl RegisteredBuffer {
         pub fn register(rio: &RioFunctions, bytes: &mut [u8]) -> Result<Self, NativeError> {
-            let register = rio
-                .table()
-                .RIORegisterBuffer
-                .ok_or(NativeError { stage: "RIORegisterBuffer entry point", code: 13 })?;
-            let length = u32::try_from(bytes.len())
-                .map_err(|_| NativeError { stage: "RIORegisterBuffer length", code: 13 })?;
+            let register = rio.table().RIORegisterBuffer.ok_or(NativeError {
+                stage: "RIORegisterBuffer entry point",
+                code: 13,
+            })?;
+            let length = u32::try_from(bytes.len()).map_err(|_| NativeError {
+                stage: "RIORegisterBuffer length",
+                code: 13,
+            })?;
             let id = unsafe { register(bytes.as_mut_ptr() as *mut i8, length) };
-            if id.is_null() {
+            if id.is_null() || id == RIO_INVALID_BUFFERID {
                 return Err(NativeError::winsock_last("RIORegisterBuffer"));
             }
-            Ok(Self { id, length, deregister: rio.table().RIODeregisterBuffer })
+            Ok(Self {
+                id,
+                length,
+                deregister: rio.table().RIODeregisterBuffer,
+            })
         }
 
         pub fn raw(&self) -> RIO_BUFFERID {
@@ -1339,9 +1478,16 @@ pub mod rio {
         /// so the engine can never hand RIO an out-of-range view.
         pub fn slice(&self, offset: u32, length: u32) -> Result<RIO_BUF, NativeError> {
             if length == 0 || offset > self.length || length > self.length - offset {
-                return Err(NativeError { stage: "RIO_BUF slice bounds", code: 13 });
+                return Err(NativeError {
+                    stage: "RIO_BUF slice bounds",
+                    code: 13,
+                });
             }
-            Ok(RIO_BUF { BufferId: self.id, Offset: offset, Length: length })
+            Ok(RIO_BUF {
+                BufferId: self.id,
+                Offset: offset,
+                Length: length,
+            })
         }
     }
 
@@ -1373,10 +1519,10 @@ pub mod rio {
             send_queue: RIO_CQ,
             socket_context: *mut c_void,
         ) -> Result<Self, NativeError> {
-            let create = rio
-                .table()
-                .RIOCreateRequestQueue
-                .ok_or(NativeError { stage: "RIOCreateRequestQueue entry point", code: 13 })?;
+            let create = rio.table().RIOCreateRequestQueue.ok_or(NativeError {
+                stage: "RIOCreateRequestQueue entry point",
+                code: 13,
+            })?;
             let queue = unsafe {
                 create(
                     socket,
@@ -1405,12 +1551,21 @@ pub mod rio {
             rio: &RioFunctions,
             buffer: &RIO_BUF,
             request_context: *mut c_void,
+            flags: u32,
         ) -> Result<(), NativeError> {
-            let receive = rio
-                .table()
-                .RIOReceive
-                .ok_or(NativeError { stage: "RIOReceive entry point", code: 13 })?;
-            let ok = unsafe { receive(self.queue, buffer as *const RIO_BUF as *mut RIO_BUF, 1, 0, request_context) };
+            let receive = rio.table().RIOReceive.ok_or(NativeError {
+                stage: "RIOReceive entry point",
+                code: 13,
+            })?;
+            let ok = unsafe {
+                receive(
+                    self.queue,
+                    buffer as *const RIO_BUF as *mut RIO_BUF,
+                    1,
+                    flags,
+                    request_context,
+                )
+            };
             if !ok.as_bool() {
                 return Err(NativeError::winsock_last("RIOReceive"));
             }
@@ -1424,11 +1579,19 @@ pub mod rio {
             buffer: &RIO_BUF,
             request_context: *mut c_void,
         ) -> Result<(), NativeError> {
-            let send = rio
-                .table()
-                .RIOSend
-                .ok_or(NativeError { stage: "RIOSend entry point", code: 13 })?;
-            let ok = unsafe { send(self.queue, buffer as *const RIO_BUF as *mut RIO_BUF, 1, 0, request_context) };
+            let send = rio.table().RIOSend.ok_or(NativeError {
+                stage: "RIOSend entry point",
+                code: 13,
+            })?;
+            let ok = unsafe {
+                send(
+                    self.queue,
+                    buffer as *const RIO_BUF as *mut RIO_BUF,
+                    1,
+                    0,
+                    request_context,
+                )
+            };
             if !ok.as_bool() {
                 return Err(NativeError::winsock_last("RIOSend"));
             }
@@ -1444,7 +1607,12 @@ pub mod rio {
 
     /// Zeroed result slot: RIO writes every field of each dequeued entry.
     pub fn empty_result() -> RIORESULT {
-        RIORESULT { Status: 0, BytesTransferred: 0, SocketContext: 0, RequestContext: 0 }
+        RIORESULT {
+            Status: 0,
+            BytesTransferred: 0,
+            SocketContext: 0,
+            RequestContext: 0,
+        }
     }
 
     /// Keeps the unused imports honest: the event-driven completion mode stays available for

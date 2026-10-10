@@ -15,9 +15,7 @@ name = "rust-echo-client"
 path = "src/main.rs"
 
 [dependencies]
-windows = { git = "https://github.com/microsoft/windows-rs", rev = "b0f55a720bb4e0942b048db9c9497bafa26526a0", default-features = false, features = ["winsock2", "ws2", "mswsockdef", "mswsock", "ioapiset", "minwinbase", "winbase", "memoryapi", "processthreadsapi", "synchapi", "handleapi", "errhandlingapi", "winnt", "windef", "minwindef", "basetsd", "winerror", "sysinfoapi", "libloaderapi", "wincon", "consoleapi", "securitybaseapi", "synchapi", "profileapi", "realtimeapiset"] }
-# RIO/Winsock bindings arrive with the engine layer:
-# windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_Threading"] }
+windows = { git = "https://github.com/microsoft/windows-rs", default-features = false, features = ["winsock2", "ws2", "mswsockdef", "mswsock", "ioapiset", "minwinbase", "winbase", "memoryapi", "processthreadsapi", "synchapi", "handleapi", "errhandlingapi", "winnt", "windef", "minwindef", "basetsd", "winerror", "sysinfoapi", "libloaderapi", "wincon", "consoleapi", "securitybaseapi", "synchapi", "profileapi", "realtimeapiset"] }
 
 [profile.release]
 lto = true

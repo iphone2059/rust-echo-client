@@ -1,15 +1,42 @@
 //! Top-level orchestration: worker resolution, session partitioning, worker startup and join,
 //! statistics aggregation, terminal accounting, console registration and result classification.
 
-
-use crate::native::clock::RioClock;
-use crate::native::Winsock;
-use windows::Win32::ws2::SOCKADDR_IN;
-use crate::metrics::Statistics;
-use crate::payload::{build, validate_payload};
 use crate::engine::transport::RioTransport;
-use crate::types::{available_processors, resolved_worker_count, ExitCode, Options, Protocol};
-use crate::worker::{StopFlag, Worker};
+use crate::metrics::Statistics;
+use crate::native::clock::RioClock;
+use crate::native::{RioFunctions, Winsock, load_connect_ex, registered_socket};
+use crate::payload::{build, validate_payload};
+use crate::types::{ExitCode, Options, Protocol, available_processors, resolved_worker_count};
+use crate::worker::{Progress, StopFlag, WakePort, Worker};
+use windows::Win32::ws2::SOCKADDR_IN;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NotificationCounters {
+    arms: u64,
+    deliveries: u64,
+    timeouts: u64,
+}
+
+fn write_diagnostics(protocol: Protocol, snapshots: &[NotificationCounters]) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("CEC_DIAG_FILE").filter(|path| !path.is_empty()) else {
+        return;
+    };
+    let Ok(mut file) = std::fs::File::create(path) else {
+        return;
+    };
+    let protocol = if protocol == Protocol::Tcp {
+        "tcp"
+    } else {
+        "udp"
+    };
+    for (worker, snapshot) in snapshots.iter().enumerate() {
+        if writeln!(file, "role=client protocol={protocol} worker={worker} notify_arms={} notify_deliveries={} notify_gap={} timeout_wakeups_while_outstanding={}",
+            snapshot.arms, snapshot.deliveries, snapshot.arms.saturating_sub(snapshot.deliveries), snapshot.timeouts).is_err() {
+            return;
+        }
+    }
+}
 
 #[link(name = "Kernel32")]
 unsafe extern "system" {
@@ -20,8 +47,8 @@ unsafe extern "system" {
 }
 
 unsafe extern "system" fn console_ctrl_handler(control: u32) -> i32 {
-    // CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT.
-    if matches!(control, 0 | 1 | 2 | 5 | 6) {
+    // CTRL_C_EVENT, CTRL_BREAK_EVENT and CTRL_CLOSE_EVENT.
+    if matches!(control, 0 | 1 | 2) {
         StopFlag::request_global();
         1
     } else {
@@ -30,6 +57,29 @@ unsafe extern "system" fn console_ctrl_handler(control: u32) -> i32 {
 }
 
 struct ConsoleHandler;
+
+#[link(name = "Winmm")]
+unsafe extern "system" {
+    fn timeBeginPeriod(period: u32) -> u32;
+    fn timeEndPeriod(period: u32) -> u32;
+}
+
+struct TimerResolution;
+
+impl TimerResolution {
+    fn start() -> Result<Self, u32> {
+        let status = unsafe { timeBeginPeriod(1) };
+        if status == 0 { Ok(Self) } else { Err(status) }
+    }
+}
+
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = timeEndPeriod(1);
+        }
+    }
+}
 
 impl ConsoleHandler {
     fn install() -> Result<Self, String> {
@@ -67,12 +117,10 @@ fn worker_memory_share(total: u64, worker_sessions: u32, total_sessions: u32) ->
     if total_sessions == 0 {
         return 0;
     }
-    let share = u128::from(total)
-        .saturating_mul(u128::from(worker_sessions))
-        / u128::from(total_sessions);
-    share.min(u128::from(u64::MAX)) as u64
+    (total / u64::from(total_sessions)).saturating_mul(u64::from(worker_sessions))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     options: Options,
     payload: std::sync::Arc<[u8]>,
@@ -80,16 +128,40 @@ fn run_worker(
     memory_share: u64,
     target: SOCKADDR_IN,
     stop: StopFlag,
-) -> Result<(Statistics, bool), String> {
-    let result = (|| -> Result<(Statistics, bool), String> {
+    progress: Option<Progress>,
+    wake: WakePort,
+    rio: RioFunctions,
+    connect_ex: windows::Win32::mswsock::LPFN_CONNECTEX,
+) -> Result<(Statistics, bool, NotificationCounters), String> {
+    let result = (|| -> Result<(Statistics, bool, NotificationCounters), String> {
         let _winsock = Winsock::start()
             .map_err(|error| format!("{} failed: native_error={}", error.stage, error.code))?;
         let payload_bytes = u32::try_from(payload.len())
             .map_err(|_| "payload is too large for the worker".to_string())?;
-        let mut worker = Worker::new(&options, sessions, payload_bytes, 0);
+        let mut worker_options = options.clone();
+        worker_options.run_seconds = 0;
+        let mut worker = Worker::new(&worker_options, sessions, payload_bytes, 0);
         worker.set_payload(std::sync::Arc::clone(&payload));
-        let mut transport = RioTransport::new(&options, sessions, payload, memory_share, target)?;
-        let mut clock = RioClock::new();
+        if let Some(progress) = progress {
+            worker.set_progress(
+                progress,
+                u64::from(options.report_seconds)
+                    .saturating_mul(1_000)
+                    .min(50),
+            );
+        }
+        let mut clock = RioClock::new()
+            .map_err(|error| format!("{} failed: native_error={}", error.stage, error.code))?;
+        let mut transport = RioTransport::new(
+            &options,
+            sessions,
+            payload,
+            memory_share,
+            target,
+            rio,
+            connect_ex,
+        )?;
+        transport.set_wake(wake)?;
         let outcome = worker.run(&mut clock, &mut transport, &stop);
         let statistics = worker.scheduler().statistics();
         // Only an internal failure means no further progress is possible anywhere, and only then
@@ -98,14 +170,18 @@ fn run_worker(
         // running until their own work or the run deadline finishes, which is also what makes
         // every failed session count exactly once toward network_errors.
         if !outcome.controlled_stop && statistics.fatal {
-            StopFlag::request_global();
+            StopFlag::request_fatal_global();
         }
-        Ok((statistics, outcome.controlled_stop))
+        Ok((
+            statistics,
+            outcome.controlled_stop,
+            transport.notification_counters(),
+        ))
     })();
     if result.is_err() {
         // Setup errors happen before Worker::run can observe the shared flag. Propagate the
         // stop to already-running peer workers so the join loop cannot deadlock on /n 0.
-        StopFlag::request_global();
+        StopFlag::request_fatal_global();
     }
     result
 }
@@ -114,10 +190,32 @@ pub fn run(options: &Options) -> ExitCode {
     if options.protocol == Protocol::None {
         return ExitCode::Usage;
     }
+    StopFlag::clear_global();
+    let _console_handler = match ConsoleHandler::install() {
+        Ok(handler) => handler,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return ExitCode::Internal;
+        }
+    };
     // The reference starts Winsock and loads the RIO extensions before it resolves the target, so
     // the run owns the Winsock lifetime here as well and every worker joins it by refcount.
     let _winsock = match Winsock::start() {
         Ok(winsock) => winsock,
+        Err(error) => {
+            eprintln!("{} failed: native_error={}", error.stage, error.code);
+            return ExitCode::Network;
+        }
+    };
+    let extensions = (|| {
+        let probe = registered_socket(Protocol::Tcp)?;
+        Ok::<_, crate::native::NativeError>((
+            RioFunctions::load(probe.raw())?,
+            load_connect_ex(probe.raw())?,
+        ))
+    })();
+    let (rio, connect_ex) = match extensions {
+        Ok(extensions) => extensions,
         Err(error) => {
             eprintln!("{} failed: native_error={}", error.stage, error.code);
             return ExitCode::Network;
@@ -145,38 +243,60 @@ pub fn run(options: &Options) -> ExitCode {
         eprintln!("Invalid payload: {}", error.0);
         return ExitCode::Usage;
     }
+    let _timer_resolution = if options.interval_milliseconds != 0 {
+        match TimerResolution::start() {
+            Ok(resolution) => Some(resolution),
+            Err(error) => {
+                eprintln!("timeBeginPeriod(client pacing) failed: native_error={error}");
+                return ExitCode::Internal;
+            }
+        }
+    } else {
+        None
+    };
     // Capacity is an argument property, not a run-time one: the parser has already validated the
     // completion-queue and registered-memory budgets against the largest shard, and the transport
     // re-checks its own arena size as a last line of defence. No usage diagnostic may be produced
     // from here, because the reference reports both failures during argument parsing.
 
-    StopFlag::clear_global();
-    let _console_handler = match ConsoleHandler::install() {
-        Ok(handler) => handler,
-        Err(reason) => {
-            eprintln!("{reason}");
-            return ExitCode::Internal;
-        }
-    };
     let stop = StopFlag;
 
     let payload: std::sync::Arc<[u8]> = std::sync::Arc::from(payload.into_boxed_slice());
     let counts = partition(options.session_count, options.worker_count);
     let mut handles = Vec::with_capacity(counts.len());
+    let mut progress = if options.report_seconds == 0 {
+        Vec::new()
+    } else {
+        Vec::with_capacity(counts.len())
+    };
+    let mut wake_ports = Vec::with_capacity(counts.len());
     let mut worker_spawn_error = false;
     for (worker_index, sessions) in counts.into_iter().enumerate() {
         let options = options.clone();
         let worker_payload = std::sync::Arc::clone(&payload);
-        let memory_share = worker_memory_share(
-            options.memory_bytes,
-            sessions,
-            options.session_count,
-        );
+        let snapshot = (options.report_seconds != 0)
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new((Statistics::default(), 0))));
+        let worker_progress = snapshot.as_ref().map(std::sync::Arc::clone);
+        let wake = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let worker_wake = std::sync::Arc::clone(&wake);
+        let memory_share =
+            worker_memory_share(options.memory_bytes, sessions, options.session_count);
         let handle = std::thread::Builder::new()
             .name(format!("cec-worker-{worker_index}"))
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_worker(options, worker_payload, sessions, memory_share, target, stop)
+                    run_worker(
+                        options,
+                        worker_payload,
+                        sessions,
+                        memory_share,
+                        target,
+                        stop,
+                        worker_progress,
+                        worker_wake,
+                        rio,
+                        connect_ex,
+                    )
                 }));
                 match result {
                     Ok(result) => result,
@@ -184,24 +304,96 @@ pub fn run(options: &Options) -> ExitCode {
                         // A panic must wake unlimited peer workers before this JoinHandle is
                         // eventually observed by the main thread. Resume the original panic so
                         // the join result still records an abnormal worker termination.
-                        StopFlag::request_global();
+                        StopFlag::request_fatal_global();
                         std::panic::resume_unwind(payload);
                     }
                 }
             });
         match handle {
-            Ok(handle) => handles.push(handle),
+            Ok(handle) => {
+                handles.push(handle);
+                if let Some(snapshot) = snapshot {
+                    progress.push(snapshot);
+                }
+                wake_ports.push(wake);
+            }
             Err(error) => {
                 eprintln!("failed to create worker thread {worker_index}: {error}");
                 worker_spawn_error = true;
-                StopFlag::request_global();
+                StopFlag::request_fatal_global();
                 break;
             }
         }
     }
 
+    let started = std::time::Instant::now();
+    let mut next_report = u64::from(options.report_seconds).saturating_mul(1_000);
+    let mut monitor_failure = false;
+    let mut stop_posts_sent = false;
+    loop {
+        let elapsed = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        if options.run_seconds != 0
+            && elapsed >= u64::from(options.run_seconds).saturating_mul(1_000)
+        {
+            StopFlag::request_global();
+        }
+        if stop.is_requested() && !stop_posts_sent {
+            for wake in &wake_ports {
+                match wake.lock() {
+                    Ok(handle) if *handle != 0 => {
+                        // Hold the snapshot lock through the post: transport teardown clears this
+                        // handle under the same lock before closing the port.
+                        let posted = unsafe {
+                            windows::Win32::ioapiset::PostQueuedCompletionStatus(
+                                *handle as *mut core::ffi::c_void,
+                                0,
+                                1,
+                                None,
+                            )
+                        };
+                        if !posted.as_bool() {
+                            monitor_failure = true;
+                            StopFlag::request_fatal_global();
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        monitor_failure = true;
+                        StopFlag::request_fatal_global();
+                    }
+                }
+            }
+            stop_posts_sent = true;
+        }
+        if options.report_seconds != 0 && elapsed >= next_report {
+            let mut report = Statistics::default();
+            let mut active = 0u32;
+            for snapshot in &progress {
+                match snapshot.lock() {
+                    Ok(snapshot) => {
+                        report.merge(&snapshot.0);
+                        active = active.saturating_add(snapshot.1);
+                    }
+                    Err(_) => {
+                        monitor_failure = true;
+                        StopFlag::request_fatal_global();
+                    }
+                }
+            }
+            report.elapsed_milliseconds = elapsed;
+            println!("{}", report.line("report", options.session_count, active));
+            next_report =
+                elapsed.saturating_add(u64::from(options.report_seconds).saturating_mul(1_000));
+        }
+        if handles.iter().all(std::thread::JoinHandle::is_finished) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
     let mut statistics = Statistics::default();
-    let mut all_controlled = true;
+    let mut controlled_stop = stop.is_requested() && !stop.is_fatal();
+    let mut snapshots = Vec::with_capacity(handles.len());
     let mut worker_panic = false;
     // A worker that returns Err never reached a clean stop, so the run must not be classified from the
     // statistics it left behind: those are partial and a controlled stop would otherwise look clean.
@@ -213,19 +405,20 @@ pub fn run(options: &Options) -> ExitCode {
     // cleanly here.
     for handle in handles {
         match handle.join() {
-            Ok(Ok((worker_statistics, controlled))) => {
+            Ok(Ok((worker_statistics, controlled, snapshot))) => {
                 statistics.merge(&worker_statistics);
-                all_controlled &= controlled;
+                controlled_stop |= controlled;
+                snapshots.push(snapshot);
             }
             Ok(Err(reason)) => {
                 eprintln!("RIO worker failed: {reason}");
                 worker_failure = true;
-                StopFlag::request_global();
+                StopFlag::request_fatal_global();
             }
             Err(_) => {
                 eprintln!("worker thread ended abnormally");
                 worker_panic = true;
-                StopFlag::request_global();
+                StopFlag::request_fatal_global();
             }
         }
     }
@@ -234,7 +427,11 @@ pub fn run(options: &Options) -> ExitCode {
     // were asked for and never completed, so the shared classification reports an echo failure even
     // when the terminal cause was a worker or network failure. An unlimited run or a controlled stop
     // claims nothing extra.
-    let unclaimed = statistics.unclaimed(options.echo_count, options.session_count, all_controlled);
+    let fatal =
+        statistics.fatal || worker_panic || worker_spawn_error || worker_failure || monitor_failure;
+    controlled_stop &= !fatal;
+    let unclaimed =
+        statistics.unclaimed(options.echo_count, options.session_count, controlled_stop);
     if unclaimed != 0 {
         statistics.lost = statistics.lost.saturating_add(unclaimed);
         // The reference reports an echo that was asked for and never claimed as both lost and
@@ -243,26 +440,38 @@ pub fn run(options: &Options) -> ExitCode {
     }
     // A controlled stop cancels the attempts that were claimed and never finished; they are neither
     // echoes nor losses, which is what the reference reports as cancelled.
-    if all_controlled {
+    if controlled_stop {
         let unfinished = statistics.attempted.saturating_sub(
             statistics
                 .echoes
                 .saturating_add(statistics.corrupted)
                 .saturating_add(statistics.lost),
         );
-        statistics.cancelled = statistics.cancelled.saturating_add(unfinished);
+        statistics.cancelled = unfinished;
+    } else if fatal {
+        let unfinished = statistics.attempted.saturating_sub(
+            statistics
+                .echoes
+                .saturating_add(statistics.corrupted)
+                .saturating_add(statistics.lost)
+                .saturating_add(statistics.cancelled),
+        );
+        statistics.lost = statistics.lost.saturating_add(unfinished);
     }
 
     // The reference prints the terminal line by default: /q suppresses it and /stats forces it,
     // so /q /stats is exactly one line and neither switch is silent. Every worker has joined here,
     // so no session is live when the line is printed.
     if options.stats || !options.quiet {
+        statistics.elapsed_milliseconds =
+            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         println!("{}", statistics.line("final", options.session_count, 0));
     }
-    if worker_panic || worker_spawn_error || worker_failure {
+    write_diagnostics(options.protocol, &snapshots);
+    if fatal {
         ExitCode::Internal
     } else {
-        statistics.exit_code(all_controlled)
+        statistics.exit_code(controlled_stop)
     }
 }
 
@@ -321,21 +530,20 @@ pub mod transport {
 
     use crate::native::arena::Arena;
     use crate::native::completion::{
-        MAXIMUM_SEND_SLOT, MAXIMUM_SESSION_INDEX, NO_SEND_SLOT, Operation, RequestContext,
-        WSAEMSGSIZE, decode_context, encode_context, next_generation,
+        MAXIMUM_SESSION_INDEX, NO_SEND_SLOT, Operation, RequestContext, WSAEMSGSIZE,
+        decode_context, encode_context, next_generation,
     };
-    use crate::native::endpoint::{
-        begin_connect, bind_local, connect_udp, update_connect_context,
-    };
-    use crate::native::{
-        NativeError, RioFunctions, SocketOwner, configure_socket, load_connect_ex, registered_socket,
-    };
+    use crate::native::endpoint::{begin_connect, bind_local, connect_udp, update_connect_context};
     use crate::native::overlapped::PendingOverlapped;
     use crate::native::rio::{CompletionPort, CompletionQueue, RequestQueue};
+    use crate::native::{
+        NativeError, RioFunctions, SocketOwner, configure_socket, registered_socket,
+    };
     use crate::types::{Options, Protocol};
     use crate::worker::{Completion, Transport};
 
     pub const MAX_RECEIVE: u32 = 1;
+    pub const MAX_SEND: u32 = 1;
     pub const COMPLETION_BATCH_SIZE: usize = 256;
     const WAIT_TIMEOUT: i32 = 258;
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -359,6 +567,9 @@ pub mod transport {
     struct SessionTransport {
         generation: u32,
         state: GenerationState,
+        /// An earlier completion in this collected batch failed the attempt. The worker still
+        /// consumes that completion before changing state, but later sends must not resume it.
+        failure_pending: bool,
         connect_outstanding: bool,
         send_outstanding: u32,
         receive_outstanding: u32,
@@ -371,18 +582,17 @@ pub mod transport {
         receive_posted_bytes: u32,
         socket: Option<SocketOwner>,
         request_queue: Option<RequestQueue>,
-        connect_ex: Option<LPFN_CONNECTEX>,
         overlapped: PendingOverlapped,
         target: SOCKADDR_IN,
-        tx_in_use: Vec<bool>,
-        free_tx_slots: Vec<u32>,
+        tx_in_use: bool,
     }
 
     impl SessionTransport {
-        fn new(target: SOCKADDR_IN, max_send: u32) -> Self {
+        fn new(target: SOCKADDR_IN) -> Self {
             Self {
                 generation: 0,
                 state: GenerationState::Empty,
+                failure_pending: false,
                 connect_outstanding: false,
                 send_outstanding: 0,
                 receive_outstanding: 0,
@@ -392,11 +602,9 @@ pub mod transport {
                 receive_posted_bytes: 0,
                 socket: None,
                 request_queue: None,
-                connect_ex: None,
                 overlapped: PendingOverlapped::new(),
                 target,
-                tx_in_use: vec![false; max_send as usize],
-                free_tx_slots: (0..max_send).rev().collect(),
+                tx_in_use: false,
             }
         }
 
@@ -414,31 +622,25 @@ pub mod transport {
         }
 
         fn generation_drained(&self) -> bool {
-            !self.connect_outstanding
-                && self.send_outstanding == 0
-                && self.receive_outstanding == 0
+            !self.connect_outstanding && self.send_outstanding == 0 && self.receive_outstanding == 0
         }
 
         fn allocate_send_slot(&mut self) -> Option<u32> {
-            let slot = self.free_tx_slots.pop()?;
-            let used = self.tx_in_use.get_mut(slot as usize)?;
-            debug_assert!(!*used, "free-list returned an in-use TX slot");
-            if *used {
+            if self.tx_in_use {
                 return None;
             }
-            *used = true;
-            Some(slot)
+            self.tx_in_use = true;
+            Some(0)
         }
 
         fn release_send_slot(&mut self, slot: u32) -> Result<(), String> {
-            let Some(used) = self.tx_in_use.get_mut(slot as usize) else {
+            if slot != 0 {
                 return Err("send completion has an out-of-range slot".to_string());
-            };
-            if !*used {
+            }
+            if !self.tx_in_use {
                 return Err("send completion references a free slot".to_string());
             }
-            *used = false;
-            self.free_tx_slots.push(slot);
+            self.tx_in_use = false;
             Ok(())
         }
 
@@ -446,11 +648,8 @@ pub mod transport {
             if !self.generation_drained() {
                 return Err("generation released before all completions drained".to_string());
             }
-            if self.tx_in_use.iter().any(|used| *used) {
+            if self.tx_in_use {
                 return Err("generation drained while a send slot is still busy".to_string());
-            }
-            if self.free_tx_slots.len() != self.tx_in_use.len() {
-                return Err("generation drained with an inconsistent TX free-list".to_string());
             }
             if self.receive_posted_bytes != 0 {
                 return Err("generation drained with a stale receive length".to_string());
@@ -462,24 +661,24 @@ pub mod transport {
                 return Err("generation drained while ConnectEx OVERLAPPED is armed".to_string());
             }
             self.request_queue = None;
-            self.connect_ex = None;
             self.socket = None;
             self.overlapped.reset_after_drain().map_err(stage)?;
             self.state = GenerationState::Empty;
+            self.failure_pending = false;
             Ok(())
         }
     }
 
     pub struct RioTransport {
         // Safe fallback drop order if explicit shutdown cannot run to completion:
-        // sessions -> CQ -> IOCP -> CQ notification OVERLAPPED -> registered arenas.
+        // sessions -> CQ -> IOCP -> CQ notification OVERLAPPED -> registered arena.
         sessions: Vec<SessionTransport>,
         queue: Option<CompletionQueue>,
         port: Option<CompletionPort>,
         notification_overlapped: Option<Box<OVERLAPPED>>,
-        send_arena: Option<Arena>,
-        receive_arena: Option<Arena>,
+        arena: Option<Arena>,
         rio: RioFunctions,
+        connect_ex: LPFN_CONNECTEX,
         results: Vec<RIORESULT>,
         protocol: Protocol,
         pending: Vec<Completion>,
@@ -487,13 +686,16 @@ pub mod transport {
         send_buffer_bytes: u32,
         receive_buffer_bytes: u32,
         local_port: u16,
-        /// Outstanding sends one session may have. The reference holds exactly one, because an
-        /// attempt is a single native operation that carries the whole batch.
-        max_send: u32,
         /// Registered bytes one attempt occupies: the payload repeated `batch_capacity` times.
         batch_bytes: u32,
         shutdown_started: bool,
         resources_leaked: bool,
+        sent_bytes: u64,
+        rio_outstanding: u32,
+        notify_arms: u64,
+        notify_deliveries: u64,
+        timeout_wakeups_while_outstanding: u64,
+        wake: Option<crate::worker::WakePort>,
     }
 
     impl RioTransport {
@@ -503,9 +705,13 @@ pub mod transport {
             payload: std::sync::Arc<[u8]>,
             memory_bytes: u64,
             target: SOCKADDR_IN,
+            rio: RioFunctions,
+            connect_ex: LPFN_CONNECTEX,
         ) -> Result<Self, String> {
             if session_count == 0 || payload.is_empty() {
-                return Err("transport requires at least one session and one payload byte".to_string());
+                return Err(
+                    "transport requires at least one session and one payload byte".to_string(),
+                );
             }
             let payload_bytes = u32::try_from(payload.len())
                 .map_err(|_| "payload is too large for a RIO_BUF".to_string())?;
@@ -516,7 +722,6 @@ pub mod transport {
             } else {
                 1
             };
-            let max_send = 1u32;
             let batch_bytes = u32::try_from(
                 u64::from(payload_bytes)
                     .checked_mul(u64::from(batch_capacity))
@@ -526,20 +731,14 @@ pub mod transport {
             if u64::from(session_count) > u64::from(MAXIMUM_SESSION_INDEX) + 1 {
                 return Err("session count exceeds request-context capacity".to_string());
             }
-            if u64::from(max_send) > u64::from(MAXIMUM_SEND_SLOT) + 1 {
-                return Err("request-context send-slot capacity is too small".to_string());
-            }
             if options.cq_capacity == 0 {
                 return Err("completion queue capacity must be non-zero".to_string());
             }
 
-            let probe = registered_socket(options.protocol).map_err(stage)?;
-            let rio = RioFunctions::load(probe.raw()).map_err(stage)?;
-
             // RQ reservations are charged against the shared CQ. One receive plus one send per
             // session makes the sum exact, not an estimate.
             let per_session = u64::from(MAX_RECEIVE)
-                .checked_add(u64::from(max_send))
+                .checked_add(u64::from(MAX_SEND))
                 .ok_or_else(|| "request queue reservation overflow".to_string())?;
             let required_cq = u64::from(session_count)
                 .checked_mul(per_session)
@@ -566,6 +765,9 @@ pub mod transport {
                     "RIO registered memory needs {required_memory} bytes (RX {receive_bytes} + TX {send_bytes}) but this worker budget is {memory_bytes}"
                 ));
             }
+            if required_memory > u64::from(u32::MAX) {
+                return Err("worker registered arena exceeds DWORD capacity".to_string());
+            }
 
             // Local declaration order is chosen for the constructor-error path too: Rust drops
             // locals in reverse order, giving CQ -> IOCP -> notification OVERLAPPED if anything
@@ -581,21 +783,15 @@ pub mod transport {
             )
             .map_err(stage)?;
 
-            // RX sessions use disjoint slices of aggregated registrations; each session's TX
-            // window has its own RIO_BUFFERID. The latter is required by the RIOSend buffer rules.
-            // A TX window holds the pattern repeated to the full attempt length, so the shorter
-            // final attempt of a finite quota is simply a shorter view of the same bytes.
-            let mut send_pattern = Vec::with_capacity(batch_bytes as usize);
-            for _ in 0..batch_capacity {
-                send_pattern.extend_from_slice(&payload);
-            }
-            let receive_arena =
-                Arena::create_receive(&rio, session_count, batch_bytes).map_err(stage)?;
-            let send_arena = Arena::create_send(&rio, session_count, &send_pattern).map_err(stage)?;
+            // Both directions share one virtual-memory owner. TX registrations remain isolated
+            // from each other and RX, as required while RIOSend is outstanding. Each TX window
+            // holds a full batch; a finite quota's tail uses a shorter view of the same bytes.
+            let arena =
+                Arena::create_worker(&rio, session_count, batch_bytes, &payload).map_err(stage)?;
             // The target was resolved once for the whole run, so every worker connects to the
             // same address the reference resolved in cec_run_client.
             let sessions = (0..session_count)
-                .map(|_| SessionTransport::new(target, max_send))
+                .map(|_| SessionTransport::new(target))
                 .collect();
 
             Ok(Self {
@@ -603,25 +799,25 @@ pub mod transport {
                 queue: Some(queue),
                 port: Some(port),
                 notification_overlapped: Some(notification_overlapped),
-                send_arena: Some(send_arena),
-                receive_arena: Some(receive_arena),
+                arena: Some(arena),
                 rio,
-                results: vec![
-                    RIORESULT::default();
-                    COMPLETION_BATCH_SIZE
-                        .min(options.cq_capacity as usize)
-                        .max(1)
-                ],
+                connect_ex,
+                results: vec![RIORESULT::default(); COMPLETION_BATCH_SIZE],
                 protocol: options.protocol,
                 pending: Vec::new(),
                 no_delay: options.protocol == Protocol::Tcp,
                 send_buffer_bytes: options.socket_buffer_bytes,
                 receive_buffer_bytes: options.socket_buffer_bytes,
                 local_port: options.local_port,
-                max_send,
                 batch_bytes,
                 shutdown_started: false,
                 resources_leaked: false,
+                sent_bytes: 0,
+                rio_outstanding: 0,
+                notify_arms: 0,
+                notify_deliveries: 0,
+                timeout_wakeups_while_outstanding: 0,
+                wake: None,
             })
         }
 
@@ -631,25 +827,53 @@ pub mod transport {
                 .ok_or_else(|| "transport completion queue is closed".to_string())
         }
 
+        pub(super) fn notification_counters(&self) -> super::NotificationCounters {
+            super::NotificationCounters {
+                arms: self.notify_arms,
+                deliveries: self.notify_deliveries,
+                timeouts: self.timeout_wakeups_while_outstanding,
+            }
+        }
+
+        pub(super) fn set_wake(&mut self, wake: crate::worker::WakePort) -> Result<(), String> {
+            let handle = self.port()?.raw() as usize;
+            *wake
+                .lock()
+                .map_err(|_| "worker wake mutex poisoned".to_string())? = handle;
+            self.wake = Some(wake);
+            Ok(())
+        }
+
+        fn clear_wake_port(&mut self) {
+            if let Some(wake) = self.wake.take() {
+                match wake.lock() {
+                    Ok(mut handle) => *handle = 0,
+                    Err(poisoned) => *poisoned.into_inner() = 0,
+                };
+            }
+        }
+
         fn arm_queue(&mut self) -> Result<(), String> {
+            if self.rio_outstanding == 0 || self.queue()?.is_armed() {
+                return Ok(());
+            }
+            if let Some(overlapped) = self.notification_overlapped.as_mut() {
+                **overlapped = OVERLAPPED::default();
+            }
             let rio = &self.rio;
             let queue = self
                 .queue
                 .as_mut()
                 .ok_or_else(|| "transport completion queue is closed".to_string())?;
-            queue.arm(rio).map_err(stage)
+            queue.arm(rio).map_err(stage)?;
+            self.notify_arms = self.notify_arms.saturating_add(1);
+            Ok(())
         }
 
         fn port(&self) -> Result<&CompletionPort, String> {
             self.port
                 .as_ref()
                 .ok_or_else(|| "transport completion port is closed".to_string())
-        }
-
-        fn has_native_outstanding(&self) -> bool {
-            self.sessions.iter().any(|slot| {
-                slot.connect_outstanding || slot.send_outstanding != 0 || slot.receive_outstanding != 0
-            })
         }
 
         fn generation_of(&self, index: u32) -> Result<u32, String> {
@@ -698,40 +922,16 @@ pub mod transport {
             )
             .map_err(stage)?;
             bind_local(socket.raw(), self.local_port).map_err(stage)?;
-            let connect_ex = match self.protocol {
-                Protocol::Udp => None,
-                Protocol::Tcp => Some(load_connect_ex(socket.raw()).map_err(stage)?),
-                Protocol::None => return Err("protocol is not selected".to_string()),
-            };
-            let queue_raw = self.queue()?.raw();
-            let request_queue = RequestQueue::create(
-                &self.rio,
-                socket.raw(),
-                MAX_RECEIVE,
-                1,
-                self.max_send,
-                1,
-                queue_raw,
-                queue_raw,
-                encode_context(index, generation, NO_SEND_SLOT, Operation::Connect),
-            )
-            .map_err(stage)?;
-
-            // Copy scalar configuration before taking the mutable session borrow. This keeps
-            // the initialization block trivially disjoint even on stricter borrow-check paths.
-            let max_send = self.max_send;
             let slot = &mut self.sessions[slot_index];
             slot.generation = generation;
             slot.state = GenerationState::Connecting;
+            slot.failure_pending = false;
             slot.connect_outstanding = false;
             slot.send_outstanding = 0;
             slot.receive_outstanding = 0;
             slot.receive_posted_bytes = 0;
-            slot.tx_in_use.fill(false);
-            slot.free_tx_slots.clear();
-            slot.free_tx_slots.extend((0..max_send).rev());
-            slot.connect_ex = connect_ex;
-            slot.request_queue = Some(request_queue);
+            slot.tx_in_use = false;
+            slot.request_queue = None;
             slot.socket = Some(socket);
             slot.overlapped.reset_after_drain().map_err(stage)?;
 
@@ -743,11 +943,10 @@ pub mod transport {
         }
 
         fn tx_global_slot(&self, index: u32, slot: u32) -> Result<u32, String> {
-            let global = u64::from(index)
-                .checked_mul(u64::from(self.max_send))
-                .and_then(|base| base.checked_add(u64::from(slot)))
-                .ok_or_else(|| "TX slot index overflow".to_string())?;
-            u32::try_from(global).map_err(|_| "TX slot index exceeds arena".to_string())
+            if slot != 0 || index as usize >= self.sessions.len() {
+                return Err("TX slot index exceeds arena".to_string());
+            }
+            Ok(index)
         }
 
         fn finish_generation(&mut self, index: u32) -> Result<Completion, String> {
@@ -823,7 +1022,7 @@ pub mod transport {
         fn retire_into(
             &mut self,
             context: RequestContext,
-            status: i32,
+            mut status: i32,
             bytes: u32,
             completions: &mut Vec<Completion>,
         ) -> Result<(), String> {
@@ -843,9 +1042,10 @@ pub mod transport {
             }
 
             let closing = session.state == GenerationState::Closing;
-        // A send that had to be re-posted reports the whole attempt, not its last segment:
-        // the worker checks the completion against the batch it posted.
-        let mut reported_bytes = bytes;
+            let suppress_send = closing || session.failure_pending;
+            // A send that had to be re-posted reports the whole attempt, not its last segment:
+            // the worker checks the completion against the batch it posted.
+            let mut reported_bytes = bytes;
             match context.operation {
                 Operation::Connect => {
                     if !session.connect_outstanding {
@@ -855,49 +1055,71 @@ pub mod transport {
                     session.overlapped.complete().map_err(stage)?;
                 }
                 Operation::Send => {
-                    if session.send_outstanding == 0 {
+                    if session.send_outstanding != 1 || context.slot != session.send_slot {
                         return Err("send completion arrived with no send outstanding".to_string());
                     }
+                    self.rio_outstanding = self
+                        .rio_outstanding
+                        .checked_sub(1)
+                        .ok_or_else(|| "RIO send completion underflow".to_string())?;
                     session.send_outstanding -= 1;
+                    let remaining = session
+                        .send_posted_bytes
+                        .checked_sub(session.send_offset)
+                        .ok_or_else(|| "send offset exceeds its request".to_string())?;
+                    if status == 0 && !suppress_send && (bytes == 0 || bytes > remaining) {
+                        status = crate::native::completion::WSAECONNRESET;
+                    }
+                    if status == 0 && !suppress_send {
+                        self.sent_bytes = self.sent_bytes.saturating_add(u64::from(bytes));
+                    }
                     // A native send may complete with a strict prefix. The reference re-posts the
                     // remainder of the same attempt, so the scheduler sees exactly one send
                     // completion per attempt and the request queue never exceeds one send.
-                    let remainder = if status == 0 && !closing && bytes != 0 {
+                    let remainder = if status == 0 && !suppress_send && bytes != 0 {
                         let offset = session.send_offset.saturating_add(bytes);
-                        (offset < session.send_posted_bytes)
-                            .then_some((session.send_slot, offset, session.send_posted_bytes - offset))
+                        (offset < session.send_posted_bytes).then_some((
+                            session.send_slot,
+                            offset,
+                            session.send_posted_bytes - offset,
+                        ))
                     } else {
                         None
                     };
                     if let Some((send_slot, offset, remaining)) = remainder {
                         let global_slot = self.tx_global_slot(context.index, send_slot)?;
                         let buffer = self
-                            .send_arena
+                            .arena
                             .as_ref()
                             .ok_or_else(|| "send arena is unavailable".to_string())?
-                            .view_from(global_slot, offset, remaining)
+                            .send_view_from(global_slot, offset, remaining)
                             .map_err(stage)?;
-                        self.sessions[slot_index]
-                            .queue()?
-                            .send(
-                                &self.rio,
-                                &buffer,
-                                encode_context(context.index, context.generation, send_slot, Operation::Send),
-                            )
-                            .map_err(stage)?;
-                        let slot = &mut self.sessions[slot_index];
-                        slot.send_outstanding += 1;
-                        slot.send_offset = offset;
-                        crate::worker::trace::event_args(
-                            "SEND_REPOST",
-                            format_args!(
-                                "session={} generation={} slot={send_slot} offset={offset} bytes={remaining}",
-                                context.index, context.generation
+                        let reposted = self.sessions[slot_index].queue()?.send(
+                            &self.rio,
+                            &buffer,
+                            encode_context(
+                                context.index,
+                                context.generation,
+                                send_slot,
+                                Operation::Send,
                             ),
                         );
-                        return Ok(());
+                        match reposted {
+                            Ok(()) => {
+                                let slot = &mut self.sessions[slot_index];
+                                slot.send_outstanding += 1;
+                                self.rio_outstanding += 1;
+                                slot.send_offset = offset;
+                                self.arm_queue()?;
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                status = error.code;
+                            }
+                        }
                     }
-                reported_bytes = session.send_offset.saturating_add(bytes);
+                    let session = &mut self.sessions[slot_index];
+                    reported_bytes = session.send_offset.saturating_add(bytes);
                     session.send_offset = 0;
                     session.send_posted_bytes = 0;
                     session.release_send_slot(context.slot)?;
@@ -909,11 +1131,21 @@ pub mod transport {
                                 .to_string(),
                         );
                     }
+                    self.rio_outstanding = self
+                        .rio_outstanding
+                        .checked_sub(1)
+                        .ok_or_else(|| "RIO receive completion underflow".to_string())?;
                     if bytes > session.receive_posted_bytes && status != WSAEMSGSIZE {
                         return Err(format!(
                             "receive completion transferred {bytes} bytes into a {}-byte request",
                             session.receive_posted_bytes
                         ));
+                    }
+                    if !closing
+                        && self.protocol == Protocol::Tcp
+                        && bytes != session.receive_posted_bytes
+                    {
+                        session.failure_pending = true;
                     }
                     session.receive_outstanding = 0;
                     session.receive_posted_bytes = 0;
@@ -924,6 +1156,12 @@ pub mod transport {
             }
 
             if !closing {
+                // Match the reference's per-result failure order even though native ownership is
+                // retired in batches: later completions still drain, but cannot count or repost a
+                // send after the first failed operation. Keep liveness until the worker sees it.
+                if status != 0 {
+                    self.sessions[slot_index].failure_pending = true;
+                }
                 completions.push(Completion {
                     index: context.index,
                     generation: context.generation,
@@ -979,7 +1217,7 @@ pub mod transport {
             &mut self,
             wait_ms: u32,
             completions: &mut Vec<Completion>,
-        ) -> Result<(), String> {
+        ) -> Result<bool, String> {
             let mut bytes = 0u32;
             let mut key = 0u64;
             let mut overlapped: *mut OVERLAPPED = ptr::null_mut();
@@ -993,35 +1231,65 @@ pub mod transport {
                 )
             };
 
-            if signaled.as_bool() {
-                if key as usize == crate::native::rio::RIO_COMPLETION_KEY {
-                    self.queue
-                        .as_mut()
-                        .ok_or_else(|| "transport completion queue is closed".to_string())?
-                        .on_delivery();
-                    return Ok(());
-                }
-                let context = decode_context(key)
-                    .ok_or_else(|| "IOCP completion has an invalid completion key".to_string())?;
-                self.retire_into(context, 0, bytes, completions)?;
-                return Ok(());
-            }
-
-            let error = unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32;
-            if !overlapped.is_null() {
-                let context = decode_context(key)
-                    .ok_or_else(|| "failed IOCP completion has an invalid completion key".to_string())?;
-                self.retire_into(context, error, bytes, completions)?;
-                return Ok(());
-            }
-            if error == WAIT_TIMEOUT {
-                Ok(())
+            let error = if signaled.as_bool() {
+                0
             } else {
-                Err(format!("GetQueuedCompletionStatus failed ({error})"))
+                (unsafe { windows::Win32::errhandlingapi::GetLastError() }) as i32
+            };
+            if error == 0 && key == 1 && overlapped.is_null() {
+                return Ok(false);
+            }
+            if key as usize == crate::native::rio::RIO_COMPLETION_KEY {
+                let expected = self
+                    .notification_overlapped
+                    .as_mut()
+                    .map(|value| &mut **value as *mut OVERLAPPED)
+                    .ok_or_else(|| "RIO notification OVERLAPPED is unavailable".to_string())?;
+                if error != 0 || overlapped != expected {
+                    return Err("invalid RIO notification packet identity/status".to_string());
+                }
+                self.queue
+                    .as_mut()
+                    .ok_or_else(|| "transport completion queue is closed".to_string())?
+                    .on_delivery()
+                    .map_err(stage)?;
+                self.notify_deliveries = self.notify_deliveries.saturating_add(1);
+                return Ok(true);
+            }
+            if !overlapped.is_null() {
+                let context = decode_context(key).ok_or_else(|| {
+                    "failed IOCP completion has an invalid completion key".to_string()
+                })?;
+                if context.operation != Operation::Connect {
+                    return Err("non-ConnectEx operation arrived through IOCP".to_string());
+                }
+                let slot = self
+                    .sessions
+                    .get_mut(context.index as usize)
+                    .ok_or_else(|| "ConnectEx packet has an invalid session index".to_string())?;
+                if context.generation != slot.generation
+                    || overlapped != slot.overlapped.as_mut_ptr()
+                {
+                    return Err("invalid ConnectEx completion identity".to_string());
+                }
+                self.retire_into(context, error, bytes, completions)?;
+                return Ok(false);
+            }
+            if error == WAIT_TIMEOUT && key == 0 {
+                if self.rio_outstanding != 0 && !self.queue()?.is_armed() {
+                    self.timeout_wakeups_while_outstanding =
+                        self.timeout_wakeups_while_outstanding.saturating_add(1);
+                }
+                Ok(false)
+            } else {
+                Err(format!(
+                    "unexpected GetQueuedCompletionStatus packet ({error})"
+                ))
             }
         }
 
         fn release_resources(&mut self) {
+            self.clear_wake_port();
             // The notification OVERLAPPED and IOCP both outlive the CQ configuration. Close the
             // CQ first, then close the IOCP so any already-queued notification packet can no
             // longer be retrieved, and only then free the notification OVERLAPPED. Registered
@@ -1029,11 +1297,11 @@ pub mod transport {
             drop(self.queue.take());
             drop(self.port.take());
             drop(self.notification_overlapped.take());
-            drop(self.send_arena.take());
-            drop(self.receive_arena.take());
+            drop(self.arena.take());
         }
 
         fn leak_resources(&mut self, reason: &str) {
+            self.clear_wake_port();
             crate::worker::trace::event("SHUTDOWN_LEAK", reason);
             // Memory safety wins over cleanup if Windows/provider state is no longer observable.
             // The process will reclaim these objects; freeing them while I/O may still reference
@@ -1046,10 +1314,7 @@ pub mod transport {
             if let Some(value) = self.queue.take() {
                 core::mem::forget(value);
             }
-            if let Some(value) = self.send_arena.take() {
-                core::mem::forget(value);
-            }
-            if let Some(value) = self.receive_arena.take() {
+            if let Some(value) = self.arena.take() {
                 core::mem::forget(value);
             }
             if let Some(value) = self.notification_overlapped.take() {
@@ -1112,6 +1377,14 @@ pub mod transport {
     }
 
     impl Transport for RioTransport {
+        fn try_close(&mut self, index: u32) -> Result<(), String> {
+            self.begin_close(index)
+        }
+
+        fn sent_bytes(&self) -> Option<u64> {
+            Some(self.sent_bytes)
+        }
+
         fn connect(&mut self, index: u32) -> Result<(), String> {
             self.prepare(index)?;
             let slot_index = index as usize;
@@ -1141,10 +1414,10 @@ pub mod transport {
             }
 
             let result = {
+                let connect_ex = self.connect_ex;
                 let slot = &mut self.sessions[slot_index];
                 slot.overlapped.arm().map_err(stage)?;
                 let socket = slot.socket()?;
-                let connect_ex = slot.connect_ex.flatten();
                 let target = slot.target;
                 let overlapped = slot.overlapped.as_mut_ptr();
                 begin_connect(connect_ex, socket, &target, overlapped)
@@ -1170,6 +1443,8 @@ pub mod transport {
 
         fn connected(&mut self, index: u32, generation: u32) -> Result<(), String> {
             let protocol = self.protocol;
+            let queue_raw = self.queue()?.raw();
+            let rio = self.rio;
             let slot = self
                 .sessions
                 .get_mut(index as usize)
@@ -1177,12 +1452,27 @@ pub mod transport {
             if slot.generation != generation || slot.state != GenerationState::Connecting {
                 return Err("connect completion does not belong to the live generation".to_string());
             }
-            if protocol == Protocol::Tcp && (slot.connect_outstanding || slot.overlapped.is_armed()) {
+            if protocol == Protocol::Tcp && (slot.connect_outstanding || slot.overlapped.is_armed())
+            {
                 return Err("ConnectEx completion was not retired before connected()".to_string());
             }
             if protocol == Protocol::Tcp {
                 update_connect_context(slot.socket()?).map_err(stage)?;
             }
+            slot.request_queue = Some(
+                RequestQueue::create(
+                    &rio,
+                    slot.socket()?,
+                    MAX_RECEIVE,
+                    1,
+                    MAX_SEND,
+                    1,
+                    queue_raw,
+                    queue_raw,
+                    encode_context(index, generation, NO_SEND_SLOT, Operation::Connect),
+                )
+                .map_err(stage)?,
+            );
             slot.state = GenerationState::Active;
             crate::worker::trace::event_args(
                 "CONNECT_COMPLETE",
@@ -1203,25 +1493,19 @@ pub mod transport {
             if bytes == 0 || bytes > self.batch_bytes {
                 return Err("invalid send length".to_string());
             }
-            if self.sessions[slot_index].send_outstanding >= self.max_send {
+            if self.sessions[slot_index].send_outstanding >= MAX_SEND {
                 return Err("RIO send depth exceeded".to_string());
             }
-
-            // Arm before posting so a successful return from this method has one unambiguous
-            // meaning: the native RIOSend is outstanding and will eventually retire exactly once.
-            // If RIONotify fails, no request has been posted and the scheduler may roll back the
-            // precomputed business step safely.
-            self.arm_queue()?;
 
             let send_slot = self.sessions[slot_index]
                 .allocate_send_slot()
                 .ok_or_else(|| "no free TX slot despite available send depth".to_string())?;
             let global_slot = self.tx_global_slot(index, send_slot)?;
             let buffer = self
-                .send_arena
+                .arena
                 .as_ref()
                 .ok_or_else(|| "send arena is unavailable".to_string())?
-                .view(global_slot, bytes)
+                .send_view(global_slot, bytes)
                 .map_err(stage)?;
             let context = encode_context(index, generation, send_slot, Operation::Send);
             let posted = self.sessions[slot_index]
@@ -1233,9 +1517,11 @@ pub mod transport {
                 return Err(error);
             }
             self.sessions[slot_index].send_outstanding += 1;
+            self.rio_outstanding += 1;
             self.sessions[slot_index].send_slot = send_slot;
             self.sessions[slot_index].send_posted_bytes = bytes;
             self.sessions[slot_index].send_offset = 0;
+            self.arm_queue()?;
             crate::worker::trace::event_args(
                 "SEND_POST",
                 format_args!(
@@ -1261,15 +1547,11 @@ pub mod transport {
                 return Err("invalid receive length".to_string());
             }
 
-            // As with send, arm before the native post so Err means that no receive request was
-            // accepted and scheduler rollback is exact.
-            self.arm_queue()?;
-
             let buffer = self
-                .receive_arena
+                .arena
                 .as_ref()
                 .ok_or_else(|| "receive arena is unavailable".to_string())?
-                .view(index, bytes)
+                .receive_view(index, bytes)
                 .map_err(stage)?;
             self.sessions[slot_index]
                 .queue()?
@@ -1277,10 +1559,17 @@ pub mod transport {
                     &self.rio,
                     &buffer,
                     encode_context(index, generation, NO_SEND_SLOT, Operation::Receive),
+                    if self.protocol == Protocol::Tcp {
+                        windows::Win32::mswsockdef::RIO_MSG_WAITALL as u32
+                    } else {
+                        0
+                    },
                 )
                 .map_err(stage)?;
             self.sessions[slot_index].receive_outstanding = 1;
+            self.rio_outstanding += 1;
             self.sessions[slot_index].receive_posted_bytes = bytes;
+            self.arm_queue()?;
             crate::worker::trace::event_args(
                 "RECV_POST",
                 format_args!("session={index} generation={generation} bytes={bytes}"),
@@ -1297,7 +1586,10 @@ pub mod transport {
         fn completion_is_live(&self, index: u32, generation: u32) -> bool {
             self.sessions.get(index as usize).is_some_and(|slot| {
                 slot.generation == generation
-                    && matches!(slot.state, GenerationState::Connecting | GenerationState::Active)
+                    && matches!(
+                        slot.state,
+                        GenerationState::Connecting | GenerationState::Active
+                    )
             })
         }
 
@@ -1308,9 +1600,9 @@ pub mod transport {
             if length > self.batch_bytes {
                 return &[];
             }
-            self.receive_arena
+            self.arena
                 .as_ref()
-                .map(|arena| arena.read(index, length))
+                .map(|arena| arena.read_receive(index, length))
                 .unwrap_or(&[])
         }
 
@@ -1320,7 +1612,7 @@ pub mod transport {
             // RIONotify is one-shot. If native work remains after a drain, re-arm even when the
             // scheduler did not post a replacement operation (for example, only a receive is
             // still outstanding after several send completions).
-            if self.has_native_outstanding() {
+            if self.rio_outstanding != 0 {
                 self.arm_queue()?;
             }
             Ok(completions)
@@ -1337,9 +1629,10 @@ pub mod transport {
             } else {
                 0
             };
-            self.wait_iocp_once_into(wait, &mut completions)?;
-            self.drain_rio_into(budget, &mut completions)?;
-            if self.has_native_outstanding() {
+            if self.wait_iocp_once_into(wait, &mut completions)? {
+                self.drain_rio_into(budget, &mut completions)?;
+            }
+            if self.rio_outstanding != 0 {
                 self.arm_queue()?;
             }
             Ok(completions)
@@ -1349,6 +1642,9 @@ pub mod transport {
             // Keep the capacity the batch grew to: the next wait_and_drain reuses this buffer
             // instead of allocating and growing a new one on every round trip.
             completions.clear();
+            // Handling this batch can synchronously retire a generation and enqueue its drain
+            // event. Preserve those new control completions when returning the reusable buffer.
+            completions.append(&mut self.pending);
             self.pending = completions;
         }
 
@@ -1362,27 +1658,23 @@ pub mod transport {
         use super::*;
 
         #[test]
-        fn tx_slot_free_list_handles_out_of_order_completion() {
+        fn tx_slot_cannot_be_reused_before_completion() {
             let target: SOCKADDR_IN = unsafe { core::mem::zeroed() };
-            let mut session = SessionTransport::new(target, 4);
-            let a = session.allocate_send_slot().expect("slot a");
-            let b = session.allocate_send_slot().expect("slot b");
-            let c = session.allocate_send_slot().expect("slot c");
-            let d = session.allocate_send_slot().expect("slot d");
-            assert_eq!([a, b, c, d], [0, 1, 2, 3]);
+            let mut session = SessionTransport::new(target);
+            let slot = session.allocate_send_slot().expect("slot");
+            assert_eq!(slot, 0);
             assert!(session.allocate_send_slot().is_none());
-
-            session.release_send_slot(b).expect("release b");
-            session.release_send_slot(d).expect("release d");
-            assert_eq!(session.allocate_send_slot(), Some(d));
-            assert_eq!(session.allocate_send_slot(), Some(b));
+            assert!(session.release_send_slot(1).is_err());
+            assert!(session.allocate_send_slot().is_none());
+            session.release_send_slot(slot).expect("release");
+            assert_eq!(session.allocate_send_slot(), Some(0));
             assert!(session.allocate_send_slot().is_none());
         }
 
         #[test]
         fn tx_slot_double_release_is_rejected() {
             let target: SOCKADDR_IN = unsafe { core::mem::zeroed() };
-            let mut session = SessionTransport::new(target, 1);
+            let mut session = SessionTransport::new(target);
             let slot = session.allocate_send_slot().expect("slot");
             session.release_send_slot(slot).expect("release");
             assert!(session.release_send_slot(slot).is_err());

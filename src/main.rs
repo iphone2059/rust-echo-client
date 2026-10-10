@@ -1,6 +1,6 @@
 use std::process::ExitCode as ProcessExitCode;
 
-use cec::contract::parse;
+use cec::contract::parse_os;
 use cec::engine;
 use cec::types::ExitCode;
 
@@ -9,8 +9,8 @@ fn help_text() -> String {
 }
 
 fn main() -> ProcessExitCode {
-    let arguments: Vec<String> = std::env::args().collect();
-    let options = match parse(&arguments) {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    let options = match parse_os(&arguments) {
         Ok(options) => options,
         Err(error) => {
             eprintln!("Invalid arguments: {}", error.0);

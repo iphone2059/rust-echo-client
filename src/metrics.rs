@@ -6,7 +6,7 @@ use crate::types::ExitCode;
 
 /// The reference buckets latency by the power of two below the sample, so bin i means
 /// [2^i, 2^(i+1)) microseconds and the reported value is that lower bound rather than the
-/// sample. Sixty-four bins cover the whole u32 range because the index is clamped.
+/// sample. Sixty-four bins cover the whole u64 range because the index is clamped.
 pub const LATENCY_BUCKETS: usize = 64;
 
 /// Counters accumulated by the workers. Nothing here is shared: each worker owns its own
@@ -28,13 +28,13 @@ pub struct Statistics {
     pub cancelled: u64,
     pub connections: u64,
     pub reconnects: u64,
-    /// Sessions that permanently ended because a transport generation could not recover.
+    /// Connection failures, including failed generations that will reconnect.
     pub network_failures: u64,
     pub fatal: bool,
-    pub latency_buckets: [u32; LATENCY_BUCKETS],
+    pub latency_buckets: [u64; LATENCY_BUCKETS],
     pub latency_samples: u64,
     pub latency_sum_us: u64,
-    pub latency_max_us: u32,
+    pub latency_max_us: u64,
     pub elapsed_milliseconds: u64,
 }
 
@@ -87,17 +87,14 @@ impl Statistics {
 
     /// Records one completed attempt, which is one latency sample because the histogram samples
     /// batches rather than echoes. The bucket is the reference's: the power of two below the
-    /// sample, with the index clamped so no sample can write past the histogram. A zero sample
-    /// keeps the reference's unsigned underflow, which lands in the last bucket.
-    pub fn record_latency(&mut self, micros: u32) {
+    /// sample, with the index clamped so no sample can write past the histogram. Like the
+    /// reference's tick conversion, zero and sub-microsecond samples count as one microsecond.
+    pub fn record_latency(&mut self, micros: u64) {
+        let micros = micros.max(1);
         self.latency_samples = self.latency_samples.saturating_add(1);
-        self.latency_sum_us = self.latency_sum_us.saturating_add(u64::from(micros));
+        self.latency_sum_us = self.latency_sum_us.saturating_add(micros);
         self.latency_max_us = self.latency_max_us.max(micros);
-        let bucket = if micros == 0 {
-            LATENCY_BUCKETS - 1
-        } else {
-            ((u32::BITS - 1 - micros.leading_zeros()) as usize).min(LATENCY_BUCKETS - 1)
-        };
+        let bucket = ((u64::BITS - 1 - micros.leading_zeros()) as usize).min(LATENCY_BUCKETS - 1);
         self.latency_buckets[bucket] = self.latency_buckets[bucket].saturating_add(1);
     }
 
@@ -116,7 +113,7 @@ impl Statistics {
             .saturating_add(remainder.saturating_mul(numerator).div_ceil(denominator));
         let mut seen = 0u64;
         for (index, count) in self.latency_buckets.iter().enumerate() {
-            seen = seen.saturating_add(u64::from(*count));
+            seen = seen.saturating_add(*count);
             if seen >= target {
                 return 1u64 << index.min(63);
             }
@@ -127,41 +124,37 @@ impl Statistics {
     pub fn sample_count(&self) -> u64 {
         let mut total = 0u64;
         for count in self.latency_buckets {
-            total = total.saturating_add(u64::from(count));
+            total = total.saturating_add(count);
         }
         total
     }
 
-    pub fn mean_latency_us(&self) -> u32 {
+    pub fn mean_latency_us(&self) -> u64 {
         if self.latency_samples == 0 {
             0
         } else {
-            (self.latency_sum_us / self.latency_samples) as u32
+            self.latency_sum_us / self.latency_samples
         }
     }
 
     pub fn echo_per_second(&self) -> f64 {
-        if self.elapsed_milliseconds == 0 {
-            0.0
-        } else {
-            self.echoes as f64 * 1_000.0 / self.elapsed_milliseconds as f64
-        }
+        self.echoes as f64 * 1_000.0 / self.elapsed_milliseconds.max(1) as f64
     }
 
     pub fn mib_per_second(&self) -> f64 {
-        if self.elapsed_milliseconds == 0 {
-            0.0
-        } else {
-            let mib = self.bytes as f64 / (1024.0 * 1024.0);
-            mib * 1_000.0 / self.elapsed_milliseconds as f64
-        }
+        let mib = self.bytes as f64 / (1024.0 * 1024.0);
+        mib * 1_000.0 / self.elapsed_milliseconds.max(1) as f64
     }
 
     /// Echoes that were asked for but never claimed. `/n` is a per-session quota, so the run
     /// described by the command line is `/n` times the session count. A controlled stop is not a
     /// loss.
     pub fn unclaimed(&self, limit: u64, sessions: u32, controlled_stop: bool) -> u64 {
-        unclaimed_echoes(limit.saturating_mul(u64::from(sessions)), self.attempted, controlled_stop)
+        unclaimed_echoes(
+            limit.saturating_mul(u64::from(sessions)),
+            self.attempted,
+            controlled_stop,
+        )
     }
 
     pub fn exit_code(&self, controlled_stop: bool) -> ExitCode {
@@ -242,12 +235,49 @@ mod tests {
     #[test]
     fn latency_clamps_extreme_samples_into_the_last_bucket() {
         let mut statistics = Statistics::default();
-        // A zero sample keeps the reference's unsigned underflow, and a sample beyond the
-        // histogram is clamped, so both land in the last bucket whose lower bound is 2^63.
-        statistics.record_latency(0);
-        statistics.record_latency(u32::MAX);
+        // The largest u64 sample lands in bin 63; the largest u32 sample lands in bin 31.
+        statistics.record_latency(u64::MAX);
+        statistics.record_latency(u64::from(u32::MAX));
         assert_eq!(statistics.sample_count(), 2);
         assert_eq!(statistics.percentile(1, 1), 1u64 << 63);
         assert_eq!(statistics.percentile(50, 100), 1u64 << 31);
+    }
+
+    #[test]
+    fn zero_latency_uses_the_reference_one_microsecond_floor() {
+        let mut statistics = Statistics::default();
+        statistics.record_latency(0);
+        assert_eq!(statistics.latency_samples, 1);
+        assert_eq!(statistics.sample_count(), 1);
+        assert_eq!(statistics.latency_sum_us, 1);
+        assert_eq!(statistics.latency_max_us, 1);
+        assert_eq!(statistics.mean_latency_us(), 1);
+        assert_eq!(statistics.percentile(50, 100), 1);
+        assert_eq!(statistics.percentile(1, 1), 1);
+        assert_eq!(statistics.latency_buckets[0], 1);
+        assert_eq!(statistics.latency_buckets[63], 0);
+    }
+
+    #[test]
+    fn submicrosecond_latency_uses_the_reference_one_microsecond_floor() {
+        let mut statistics = Statistics::default();
+        let micros = std::time::Duration::from_nanos(999).as_micros() as u64;
+        statistics.record_latency(micros);
+        assert_eq!(statistics.mean_latency_us(), 1);
+        assert_eq!(statistics.percentile(1, 1), 1);
+    }
+
+    #[test]
+    fn long_latency_samples_and_submillisecond_rates_preserve_the_reference_range() {
+        let mut statistics = Statistics {
+            echoes: 2,
+            bytes: 1_048_576,
+            ..Statistics::default()
+        };
+        statistics.record_latency(1u64 << 40);
+        assert_eq!(statistics.mean_latency_us(), 1u64 << 40);
+        assert_eq!(statistics.percentile(1, 1), 1u64 << 40);
+        assert_eq!(statistics.echo_per_second(), 2_000.0);
+        assert_eq!(statistics.mib_per_second(), 1_000.0);
     }
 }

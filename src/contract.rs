@@ -23,14 +23,21 @@ pub mod token {
     pub const MISSING_TARGET: &str = "missing-target";
     pub const MISSING_PROTOCOL: &str = "missing-protocol";
     pub const UNEXPECTED_TARGET: &str = "unexpected-target";
+    pub const INVALID_UTF16: &str = "invalid-utf16";
 }
 
 /// Usage text, one entry per line; printed on stdout for a valid /h command line.
 pub const USAGE: &[&str] = &[
-    "Usage: rust-echo-client <IPv4-address> /p tcp|udp [/r port] [/l port] [/n count]",
+    "Usage: rust-echo-client target /p tcp|udp [/r port] [/l port] [/n count]",
     "       [/t seconds] [/i ms] [/d text | /z bytes | /zt bytes] [/k tcp-depth]",
     "       [/c sessions] [/threads workers] [/w seconds] [/rc [seconds]]",
-    "       [/report seconds] [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats]",
+    "       [/report seconds] [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats] [/h]",
+    "/n count: attempts per session; 0 means unlimited.",
+    "/k depth: echo units in each TCP attempt; UDP rejects /k.",
+    "/threads 0: automatic workers, min(sessions, active processors, 64).",
+    "/rc [seconds]: reconnect after failure; bare /rc means 1 second.",
+    "/w 0: no run limit. /report 0: no periodic reports.",
+    "/q suppresses the default final; /stats forces final; /h shows help.",
     "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.",
     "One attempt is one receive plus one send whatever /k is, so each worker's CQ reserves two",
     "operations per session of its largest shard and two batches of registered memory per session.",
@@ -42,7 +49,7 @@ pub fn help_text() -> String {
 }
 
 use crate::types::{
-    ArgumentError, Options, Pattern, Protocol, MAXIMUM_SESSIONS, MAXIMUM_UDP_PAYLOAD_BYTES,
+    ArgumentError, MAXIMUM_SESSIONS, MAXIMUM_UDP_PAYLOAD_BYTES, Options, Pattern, Protocol,
 };
 
 pub fn checked_product(a: u64, b: u64) -> Option<u64> {
@@ -50,14 +57,18 @@ pub fn checked_product(a: u64, b: u64) -> Option<u64> {
 }
 
 pub fn unclaimed_echoes(limit: u64, claimed: u64, controlled_stop: bool) -> u64 {
-    if controlled_stop || limit == 0 || claimed >= limit { 0 } else { limit - claimed }
+    if controlled_stop || limit == 0 || claimed >= limit {
+        0
+    } else {
+        limit - claimed
+    }
 }
 
 pub fn classify_result(
     echoed: u64,
     corrupted: u64,
     lost: u64,
-    network_failures: u64,
+    _network_failures: u64,
     fatal: bool,
     controlled_stop: bool,
 ) -> crate::types::ExitCode {
@@ -68,13 +79,14 @@ pub fn classify_result(
     if corrupted != 0 || lost != 0 {
         return ExitCode::EchoFailure;
     }
-    if network_failures != 0 {
-        return ExitCode::Network;
-    }
     if controlled_stop {
         return ExitCode::Success;
     }
-    if echoed == 0 { ExitCode::Network } else { ExitCode::Success }
+    if echoed == 0 {
+        ExitCode::Network
+    } else {
+        ExitCode::Success
+    }
 }
 
 fn switch_offset(token: &str) -> Option<usize> {
@@ -82,12 +94,23 @@ fn switch_offset(token: &str) -> Option<usize> {
     if bytes.len() < 2 || (bytes[0] != b'/' && bytes[0] != b'-') {
         return None;
     }
-    let offset = if bytes.len() > 2 && bytes[0] == b'-' && bytes[1] == b'-' { 2 } else { 1 };
+    let offset = if bytes.len() > 2 && bytes[0] == b'-' && bytes[1] == b'-' {
+        2
+    } else {
+        1
+    };
     let first = bytes[offset].to_ascii_lowercase();
-    if first.is_ascii_lowercase() { Some(offset) } else { None }
+    if first.is_ascii_lowercase() {
+        Some(offset)
+    } else {
+        None
+    }
 }
 
 fn numeric(value: &str) -> Result<u64, ArgumentError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ArgumentError(token::INVALID_NUMBER.to_string()));
+    }
     value
         .parse::<u64>()
         .map_err(|_| ArgumentError(token::INVALID_NUMBER.to_string()))
@@ -97,6 +120,25 @@ fn numeric(value: &str) -> Result<u64, ArgumentError> {
 /// switches, and cross rules (fixed local port requires one session and forbids
 /// reconnects on TCP). /h never masks a malformed command line.
 pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
+    parse_impl(arguments, &[])
+}
+
+/// Preserve the reference's token-consumption order even when Windows supplies unpaired UTF-16
+/// surrogates. Invalid numeric/protocol values receive their normal value diagnostics; invalid
+/// literal text is diagnosed after the same mandatory/cross-field rules as the reference.
+pub fn parse_os(arguments: &[std::ffi::OsString]) -> Result<Options, ArgumentError> {
+    let invalid: Vec<bool> = arguments
+        .iter()
+        .map(|argument| argument.to_str().is_none())
+        .collect();
+    let arguments: Vec<String> = arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    parse_impl(&arguments, &invalid)
+}
+
+fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, ArgumentError> {
     if arguments.is_empty() {
         return Err(ArgumentError("invalid parser arguments".to_string()));
     }
@@ -108,8 +150,12 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     // A second positional is reported after the cross-field rules, exactly as the reference does,
     // so the worker split still wins when both are wrong.
     let mut saw_extra_target = false;
+    let mut literal_invalid_utf16 = false;
     let mut index = 1;
     while index < arguments.len() {
+        if invalid_utf16.get(index).copied().unwrap_or(false) {
+            return Err(ArgumentError(token::INVALID_UTF16.to_string()));
+        }
         let token = arguments[index].clone();
         index += 1;
         let Some(offset) = switch_offset(&token) else {
@@ -118,10 +164,10 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
                 continue;
             }
             if token.is_empty() {
-                return Err(ArgumentError("target host is empty".to_string()));
+                return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
             }
-            if token.len() >= 256 {
-                return Err(ArgumentError("target host is too long".to_string()));
+            if token.encode_utf16().count() >= 256 {
+                return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
             }
             options.host = token;
             continue;
@@ -144,7 +190,8 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             continue;
         }
         if name == "rc" && inline.is_none() {
-            let next_is_value = index < arguments.len() && switch_offset(&arguments[index]).is_none();
+            let next_is_value =
+                index < arguments.len() && switch_offset(&arguments[index]).is_none();
             if !next_is_value {
                 options.reconnect_seconds = Some(1);
                 continue;
@@ -152,11 +199,27 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         }
         if !matches!(
             name.as_str(),
-            "p" | "d" | "r" | "l" | "n" | "t" | "i" | "b" | "k" | "z" | "zt" | "w" | "rc"
-                | "report" | "c" | "threads" | "cq" | "memory"
+            "p" | "d"
+                | "r"
+                | "l"
+                | "n"
+                | "t"
+                | "i"
+                | "b"
+                | "k"
+                | "z"
+                | "zt"
+                | "w"
+                | "rc"
+                | "report"
+                | "c"
+                | "threads"
+                | "cq"
+                | "memory"
         ) {
             return Err(ArgumentError(token::UNKNOWN_SWITCH.to_string()));
         }
+        let mut value_invalid_utf16 = false;
         let value = match inline {
             Some(value) if !value.is_empty() => value,
             Some(_) => return Err(ArgumentError(token::MISSING_VALUE.to_string())),
@@ -168,6 +231,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
                     return Err(ArgumentError(token::MISSING_VALUE.to_string()));
                 }
                 let value = arguments[index].clone();
+                value_invalid_utf16 = invalid_utf16.get(index).copied().unwrap_or(false);
                 index += 1;
                 value
             }
@@ -185,15 +249,19 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         if name == "d" || name == "z" || name == "zt" {
             let number = if name == "d" { 0 } else { numeric(&value)? };
             if name != "d" {
-                if number == 0 || number > MAXIMUM_UDP_PAYLOAD_BYTES.max(u64::from(u32::MAX)) {
+                if number == 0 || number > crate::types::MAXIMUM_TCP_BATCH_BYTES {
                     return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
                 }
             }
             match name.as_str() {
                 "d" => {
+                    if value.encode_utf16().count() >= 32_768 {
+                        return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
+                    }
                     literal = true;
                     options.pattern = Pattern::LiteralText;
                     options.literal_pattern = value;
+                    literal_invalid_utf16 = value_invalid_utf16;
                 }
                 "z" => {
                     binary = true;
@@ -214,13 +282,13 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             "n" => 0..=u64::MAX,
             "r" => 1..=65_535,
             "l" => 0..=65_535,
-            "t" | "w" => 1..=u64::from(u32::MAX),
-            "i" | "report" => 0..=u64::from(u32::MAX),
+            "t" => 1..=u64::from(u32::MAX),
+            "i" | "report" | "w" => 0..=u64::from(u32::MAX),
             "rc" => 0..=u64::from(u32::MAX),
             "b" => 0..=2_147_483_647,
             "k" => 1..=65_536,
             "c" => 1..=u64::from(MAXIMUM_SESSIONS),
-            "threads" => 1..=64,
+            "threads" => 0..=64,
             "cq" => 64..=1_048_576,
             _ => 1_048_576..=u64::MAX,
         };
@@ -235,12 +303,6 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             "i" => options.interval_milliseconds = number as u32,
             "b" => options.socket_buffer_bytes = number as u32,
             "k" => {
-                // /k is the TCP pipeline depth. The datagram path has no equivalent, and the
-                // baseline clients reject the switch outright for UDP, so accepting it here
-                // would silently diverge.
-                if options.protocol == Protocol::Udp {
-                    return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
-                }
                 saw_pipeline = true;
                 options.pipeline_depth = number as u32;
             }
@@ -253,18 +315,10 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             _ => options.memory_bytes = number,
         }
     }
-    // The datagram path has no /k; a /k that appeared before /p udp is rejected here, before the
-    // help short-circuit, so the diagnostic does not depend on the order of the switches.
-    if options.protocol == Protocol::Udp && saw_pipeline {
-        return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
-    }
     // The worker split is validated before the mandatory arguments, which is why
     // `/c 1 /threads 2` reports out-of-range and not missing-target.
     if options.worker_count > options.session_count {
         return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
-    }
-    if saw_extra_target {
-        return Err(ArgumentError(token::UNEXPECTED_TARGET.to_string()));
     }
     // /h suppresses only the two mandatory-argument checks. Every other rule, including the
     // capacity budgets, still applies exactly as it does without /h.
@@ -273,15 +327,24 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     if !options.help && options.host.is_empty() {
         return Err(ArgumentError(token::MISSING_TARGET.to_string()));
     }
+    if saw_extra_target {
+        return Err(ArgumentError(token::UNEXPECTED_TARGET.to_string()));
+    }
     if !options.help && options.protocol == Protocol::None {
         return Err(ArgumentError(token::MISSING_PROTOCOL.to_string()));
     }
     // The target is not required to be a literal: the reference resolves it with GetAddrInfoW
     // after parsing, so a name is accepted here and an unresolvable one is a network failure
     // rather than a usage error.
-    let payload_switches = [literal, binary, printable].iter().filter(|flag| **flag).count();
+    let payload_switches = [literal, binary, printable]
+        .iter()
+        .filter(|flag| **flag)
+        .count();
     if payload_switches > 1 {
         return Err(ArgumentError(token::CONFLICTING_PAYLOAD.to_string()));
+    }
+    if options.protocol == Protocol::Udp && saw_pipeline {
+        return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
     }
     if options.local_port != 0
         && (options.session_count != 1
@@ -290,8 +353,13 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         return Err(ArgumentError(token::LOCAL_PORT_CONFLICT.to_string()));
     }
     // The run the command line describes may not exceed the quota the engine can represent.
-    if options.session_count != 0 && options.echo_count > u64::MAX / u64::from(options.session_count) {
+    if options.session_count != 0
+        && options.echo_count > u64::MAX / u64::from(options.session_count)
+    {
         return Err(ArgumentError(token::QUOTA_OVERFLOW.to_string()));
+    }
+    if options.pattern == Pattern::LiteralText && literal_invalid_utf16 {
+        return Err(ArgumentError(token::INVALID_UTF16.to_string()));
     }
     // The effective payload length is known before any session exists: the counter payloads carry
     // their own /z or /zt length, while the literal and default texts are measured in UTF-8 bytes
@@ -317,9 +385,12 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     // Capacity rules, validated here in the parser exactly like the reference: each worker owns its own
     // CQ and its own registered arena, so the largest shard decides both budgets, and both failures are
     // reported before any Winsock call is made.
-    let workers = crate::types::resolved_worker_count(options.worker_count, crate::types::available_processors())
-        .min(options.session_count)
-        .max(1);
+    let workers = crate::types::resolved_worker_count(
+        options.worker_count,
+        crate::types::available_processors(),
+    )
+    .min(options.session_count)
+    .max(1);
     let shard = u64::from(options.session_count).div_ceil(u64::from(workers));
     if pattern_bytes != 0 {
         let Some(batch) = pattern_bytes
@@ -370,9 +441,24 @@ mod tests {
             list.extend(extra.iter().map(|value| value.to_string()));
             list
         };
-        assert!(parse(&args(&["/c", "1", "/k", "2", "/z", "300000", "/memory", "1048576"])).is_err());
-        assert!(parse(&args(&["/c", "1", "/k", "2", "/z", "300000", "/memory", "2097152"])).is_ok());
-        assert!(parse(&args(&["/c", "64", "/threads", "2", "/k", "1", "/cq", "64"])).is_ok());
+        assert!(
+            parse(&args(&[
+                "/c", "1", "/k", "2", "/z", "300000", "/memory", "1048576"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(&args(&[
+                "/c", "1", "/k", "2", "/z", "300000", "/memory", "2097152"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            parse(&args(&[
+                "/c", "64", "/threads", "2", "/k", "1", "/cq", "64"
+            ]))
+            .is_ok()
+        );
         assert!(parse(&args(&["/c", "1", "/k", "64", "/cq", "64", "/z", "1"])).is_ok());
     }
 
@@ -391,8 +477,8 @@ mod tests {
 
     #[test]
     fn switch_forms_and_case_are_accepted() {
-        let options = parse(&args(&["127.0.0.1", "--p=UDP", "-R", "7000", "/n", "0"]))
-            .expect("valid");
+        let options =
+            parse(&args(&["127.0.0.1", "--p=UDP", "-R", "7000", "/n", "0"])).expect("valid");
         assert_eq!(options.protocol, Protocol::Udp);
         assert_eq!(options.remote_port, 7000);
         assert_eq!(options.echo_count, 0);
@@ -404,6 +490,67 @@ mod tests {
         parse(&args(arguments))
             .expect_err("expected a rejected command line")
             .0
+    }
+
+    #[test]
+    fn zero_run_duration_and_worker_count_are_valid() {
+        let parsed = parse(&args(&[
+            "localhost",
+            "/p",
+            "tcp",
+            "/w",
+            "0",
+            "/threads",
+            "0",
+        ]))
+        .expect("zero disables the deadline and selects automatic workers");
+        assert_eq!(parsed.run_seconds, 0);
+        assert_eq!(parsed.worker_count, 0);
+    }
+
+    #[test]
+    fn decimal_numbers_reject_signs_and_counter_limits_apply_without_a_protocol() {
+        assert_eq!(error_token(&["/h", "/n", "+1"]), token::INVALID_NUMBER);
+        assert_eq!(
+            error_token(&["/h", "/n", "18446744073709551616"]),
+            token::INVALID_NUMBER
+        );
+        assert_eq!(error_token(&["/h", "/z", "67108865"]), token::OUT_OF_RANGE);
+        assert_eq!(error_token(&["/h", "/zt", "67108865"]), token::OUT_OF_RANGE);
+    }
+
+    #[test]
+    fn text_capacity_is_measured_in_utf16_units() {
+        let mut values = args(&["/h"]);
+        values.push("界".repeat(255));
+        assert!(parse(&values).is_ok());
+        values[2] = "界".repeat(256);
+        assert_eq!(parse(&values).unwrap_err().0, token::OUT_OF_RANGE);
+        values[2] = "😀".repeat(128);
+        assert_eq!(parse(&values).unwrap_err().0, token::OUT_OF_RANGE);
+        let mut values = args(&["/h", "/d"]);
+        values.push("界".repeat(32_767));
+        assert!(parse(&values).is_ok());
+        values[3].push('界');
+        assert_eq!(parse(&values).unwrap_err().0, token::OUT_OF_RANGE);
+        assert_eq!(error_token(&[""]), token::OUT_OF_RANGE);
+    }
+
+    #[test]
+    fn cross_field_diagnostic_precedence_matches_the_reference() {
+        assert_eq!(
+            error_token(&["/p", "udp", "/k", "1"]),
+            token::MISSING_TARGET
+        );
+        assert_eq!(
+            error_token(&["/h", "/p", "udp", "/k", "1", "/threads", "2"]),
+            token::OUT_OF_RANGE
+        );
+        assert_eq!(
+            error_token(&["/h", "/p", "udp", "/k", "1", "/d", "x", "/z", "1"]),
+            token::CONFLICTING_PAYLOAD
+        );
+        assert!(parse(&args(&["localhost", "/p", "udp", "/k", "1", "/p", "tcp"])).is_ok());
     }
 
     /// Every case below is a measured reference diagnostic, so the tokens are the contract rather
@@ -464,7 +611,17 @@ mod tests {
             token::QUOTA_OVERFLOW
         );
         assert_eq!(
-            error_token(&["127.0.0.1", "/p", "tcp", "/c", "200", "/threads", "4", "/cq", "64"]),
+            error_token(&[
+                "127.0.0.1",
+                "/p",
+                "tcp",
+                "/c",
+                "200",
+                "/threads",
+                "4",
+                "/cq",
+                "64"
+            ]),
             token::CQ_CAPACITY
         );
         assert_eq!(
@@ -481,20 +638,32 @@ mod tests {
             ]),
             token::MEMORY_CAPACITY
         );
-        assert_eq!(error_token(&["127.0.0.1", "/p", "sctp"]), token::OUT_OF_RANGE);
+        assert_eq!(
+            error_token(&["127.0.0.1", "/p", "sctp"]),
+            token::OUT_OF_RANGE
+        );
         assert_eq!(error_token(&["/q=1"]), token::UNEXPECTED_VALUE);
         assert_eq!(error_token(&["/r="]), token::MISSING_VALUE);
         assert_eq!(error_token(&["/r"]), token::MISSING_VALUE);
         assert_eq!(error_token(&["/b=x"]), token::INVALID_NUMBER);
         assert_eq!(error_token(&["/zzz"]), token::UNKNOWN_SWITCH);
-        assert_eq!(error_token(&["127.0.0.1", "/p", "tcp", "/k", "0"]), token::OUT_OF_RANGE);
-        assert_eq!(error_token(&["127.0.0.1", "/p", "tcp", "/cq", "63"]), token::OUT_OF_RANGE);
+        assert_eq!(
+            error_token(&["127.0.0.1", "/p", "tcp", "/k", "0"]),
+            token::OUT_OF_RANGE
+        );
+        assert_eq!(
+            error_token(&["127.0.0.1", "/p", "tcp", "/cq", "63"]),
+            token::OUT_OF_RANGE
+        );
         // /h suppresses only the mandatory arguments; the budgets still apply.
         assert_eq!(
             error_token(&["/h", "/p", "tcp", "/c", "200", "/threads", "4", "/cq", "64"]),
             token::CQ_CAPACITY
         );
-        assert_eq!(error_token(&["/h", "/d", "x", "/z", "8"]), token::CONFLICTING_PAYLOAD);
+        assert_eq!(
+            error_token(&["/h", "/d", "x", "/z", "8"]),
+            token::CONFLICTING_PAYLOAD
+        );
         assert!(parse(&args(&["/h", "/p", "tcp", "/n", "1", "/d", "x"])).is_ok());
     }
 
@@ -533,7 +702,7 @@ mod tests {
         );
         assert_eq!(
             classify_result(5, 0, 0, 1, false, false),
-            crate::types::ExitCode::Network
+            crate::types::ExitCode::Success
         );
     }
 }

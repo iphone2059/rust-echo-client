@@ -34,9 +34,10 @@ pub mod session {
         pub index: u32,
         pub state: SessionState,
         pub echoes: u64,
+        pub active_counted: bool,
         /// Bytes already received for the attempt currently in flight.
         pub received: u32,
-        /// Absolute operation deadline (connect or active I/O), if one is armed.
+        /// Absolute operation deadline in the scheduler's clock ticks, if one is armed.
         pub deadline: Option<u64>,
         /// Absolute time for the next interval-spaced send.
         pub send_at: Option<u64>,
@@ -50,6 +51,7 @@ pub mod session {
                 index,
                 state: SessionState::Idle,
                 echoes: 0,
+                active_counted: false,
                 received: 0,
                 deadline: None,
                 send_at: None,
@@ -57,7 +59,7 @@ pub mod session {
             }
         }
 
-        pub fn begin_connect(&mut self, now: u64, timeout_ms: u64) -> bool {
+        pub fn begin_connect(&mut self, now: u64, timeout_ticks: u64) -> bool {
             if self.state != SessionState::Idle {
                 return false;
             }
@@ -65,7 +67,7 @@ pub mod session {
             self.received = 0;
             self.send_at = None;
             self.reconnect_at = None;
-            self.deadline = Some(now.saturating_add(timeout_ms));
+            self.deadline = Some(now.saturating_add(timeout_ticks));
             true
         }
 
@@ -74,6 +76,7 @@ pub mod session {
                 return false;
             }
             self.state = SessionState::Active;
+            self.active_counted = true;
             self.deadline = None;
             true
         }
@@ -95,6 +98,7 @@ pub mod session {
 
         pub fn fail_permanently(&mut self) {
             self.state = SessionState::Failed;
+            self.active_counted = false;
             self.deadline = None;
             self.send_at = None;
             self.reconnect_at = None;
@@ -103,6 +107,7 @@ pub mod session {
 
         pub fn complete(&mut self) {
             self.state = SessionState::Completed;
+            self.active_counted = false;
             self.deadline = None;
             self.send_at = None;
             self.reconnect_at = None;
@@ -110,18 +115,20 @@ pub mod session {
         }
 
         pub fn schedule_reconnect(&mut self, now: u64, delay_seconds: u32) -> bool {
+            self.schedule_reconnect_ticks(now, u64::from(delay_seconds).saturating_mul(1_000))
+        }
+
+        pub(crate) fn schedule_reconnect_ticks(&mut self, now: u64, delay_ticks: u64) -> bool {
             if self.state != SessionState::Closing {
                 return false;
             }
             self.state = SessionState::ReconnectWait;
             self.deadline = None;
-            self.reconnect_at = Some(
-                now.saturating_add(u64::from(delay_seconds).saturating_mul(1_000)),
-            );
+            self.reconnect_at = Some(now.saturating_add(delay_ticks));
             true
         }
 
-        pub fn reconnect_due(&mut self, now: u64, timeout_ms: u64) -> bool {
+        pub fn reconnect_due(&mut self, now: u64, timeout_ticks: u64) -> bool {
             if self.state != SessionState::ReconnectWait {
                 return false;
             }
@@ -129,7 +136,7 @@ pub mod session {
                 Some(at) if now >= at => {
                     self.state = SessionState::Idle;
                     self.reconnect_at = None;
-                    self.begin_connect(now, timeout_ms)
+                    self.begin_connect(now, timeout_ticks)
                 }
                 _ => false,
             }
@@ -138,7 +145,9 @@ pub mod session {
         /// Bytes of the current attempt still expected. The scheduler posts the remainder after a
         /// partial receive, so the accumulator is per attempt rather than per echo unit.
         pub fn receive_remaining(&self, attempt_bytes: u32) -> Option<u32> {
-            attempt_bytes.checked_sub(self.received).filter(|remaining| *remaining != 0)
+            attempt_bytes
+                .checked_sub(self.received)
+                .filter(|remaining| *remaining != 0)
         }
 
         /// Validates received bytes against the attempt's expected payload. One attempt carries
@@ -152,7 +161,7 @@ pub mod session {
             pattern: &[u8],
             units: u32,
             now: u64,
-            timeout_ms: u64,
+            timeout_ticks: u64,
             allow_partial: bool,
         ) -> ReceiveOutcome {
             if self.state != SessionState::Active {
@@ -193,12 +202,11 @@ pub mod session {
 
             self.received = end as u32;
             if end as u64 == total {
-                self.echoes = self.echoes.saturating_add(u64::from(units));
                 self.received = 0;
-                self.deadline = None;
                 ReceiveOutcome::Verified
             } else if allow_partial {
-                self.deadline = Some(now.saturating_add(timeout_ms));
+                // Native I/O has one fixed deadline for the complete attempt.
+                let _ = (now, timeout_ticks);
                 ReceiveOutcome::Partial
             } else {
                 // Datagram boundaries are semantic boundaries. A short UDP datagram must not be
@@ -245,7 +253,10 @@ pub mod session {
                 session.on_received(b"def", PAYLOAD, 1, 2, 5_000, true),
                 ReceiveOutcome::Verified
             );
-            assert_eq!(session.echoes, 1);
+            assert_eq!(
+                session.echoes, 0,
+                "the scheduler settles after both operations complete"
+            );
         }
 
         #[test]
@@ -262,850 +273,1124 @@ pub mod session {
 
     // A session owns its socket, its request queue and the batch scheduler that drives its progress.
 
-pub mod scheduler {
-    //! Per-worker scheduler.
-    //!
-    //! The scheduler owns business state only. Native generation lifetime is owned by the
-    //! transport and reconnect is deliberately split in two phases: failure -> `Close`, then
-    //! `GenerationDrained` -> reconnect timer. This prevents a new socket from being created
-    //! while the old generation can still produce completions.
+    pub mod scheduler {
+        //! Per-worker scheduler.
+        //!
+        //! The scheduler owns business state only. Native generation lifetime is owned by the
+        //! transport and reconnect is deliberately split in two phases: failure -> `Close`, then
+        //! `GenerationDrained` -> reconnect timer. This prevents a new socket from being created
+        //! while the old generation can still produce completions.
 
-    use crate::metrics::Statistics;
-    use crate::session::{ReceiveOutcome, Session, SessionState};
-    use crate::worker::timer::TimerHeap;
-    use crate::types::{Options, Protocol};
+        use crate::metrics::Statistics;
+        use crate::native::clock::{milliseconds_to_ticks, ticks_to_wait_milliseconds};
+        use crate::session::{ReceiveOutcome, Session, SessionState};
+        use crate::types::{Options, Protocol};
+        use crate::worker::timer::TimerHeap;
 
-    const GENERATION_DRAIN_GRACE_MS: u64 = 5_000;
+        const GENERATION_DRAIN_GRACE_MS: u64 = 5_000;
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Step {
-        Connect(u32),
-        Send { index: u32, bytes: u32 },
-        Receive { index: u32, bytes: u32 },
-        Close(u32),
-    }
-
-    #[derive(Clone, Copy, Debug, Default)]
-    struct Flow {
-        /// Echo units requested from this session, including already verified units.
-        requested: u64,
-        /// Echo units carried by the attempt currently posted; zero when no attempt is posted.
-        batch_units: u32,
-        /// The posted attempt's send has completed.
-        send_done: bool,
-        /// Exactly one receive may be outstanding per session.
-        receive_posted: bool,
-        /// The posted attempt's receive has been fully verified.
-        receive_done: bool,
-        /// The first attempt of this transport generation is immediate. `/i` spaces only later
-        /// cycles, matching the baseline behaviour.
-        started: bool,
-        /// Echo units this session claimed and then settled as lost or corrupted. The ledger is
-        /// `requested = echoes + settled + inflight`, which is what lets a reconnect keep the
-        /// quota a failed attempt already spent instead of handing it back.
-        settled: u32,
-    }
-
-    impl Flow {
-        /// Starts a fresh transport generation without rewinding the ledger. The claimed units of
-        /// a failed attempt stay claimed and settled, exactly as the reference spends the quota
-        /// when it begins an attempt, so a reconnect only claims what the run has left.
-        fn after_failure(previous: &Flow) -> Self {
-            Self {
-                requested: previous.requested,
-                settled: previous.settled,
-                ..Self::default()
-            }
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Step {
+            Connect(u32),
+            Send { index: u32, bytes: u32 },
+            Receive { index: u32, bytes: u32 },
+            Close(u32),
         }
-    }
 
-    pub struct Scheduler {
-        sessions: Vec<Session>,
-        heap: TimerHeap,
-        statistics: Statistics,
-        payload_bytes: u32,
-        limit: u64,
-        timeout_milliseconds: u64,
-        interval_milliseconds: u32,
-        reconnect_seconds: Option<u32>,
-        protocol: Protocol,
-        /// Echo units one attempt may carry: `/k` for TCP and a single unit for UDP, exactly as the
-        /// reference sizes one send/receive pair.
-        batch_capacity: u32,
-        flows: Vec<Flow>,
-    }
+        #[derive(Clone, Copy, Debug, Default)]
+        struct Flow {
+            /// Echo units requested from this session, including already verified units.
+            requested: u64,
+            /// Echo units carried by the attempt currently posted; zero when no attempt is posted.
+            batch_units: u32,
+            /// The posted attempt's send has completed.
+            send_done: bool,
+            /// Exactly one receive may be outstanding per session.
+            receive_posted: bool,
+            /// The posted attempt's receive completed, with its integrity recorded separately.
+            receive_done: bool,
+            receive_corrupted: bool,
+            /// The first attempt of this transport generation is immediate. `/i` spaces only later
+            /// cycles, matching the baseline behaviour.
+            started: bool,
+            /// Echo units this session claimed and then settled as lost or corrupted. The ledger is
+            /// `requested = echoes + settled + inflight`, which is what lets a reconnect keep the
+            /// quota a failed attempt already spent instead of handing it back.
+            settled: u64,
+        }
 
-    impl Scheduler {
-        pub fn new(session_count: u32, payload_bytes: u32, options: &Options) -> Self {
-            let count = session_count as usize;
-            Self {
-                sessions: (0..session_count).map(Session::new).collect(),
-                heap: TimerHeap::new(count),
-                statistics: Statistics::default(),
-                payload_bytes,
-                limit: options.echo_count,
-                timeout_milliseconds: u64::from(options.timeout_seconds).saturating_mul(1_000),
-                interval_milliseconds: options.interval_milliseconds,
-                reconnect_seconds: options.reconnect_seconds,
-                protocol: options.protocol,
-                batch_capacity: if options.protocol == Protocol::Tcp {
-                    options.pipeline_depth.max(1)
-                } else {
-                    1
-                },
-                flows: vec![Flow::default(); count],
+        impl Flow {
+            /// Starts a fresh transport generation without rewinding the ledger. The claimed units of
+            /// a failed attempt stay claimed and settled, exactly as the reference spends the quota
+            /// when it begins an attempt, so a reconnect only claims what the run has left.
+            fn after_failure(previous: &Flow) -> Self {
+                Self {
+                    requested: previous.requested,
+                    settled: previous.settled,
+                    ..Self::default()
+                }
             }
         }
 
-        pub fn statistics(&self) -> Statistics {
-            self.statistics
+        pub struct Scheduler {
+            sessions: Vec<Session>,
+            heap: TimerHeap,
+            statistics: Statistics,
+            payload_bytes: u32,
+            limit: u64,
+            timeout_ticks: u64,
+            interval_ticks: u64,
+            reconnect_ticks: Option<u64>,
+            drain_grace_ticks: u64,
+            ticks_per_second: u64,
+            protocol: Protocol,
+            /// Echo units one attempt may carry: `/k` for TCP and a single unit for UDP, exactly as the
+            /// reference sizes one send/receive pair.
+            batch_capacity: u32,
+            flows: Vec<Flow>,
         }
 
-        pub fn sessions(&self) -> &[Session] {
-            &self.sessions
-        }
+        impl Scheduler {
+            pub fn new(session_count: u32, payload_bytes: u32, options: &Options) -> Self {
+                let count = session_count as usize;
+                Self {
+                    sessions: (0..session_count).map(Session::new).collect(),
+                    heap: TimerHeap::new(count),
+                    statistics: Statistics::default(),
+                    payload_bytes,
+                    limit: options.echo_count,
+                    timeout_ticks: u64::from(options.timeout_seconds).saturating_mul(1_000),
+                    interval_ticks: u64::from(options.interval_milliseconds),
+                    reconnect_ticks: options
+                        .reconnect_seconds
+                        .map(|seconds| u64::from(seconds).saturating_mul(1_000)),
+                    drain_grace_ticks: GENERATION_DRAIN_GRACE_MS,
+                    ticks_per_second: 1_000,
+                    protocol: options.protocol,
+                    batch_capacity: if options.protocol == Protocol::Tcp {
+                        options.pipeline_depth.max(1)
+                    } else {
+                        1
+                    },
+                    flows: vec![Flow::default(); count],
+                }
+            }
 
-        pub fn session(&self, index: u32) -> Option<&Session> {
-            self.sessions.get(index as usize)
-        }
+            pub fn statistics(&self) -> Statistics {
+                self.statistics
+            }
 
-        pub fn all_finished(&self) -> bool {
-            self.sessions.iter().all(Session::is_finished)
-        }
+            /// Convert the initial millisecond durations once, before any timer is armed. The
+            /// scheduler and every session thereafter keep absolute timestamps in this domain.
+            pub(crate) fn configure_clock(&mut self, frequency: u64) {
+                assert!(
+                    frequency != 0
+                        && self.ticks_per_second == 1_000
+                        && self.heap.is_empty()
+                        && self
+                            .sessions
+                            .iter()
+                            .all(|session| session.state == SessionState::Idle),
+                    "client timer frequency changed after scheduling started"
+                );
+                self.timeout_ticks = milliseconds_to_ticks(self.timeout_ticks, frequency);
+                self.interval_ticks = milliseconds_to_ticks(self.interval_ticks, frequency);
+                self.reconnect_ticks = self
+                    .reconnect_ticks
+                    .map(|milliseconds| milliseconds_to_ticks(milliseconds, frequency));
+                self.drain_grace_ticks = milliseconds_to_ticks(self.drain_grace_ticks, frequency);
+                self.ticks_per_second = frequency;
+            }
 
-        pub fn mark_fatal(&mut self) {
-            self.statistics.fatal = true;
-        }
+            pub fn sessions(&self) -> &[Session] {
+                &self.sessions
+            }
 
-        pub fn record_latency(&mut self, micros: u32) {
-            self.statistics.record_latency(micros);
-        }
+            pub fn session(&self, index: u32) -> Option<&Session> {
+                self.sessions.get(index as usize)
+            }
 
-        pub fn set_elapsed_milliseconds(&mut self, milliseconds: u64) {
-            self.statistics.elapsed_milliseconds = milliseconds;
-        }
+            pub fn all_finished(&self) -> bool {
+                self.sessions.iter().all(Session::is_finished)
+            }
 
-        pub fn start(&mut self, now: u64) -> Vec<Step> {
-            let mut steps = Vec::with_capacity(self.sessions.len());
-            for index in 0..self.sessions.len() as u32 {
-                if self.sessions[index as usize].begin_connect(now, self.timeout_milliseconds) {
+            pub fn mark_fatal(&mut self) {
+                self.statistics.fatal = true;
+            }
+
+            pub fn record_latency(&mut self, micros: u64) {
+                self.statistics.record_latency(micros);
+            }
+
+            pub fn set_elapsed_milliseconds(&mut self, milliseconds: u64) {
+                self.statistics.elapsed_milliseconds = milliseconds;
+            }
+
+            pub fn start(&mut self, now: u64) -> Vec<Step> {
+                let mut steps = Vec::with_capacity(self.sessions.len());
+                for index in 0..self.sessions.len() as u32 {
+                    if self.sessions[index as usize].begin_connect(now, self.timeout_ticks) {
+                        self.arm(index);
+                        steps.push(Step::Connect(index));
+                    }
+                }
+                steps
+            }
+
+            pub fn wait_milliseconds(&self, now: u64, maximum: u32) -> u32 {
+                let Some(deadline) = self.heap.next_deadline() else {
+                    return maximum;
+                };
+                if deadline <= now {
+                    return 0;
+                }
+                let delta = deadline - now;
+                ticks_to_wait_milliseconds(delta, self.ticks_per_second).min(u64::from(maximum))
+                    as u32
+            }
+
+            pub(crate) fn has_pacing(&self) -> bool {
+                self.interval_ticks != 0
+            }
+
+            /// Native validation and latency recording finish after the completion timestamp.
+            /// Start the next pacing interval from that actual finish, like the reference.
+            pub(crate) fn refresh_completed_pacing(&mut self, index: u32, now: u64) {
+                let slot = index as usize;
+                if self.interval_ticks != 0
+                    && slot < self.sessions.len()
+                    && self.sessions[slot].state == SessionState::Active
+                    && self.flows[slot].batch_units == 0
+                    && self.sessions[slot].send_at.is_some()
+                {
+                    self.sessions[slot].send_at = Some(now.saturating_add(self.interval_ticks));
                     self.arm(index);
-                    steps.push(Step::Connect(index));
                 }
             }
-            steps
-        }
 
-        pub fn wait_milliseconds(&self, now: u64, maximum: u32) -> u32 {
-            let Some(deadline) = self.heap.next_deadline() else {
-                return maximum;
-            };
-            if deadline <= now {
-                return 0;
+            /// Units this session claimed that are neither verified nor already settled as lost or
+            /// corrupted. Subtracting the settled units is what keeps the pipeline bound and the loss
+            /// accounting correct across a reconnect.
+            fn inflight_echoes(&self, slot: usize) -> Option<u64> {
+                let flow = self.flows.get(slot)?;
+                flow.requested
+                    .checked_sub(self.sessions.get(slot)?.echoes)?
+                    .checked_sub(flow.settled)
             }
-            let delta = deadline - now;
-            delta.min(u64::from(maximum)) as u32
-        }
 
-        /// Units this session claimed that are neither verified nor already settled as lost or
-        /// corrupted. Subtracting the settled units is what keeps the pipeline bound and the loss
-        /// accounting correct across a reconnect.
-        fn inflight_echoes(&self, slot: usize) -> Option<u64> {
-            let flow = self.flows.get(slot)?;
-            flow.requested
-                .checked_sub(self.sessions.get(slot)?.echoes)?
-                .checked_sub(u64::from(flow.settled))
-        }
-
-        fn arm(&mut self, index: u32) {
-            let Some(session) = self.sessions.get(index as usize) else {
-                return;
-            };
-            let earliest = [session.deadline, session.send_at, session.reconnect_at]
-                .into_iter()
-                .flatten()
-                .min();
-            match earliest {
-                Some(at) => {
-                    if !self.heap.insert_or_update(at, index) {
-                        self.statistics.fatal = true;
+            fn arm(&mut self, index: u32) {
+                let Some(session) = self.sessions.get(index as usize) else {
+                    return;
+                };
+                let earliest = [session.deadline, session.send_at, session.reconnect_at]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                match earliest {
+                    Some(at) => {
+                        if !self.heap.insert_or_update(at, index) {
+                            self.statistics.fatal = true;
+                        }
+                    }
+                    None => {
+                        self.heap.remove(index);
                     }
                 }
-                None => {
-                    self.heap.remove(index);
+            }
+
+            /// Bytes one attempt carrying `units` echo units occupies in registered memory.
+            fn attempt_bytes(&self, units: u32) -> Option<u32> {
+                units.checked_mul(self.payload_bytes)
+            }
+
+            /// Bytes of the attempt currently posted for `index`, zero when none is posted. The worker
+            /// uses it to validate a send completion against the exact native request length.
+            pub fn batch_bytes(&self, index: u32) -> u32 {
+                self.flows
+                    .get(index as usize)
+                    .and_then(|flow| self.attempt_bytes(flow.batch_units))
+                    .unwrap_or(0)
+            }
+
+            fn can_request_more(&self, slot: usize) -> bool {
+                // Exactly one attempt at a time per session. The reference begins the next attempt only
+                // after the previous one's send and receive have both completed, which is what keeps the
+                // request queue at one outstanding receive plus one outstanding send per session.
+                if self.flows[slot].batch_units != 0 {
+                    return false;
                 }
-            }
-        }
-
-        /// Bytes one attempt carrying `units` echo units occupies in registered memory.
-        fn attempt_bytes(&self, units: u32) -> Option<u32> {
-            units.checked_mul(self.payload_bytes)
-        }
-
-        /// Bytes of the attempt currently posted for `index`, zero when none is posted. The worker
-        /// uses it to validate a send completion against the exact native request length.
-        pub fn batch_bytes(&self, index: u32) -> u32 {
-            self.flows
-                .get(index as usize)
-                .and_then(|flow| self.attempt_bytes(flow.batch_units))
-                .unwrap_or(0)
-        }
-
-        fn can_request_more(&self, slot: usize) -> bool {
-            // Exactly one attempt at a time per session. The reference begins the next attempt only
-            // after the previous one's send and receive have both completed, which is what keeps the
-            // request queue at one outstanding receive plus one outstanding send per session.
-            if self.flows[slot].batch_units != 0 {
-                return false;
-            }
-            self.limit == 0 || self.flows[slot].requested < self.limit
-        }
-
-        /// Echo units the next attempt may carry: the batch capacity, trimmed to the remaining finite
-        /// quota so the final attempt of a run may be shorter than `/k`.
-        fn granted_units(&self, slot: usize) -> u32 {
-            let capacity = u64::from(self.batch_capacity);
-            let granted = if self.limit == 0 {
-                capacity
-            } else {
-                capacity.min(self.limit.saturating_sub(self.flows[slot].requested))
-            };
-            granted.min(u64::from(u32::MAX)) as u32
-        }
-
-        fn post_one_send(&mut self, index: u32, steps: &mut Vec<Step>) -> bool {
-            let slot = index as usize;
-            if !self.can_request_more(slot) {
-                return false;
-            }
-            let granted = self.granted_units(slot);
-            if granted == 0 {
-                return false;
-            }
-            let Some(bytes) = self.attempt_bytes(granted) else {
-                self.statistics.fatal = true;
-                return false;
-            };
-            let Some(requested) = self.flows[slot].requested.checked_add(u64::from(granted)) else {
-                self.statistics.fatal = true;
-                return false;
-            };
-            let flow = &mut self.flows[slot];
-            flow.requested = requested;
-            flow.batch_units = granted;
-            flow.send_done = false;
-            flow.receive_done = false;
-            flow.started = true;
-            self.statistics.attempted = self.statistics.attempted.saturating_add(u64::from(granted));
-            steps.push(Step::Send { index, bytes });
-            true
-        }
-
-        fn ensure_receive(&mut self, index: u32, steps: &mut Vec<Step>) {
-            let slot = index as usize;
-            let flow = self.flows[slot];
-            // A receive is posted once per attempt, and only for the bytes still missing after a
-            // partial completion. Nothing is posted while no attempt is in flight.
-            if flow.batch_units == 0 || flow.receive_posted || flow.receive_done {
-                return;
-            }
-            let Some(expected) = self.attempt_bytes(flow.batch_units) else {
-                self.statistics.fatal = true;
-                return;
-            };
-            let Some(bytes) = self.sessions[slot].receive_remaining(expected) else {
-                self.statistics.fatal = true;
-                return;
-            };
-            self.flows[slot].receive_posted = true;
-            steps.push(Step::Receive { index, bytes });
-        }
-
-        fn refresh_active_timers(&mut self, index: u32, now: u64) {
-            let slot = index as usize;
-            if self.sessions[slot].state != SessionState::Active {
-                self.arm(index);
-                return;
-            }
-            let busy = self.flows[slot].batch_units != 0;
-            self.sessions[slot].deadline = busy.then_some(now.saturating_add(self.timeout_milliseconds));
-            self.arm(index);
-        }
-
-        /// Fills an active session. With `/i == 0` it fills the business pipeline immediately.
-        /// With `/i != 0`, the first send is immediate and later cycles are paced by `send_at`.
-        fn top_up(&mut self, index: u32, now: u64) -> Vec<Step> {
-            let slot = index as usize;
-            let mut steps = Vec::new();
-            if slot >= self.sessions.len() || self.sessions[slot].state != SessionState::Active {
-                return steps;
+                self.limit == 0 || self.flows[slot].requested < self.limit
             }
 
-            let Some(inflight) = self.inflight_echoes(slot) else {
-                self.statistics.fatal = true;
-                return steps;
-            };
-            if inflight > u64::from(self.batch_capacity) {
-                self.statistics.fatal = true;
-                debug_assert!(false, "attempt batch exceeded its capacity");
-                return steps;
+            /// Echo units the next attempt may carry: the batch capacity, trimmed to the remaining finite
+            /// quota so the final attempt of a run may be shorter than `/k`.
+            fn granted_units(&self, slot: usize) -> u32 {
+                let capacity = u64::from(self.batch_capacity);
+                let granted = if self.limit == 0 {
+                    capacity
+                } else {
+                    capacity.min(self.limit.saturating_sub(self.flows[slot].requested))
+                };
+                granted.min(u64::from(u32::MAX)) as u32
             }
 
-            if self.interval_milliseconds == 0 {
-                while self.can_request_more(slot) {
-                    if !self.post_one_send(index, &mut steps) {
-                        break;
-                    }
+            fn post_one_send(&mut self, index: u32, steps: &mut Vec<Step>) -> bool {
+                let slot = index as usize;
+                if !self.can_request_more(slot) {
+                    return false;
                 }
-            } else if self.can_request_more(slot) && self.sessions[slot].send_at.is_none() {
-                // Preserve the baseline pacing contract: the first cycle starts immediately;
-                // `/i` delays only subsequent cycles.
-                if !self.flows[slot].started {
-                    self.post_one_send(index, &mut steps);
+                let granted = self.granted_units(slot);
+                if granted == 0 {
+                    return false;
                 }
-                if self.can_request_more(slot) {
-                    self.sessions[slot].send_at = Some(
-                        now.saturating_add(u64::from(self.interval_milliseconds)),
-                    );
-                }
-            }
-
-            self.ensure_receive(index, &mut steps);
-            self.refresh_active_timers(index, now);
-
-            let inflight = match self.inflight_echoes(slot) {
-                Some(inflight) => inflight,
-                None => {
+                let Some(bytes) = self.attempt_bytes(granted) else {
                     self.statistics.fatal = true;
+                    return false;
+                };
+                let Some(requested) = self.flows[slot].requested.checked_add(u64::from(granted))
+                else {
+                    self.statistics.fatal = true;
+                    return false;
+                };
+                let flow = &mut self.flows[slot];
+                flow.requested = requested;
+                flow.batch_units = granted;
+                flow.send_done = false;
+                flow.receive_done = false;
+                flow.receive_corrupted = false;
+                flow.started = true;
+                self.statistics.attempted =
+                    self.statistics.attempted.saturating_add(u64::from(granted));
+                steps.push(Step::Send { index, bytes });
+                true
+            }
+
+            fn ensure_receive(&mut self, index: u32, steps: &mut Vec<Step>) {
+                let slot = index as usize;
+                let flow = self.flows[slot];
+                // A receive is posted once per attempt, and only for the bytes still missing after a
+                // partial completion. Nothing is posted while no attempt is in flight.
+                if flow.batch_units == 0 || flow.receive_posted || flow.receive_done {
+                    return;
+                }
+                let Some(expected) = self.attempt_bytes(flow.batch_units) else {
+                    self.statistics.fatal = true;
+                    return;
+                };
+                let Some(bytes) = self.sessions[slot].receive_remaining(expected) else {
+                    self.statistics.fatal = true;
+                    return;
+                };
+                self.flows[slot].receive_posted = true;
+                steps.push(Step::Receive { index, bytes });
+            }
+
+            fn refresh_active_timers(&mut self, index: u32, now: u64) {
+                let slot = index as usize;
+                if self.sessions[slot].state != SessionState::Active {
+                    self.arm(index);
+                    return;
+                }
+                let busy = self.flows[slot].batch_units != 0;
+                if busy && self.sessions[slot].deadline.is_none() {
+                    self.sessions[slot].deadline = Some(now.saturating_add(self.timeout_ticks));
+                } else if !busy {
+                    self.sessions[slot].deadline = None;
+                }
+                self.arm(index);
+            }
+
+            /// Fills an active session. With `/i == 0` it fills the business pipeline immediately.
+            /// With `/i != 0`, the first send is immediate and later cycles are paced by `send_at`.
+            fn top_up(&mut self, index: u32, now: u64) -> Vec<Step> {
+                let slot = index as usize;
+                let mut steps = Vec::new();
+                if slot >= self.sessions.len() || self.sessions[slot].state != SessionState::Active
+                {
                     return steps;
                 }
-            };
-            let busy = self.flows[slot].batch_units != 0;
-            if self.limit != 0
-                && self.sessions[slot].echoes >= self.limit
-                && inflight == 0
-                && !busy
-            {
-                self.sessions[slot].complete();
-                self.heap.remove(index);
-                steps.push(Step::Close(index));
-            }
-            steps
-        }
 
-        pub fn on_connected(&mut self, index: u32, now: u64) -> Vec<Step> {
-            let slot = index as usize;
-            if slot >= self.sessions.len() || !self.sessions[slot].connected() {
-                return Vec::new();
-            }
-            self.statistics.connections = self.statistics.connections.saturating_add(1);
-            self.flows[slot] = Flow::after_failure(&self.flows[slot]);
-            self.top_up(index, now)
-        }
-
-        pub fn on_sent(&mut self, index: u32, now: u64) -> Vec<Step> {
-            let slot = index as usize;
-            if slot >= self.flows.len() || self.sessions[slot].state != SessionState::Active {
-                return Vec::new();
-            }
-            if self.flows[slot].batch_units == 0 || self.flows[slot].send_done {
-                self.statistics.fatal = true;
-                return Vec::new();
-            }
-            self.flows[slot].send_done = true;
-            self.finish_attempt(index, now)
-        }
-
-        /// Retires the posted attempt once both of its native operations have completed and starts
-        /// the next one. Nothing else may be posted for the session before that, because its request
-        /// queue holds exactly one outstanding receive and one outstanding send.
-        fn finish_attempt(&mut self, index: u32, now: u64) -> Vec<Step> {
-            let slot = index as usize;
-            let flow = self.flows[slot];
-            if flow.batch_units == 0 || !flow.send_done || !flow.receive_done || flow.receive_posted {
-                return Vec::new();
-            }
-            self.flows[slot].batch_units = 0;
-            self.flows[slot].send_done = false;
-            self.flows[slot].receive_done = false;
-            // `/i` spaces attempts, never the operations inside one attempt. A finished quota still
-            // falls through to top_up so the session can close instead of parking on a timer.
-            if self.interval_milliseconds != 0 && self.can_request_more(slot) {
-                self.sessions[slot].send_at =
-                    Some(now.saturating_add(u64::from(self.interval_milliseconds)));
-                self.arm(index);
-                return Vec::new();
-            }
-            self.top_up(index, now)
-        }
-
-        pub fn on_sent_bytes(&mut self, bytes: u64) {
-            self.statistics.sent_bytes = self.statistics.sent_bytes.saturating_add(bytes);
-        }
-
-        /// Reverses one scheduler reservation whose native post was never accepted. `top_up` may
-        /// precompute several steps for one session; dispatch calls this for the failed step and
-        /// every later step for that same session before classifying the generation as failed.
-        pub fn rollback_unposted_step(&mut self, step: Step) {
-            match step {
-                Step::Send { index, .. } => {
-                    let slot = index as usize;
-                    let Some(flow) = self.flows.get_mut(slot) else {
-                        self.statistics.fatal = true;
-                        return;
-                    };
-                    let units = u64::from(flow.batch_units);
-                    if units == 0 {
-                        self.statistics.fatal = true;
-                        return;
-                    }
-                    let Some(requested) = flow.requested.checked_sub(units) else {
-                        self.statistics.fatal = true;
-                        return;
-                    };
-                    if requested < self.sessions[slot].echoes {
-                        self.statistics.fatal = true;
-                        return;
-                    }
-                    flow.requested = requested;
-                    flow.batch_units = 0;
-                    flow.send_done = false;
-                    flow.receive_done = false;
-                }
-                Step::Receive { index, .. } => {
-                    let slot = index as usize;
-                    let Some(flow) = self.flows.get_mut(slot) else {
-                        self.statistics.fatal = true;
-                        return;
-                    };
-                    if !flow.receive_posted {
-                        self.statistics.fatal = true;
-                        return;
-                    }
-                    flow.receive_posted = false;
-                }
-                Step::Connect(_) | Step::Close(_) => {}
-            }
-        }
-
-        pub fn on_received(
-            &mut self,
-            index: u32,
-            chunk: &[u8],
-            payload: &[u8],
-            now: u64,
-        ) -> Vec<Step> {
-            let slot = index as usize;
-            if slot >= self.sessions.len() || self.sessions[slot].state != SessionState::Active {
-                return Vec::new();
-            }
-            if !self.flows[slot].receive_posted {
-                self.statistics.fatal = true;
-                return Vec::new();
-            }
-            // The OS request ended when its completion was dequeued. A partial echo therefore
-            // gets a brand-new receive request in top_up().
-            self.flows[slot].receive_posted = false;
-            self.statistics.received_bytes = self
-                .statistics
-                .received_bytes
-                .saturating_add(chunk.len() as u64);
-
-            let units = self.flows[slot].batch_units;
-            if units == 0 {
-                self.statistics.fatal = true;
-                return Vec::new();
-            }
-            // TCP is a byte stream and may complete with a strict prefix. UDP is
-            // message-oriented, so Session rejects a short datagram instead of concatenating it
-            // with the next datagram.
-            let outcome = self.sessions[slot].on_received(
-                chunk,
-                payload,
-                units,
-                now,
-                self.timeout_milliseconds,
-                self.protocol == Protocol::Tcp,
-            );
-
-            match outcome {
-                ReceiveOutcome::Partial => {
-                    crate::worker::trace::event_args("RECV_PARTIAL", format_args!("session={index}"));
-                    self.top_up(index, now)
-                }
-                ReceiveOutcome::Verified => {
-                    crate::worker::trace::event_args("RECV_COMPLETE", format_args!("session={index}"));
-                    let Some(bytes) = self.attempt_bytes(units) else {
-                        self.statistics.fatal = true;
-                        return Vec::new();
-                    };
-                    // Echoes and validated bytes are counted per attempt, so a batch of `units`
-                    // echoes advances the identity by exactly that many units.
-                    self.statistics.echoes = self.statistics.echoes.saturating_add(u64::from(units));
-                    self.statistics.bytes = self.statistics.bytes.saturating_add(u64::from(bytes));
-                    self.flows[slot].receive_done = true;
-                    self.finish_attempt(index, now)
-                }
-                ReceiveOutcome::PeerClosed => self.on_transport_failure(index, now),
-                ReceiveOutcome::Corrupted => self.on_corrupted_receive(index),
-            }
-        }
-
-        /// Terminates a session after a protocol/data-integrity failure. This is also used for
-        /// an oversized UDP echo reported by RIO as WSAEMSGSIZE: reconnecting cannot turn an
-        /// invalid echo into a valid one, so it is an EchoFailure rather than a network retry.
-        pub fn on_corrupted_receive(&mut self, index: u32) -> Vec<Step> {
-            let slot = index as usize;
-            if slot >= self.sessions.len() || self.sessions[slot].is_finished() {
-                return Vec::new();
-            }
-            crate::worker::trace::event_args("RECV_CORRUPT", format_args!("session={index}"));
-            // Integrity is judged per attempt: a corrupted batch is as many corrupted echoes as the
-            // batch carried, which is how the reference counts it. That attempt is accounted for,
-            // so it must not also be counted as lost: one attempt has one terminal classification.
-            let units = u64::from(self.flows[slot].batch_units.max(1));
-            self.statistics.corrupted = self.statistics.corrupted.saturating_add(units);
-            self.flows[slot] = Flow::default();
-            self.sessions[slot].fail_permanently();
-            self.heap.remove(index);
-            vec![Step::Close(index)]
-        }
-
-        /// Starts generation retirement after a connection-scoped failure. This is idempotent:
-        /// cancellation completions from a generation already closing do not count as new losses.
-        pub fn on_transport_failure(&mut self, index: u32, now: u64) -> Vec<Step> {
-            let slot = index as usize;
-            if slot >= self.sessions.len() {
-                return Vec::new();
-            }
-            if matches!(
-                self.sessions[slot].state,
-                SessionState::Closing
-                    | SessionState::ReconnectWait
-                    | SessionState::Completed
-                    | SessionState::Failed
-            ) {
-                return Vec::new();
-            }
-
-            let lost = match self.inflight_echoes(slot) {
-                Some(inflight) => inflight,
-                None => {
+                let Some(inflight) = self.inflight_echoes(slot) else {
                     self.statistics.fatal = true;
-                    0
+                    return steps;
+                };
+                if inflight > u64::from(self.batch_capacity) {
+                    self.statistics.fatal = true;
+                    debug_assert!(false, "attempt batch exceeded its capacity");
+                    return steps;
                 }
-            };
-            self.statistics.lost = self.statistics.lost.saturating_add(lost);
-            self.flows[slot].settled = self.flows[slot].settled.saturating_add(lost.min(u64::from(u32::MAX)) as u32);
-            self.flows[slot] = Flow::after_failure(&self.flows[slot]);
-            self.heap.remove(index);
-            if self.sessions[slot].begin_closing() {
-                // Cancellation completion is normally prompt, but never let a broken provider
-                // strand the worker in Closing forever. Expiry is fatal; transport shutdown then
-                // performs its bounded safe-drain/leak fallback rather than freeing live memory.
-                self.sessions[slot].deadline =
-                    Some(now.saturating_add(GENERATION_DRAIN_GRACE_MS));
-                self.arm(index);
-                vec![Step::Close(index)]
-            } else {
-                Vec::new()
-            }
-        }
 
-        /// Called only after the transport proved all completions from the old generation were
-        /// dequeued and its OVERLAPPED/RQ/socket can no longer be referenced by Windows.
-        pub fn on_generation_drained(&mut self, index: u32, now: u64) -> Vec<Step> {
-            let slot = index as usize;
-            if slot >= self.sessions.len() || self.sessions[slot].state != SessionState::Closing {
-                return Vec::new();
-            }
-            match self.reconnect_seconds {
-                Some(delay) => {
-                    if self.sessions[slot].schedule_reconnect(now, delay) {
-                        self.statistics.reconnects = self.statistics.reconnects.saturating_add(1);
-                        self.arm(index);
+                if self.interval_ticks == 0 {
+                    while self.can_request_more(slot) {
+                        if !self.post_one_send(index, &mut steps) {
+                            break;
+                        }
+                    }
+                } else if self.can_request_more(slot) && self.sessions[slot].send_at.is_none() {
+                    // Preserve the baseline pacing contract: the first cycle starts immediately;
+                    // `/i` delays only subsequent cycles.
+                    if !self.flows[slot].started {
+                        self.post_one_send(index, &mut steps);
+                    }
+                    if self.can_request_more(slot) {
+                        self.sessions[slot].send_at = Some(now.saturating_add(self.interval_ticks));
                     }
                 }
-                None => {
-                    self.statistics.network_failures =
-                        self.statistics.network_failures.saturating_add(1);
-                    self.sessions[slot].fail_permanently();
+
+                self.ensure_receive(index, &mut steps);
+                // The reference posts the receive before the send so a fast echo always has a buffer.
+                if steps.len() == 2 && matches!(steps[0], Step::Send { .. }) {
+                    steps.swap(0, 1);
+                }
+                self.refresh_active_timers(index, now);
+
+                let inflight = match self.inflight_echoes(slot) {
+                    Some(inflight) => inflight,
+                    None => {
+                        self.statistics.fatal = true;
+                        return steps;
+                    }
+                };
+                let busy = self.flows[slot].batch_units != 0;
+                if self.limit != 0
+                    && self.flows[slot].requested >= self.limit
+                    && inflight == 0
+                    && !busy
+                {
+                    self.sessions[slot].complete();
                     self.heap.remove(index);
+                    steps.push(Step::Close(index));
+                }
+                steps
+            }
+
+            pub fn on_connected(&mut self, index: u32, now: u64) -> Vec<Step> {
+                let slot = index as usize;
+                if slot >= self.sessions.len() || !self.sessions[slot].connected() {
+                    return Vec::new();
+                }
+                self.statistics.connections = self.statistics.connections.saturating_add(1);
+                self.flows[slot] = Flow::after_failure(&self.flows[slot]);
+                self.top_up(index, now)
+            }
+
+            pub fn on_sent(&mut self, index: u32, now: u64) -> Vec<Step> {
+                let slot = index as usize;
+                if slot >= self.flows.len() || self.sessions[slot].state != SessionState::Active {
+                    return Vec::new();
+                }
+                if self.flows[slot].batch_units == 0 || self.flows[slot].send_done {
+                    self.statistics.fatal = true;
+                    return Vec::new();
+                }
+                self.flows[slot].send_done = true;
+                self.finish_attempt(index, now)
+            }
+
+            /// Retires the posted attempt once both of its native operations have completed and starts
+            /// the next one. Nothing else may be posted for the session before that, because its request
+            /// queue holds exactly one outstanding receive and one outstanding send.
+            fn finish_attempt(&mut self, index: u32, now: u64) -> Vec<Step> {
+                let slot = index as usize;
+                let flow = self.flows[slot];
+                if flow.batch_units == 0
+                    || !flow.send_done
+                    || !flow.receive_done
+                    || flow.receive_posted
+                {
+                    return Vec::new();
+                }
+                let units = u64::from(flow.batch_units);
+                if flow.receive_corrupted {
+                    self.statistics.corrupted = self.statistics.corrupted.saturating_add(units);
+                    self.flows[slot].settled = self.flows[slot].settled.saturating_add(units);
+                } else {
+                    self.statistics.echoes = self.statistics.echoes.saturating_add(units);
+                    self.statistics.bytes = self
+                        .statistics
+                        .bytes
+                        .saturating_add(u64::from(self.batch_bytes(index)));
+                    self.sessions[slot].echoes = self.sessions[slot].echoes.saturating_add(units);
+                }
+                self.flows[slot].batch_units = 0;
+                self.flows[slot].send_done = false;
+                self.flows[slot].receive_done = false;
+                self.flows[slot].receive_corrupted = false;
+                self.sessions[slot].received = 0;
+                self.sessions[slot].deadline = None;
+                // `/i` spaces attempts, never their individual native operations. Like the reference,
+                // the final completed attempt also waits through its pacing interval before closing.
+                if self.interval_ticks != 0 {
+                    self.sessions[slot].send_at = Some(now.saturating_add(self.interval_ticks));
+                    self.arm(index);
+                    return Vec::new();
+                }
+                self.top_up(index, now)
+            }
+
+            pub fn on_sent_bytes(&mut self, bytes: u64) {
+                self.statistics.sent_bytes = self.statistics.sent_bytes.saturating_add(bytes);
+            }
+
+            pub fn set_sent_bytes(&mut self, bytes: u64) {
+                self.statistics.sent_bytes = bytes;
+            }
+
+            /// Clears unposted receive reservations before generation failure. Beginning the attempt
+            /// already spent its quota, so failed sends never refund requested/attempted units.
+            pub fn rollback_unposted_step(&mut self, step: Step) {
+                match step {
+                    // Beginning an attempt spends its quota even when the native post fails.
+                    Step::Send { .. } => {}
+                    Step::Receive { index, .. } => {
+                        let slot = index as usize;
+                        let Some(flow) = self.flows.get_mut(slot) else {
+                            self.statistics.fatal = true;
+                            return;
+                        };
+                        if !flow.receive_posted {
+                            self.statistics.fatal = true;
+                            return;
+                        }
+                        flow.receive_posted = false;
+                    }
+                    Step::Connect(_) | Step::Close(_) => {}
                 }
             }
-            Vec::new()
-        }
 
-        fn interval_send_due(&mut self, index: u32, now: u64) -> Vec<Step> {
-            let slot = index as usize;
-            let mut steps = Vec::new();
-            if self.sessions[slot].state != SessionState::Active {
-                return steps;
-            }
-            self.sessions[slot].send_at = None;
-            self.post_one_send(index, &mut steps);
-            self.ensure_receive(index, &mut steps);
+            pub fn on_received(
+                &mut self,
+                index: u32,
+                chunk: &[u8],
+                payload: &[u8],
+                now: u64,
+            ) -> Vec<Step> {
+                let slot = index as usize;
+                if slot >= self.sessions.len() || self.sessions[slot].state != SessionState::Active
+                {
+                    return Vec::new();
+                }
+                if !self.flows[slot].receive_posted {
+                    self.statistics.fatal = true;
+                    return Vec::new();
+                }
+                // The native request ended when its completion was dequeued.
+                self.flows[slot].receive_posted = false;
 
-            if self.interval_milliseconds != 0
-                && self.can_request_more(slot)
-                && self.sessions[slot].send_at.is_none()
-            {
-                self.sessions[slot].send_at = Some(
-                    now.saturating_add(u64::from(self.interval_milliseconds)),
+                let units = self.flows[slot].batch_units;
+                if units == 0 {
+                    self.statistics.fatal = true;
+                    return Vec::new();
+                }
+                if self.protocol == Protocol::Tcp && chunk.len() != self.batch_bytes(index) as usize
+                {
+                    return self.on_transport_failure(index, now);
+                }
+                self.statistics.received_bytes = self
+                    .statistics
+                    .received_bytes
+                    .saturating_add(chunk.len() as u64);
+                // TCP is a byte stream and may complete with a strict prefix. UDP is
+                // message-oriented, so Session rejects a short datagram instead of concatenating it
+                // with the next datagram.
+                let outcome = self.sessions[slot].on_received(
+                    chunk,
+                    payload,
+                    units,
+                    now,
+                    self.timeout_ticks,
+                    self.protocol == Protocol::Tcp,
                 );
+
+                match outcome {
+                    ReceiveOutcome::Partial => {
+                        crate::worker::trace::event_args(
+                            "RECV_PARTIAL",
+                            format_args!("session={index}"),
+                        );
+                        self.top_up(index, now)
+                    }
+                    ReceiveOutcome::Verified => {
+                        crate::worker::trace::event_args(
+                            "RECV_COMPLETE",
+                            format_args!("session={index}"),
+                        );
+                        // Accounting waits for both native operations, so a later send failure cannot
+                        // turn an incompletely sent attempt into an echo success.
+                        self.flows[slot].receive_done = true;
+                        self.finish_attempt(index, now)
+                    }
+                    ReceiveOutcome::PeerClosed => self.on_transport_failure(index, now),
+                    ReceiveOutcome::Corrupted => {
+                        self.flows[slot].receive_done = true;
+                        self.flows[slot].receive_corrupted = true;
+                        self.finish_attempt(index, now)
+                    }
+                }
             }
-            self.refresh_active_timers(index, now);
-            steps
-        }
 
-        pub fn poll(&mut self, now: u64, expired: &mut Vec<u32>) -> Vec<Step> {
-            expired.clear();
-            let count = self.heap.pop_expired(now, expired);
-            let mut steps = Vec::new();
-
-            for position in 0..count {
-                let index = expired[position];
+            /// Starts generation retirement after a connection-scoped failure. This is idempotent:
+            /// cancellation completions from a generation already closing do not count as new losses.
+            pub fn on_transport_failure(&mut self, index: u32, now: u64) -> Vec<Step> {
                 let slot = index as usize;
                 if slot >= self.sessions.len() {
-                    self.statistics.fatal = true;
-                    continue;
+                    return Vec::new();
+                }
+                if matches!(
+                    self.sessions[slot].state,
+                    SessionState::Closing
+                        | SessionState::ReconnectWait
+                        | SessionState::Completed
+                        | SessionState::Failed
+                ) {
+                    return Vec::new();
                 }
 
-                match self.sessions[slot].state {
-                    SessionState::ReconnectWait => {
-                        if self.sessions[slot].reconnect_due(now, self.timeout_milliseconds) {
-                            self.arm(index);
-                            steps.push(Step::Connect(index));
-                        } else {
-                            self.arm(index);
-                        }
+                let lost = match self.inflight_echoes(slot) {
+                    Some(inflight) => inflight,
+                    None => {
+                        self.statistics.fatal = true;
+                        0
                     }
-                    SessionState::Active => {
-                        // An already-expired native I/O deadline wins over a send timer when
-                        // both timestamps are equal; never post fresh work onto a timed-out
-                        // generation just because its pacing timer fired at the same instant.
-                        if self.sessions[slot].deadline.is_some_and(|at| now >= at) {
-                            steps.extend(self.on_transport_failure(index, now));
-                        } else if self.sessions[slot].send_at.is_some_and(|at| now >= at) {
-                            steps.extend(self.interval_send_due(index, now));
-                        } else {
-                            self.arm(index);
-                        }
-                    }
-                    SessionState::Connecting => {
-                        if self.sessions[slot].deadline.is_some_and(|at| now >= at) {
-                            steps.extend(self.on_transport_failure(index, now));
-                        } else {
-                            self.arm(index);
-                        }
-                    }
-                    SessionState::Closing => {
-                        if self.sessions[slot].deadline.is_some_and(|at| now >= at) {
-                            crate::worker::trace::event_args(
-                                "GENERATION_DRAIN_TIMEOUT",
-                                format_args!("session={index}"),
-                            );
-                            self.statistics.fatal = true;
-                            self.heap.remove(index);
-                        } else {
-                            self.arm(index);
-                        }
-                    }
-                    _ => self.arm(index),
+                };
+                self.statistics.lost = self.statistics.lost.saturating_add(lost);
+                self.statistics.network_failures =
+                    self.statistics.network_failures.saturating_add(1);
+                if self.reconnect_ticks.is_some() {
+                    self.statistics.reconnects = self.statistics.reconnects.saturating_add(1);
+                }
+                self.flows[slot].settled = self.flows[slot].settled.saturating_add(lost);
+                self.flows[slot] = Flow::after_failure(&self.flows[slot]);
+                self.heap.remove(index);
+                if self.sessions[slot].begin_closing() {
+                    // Cancellation completion is normally prompt, but never let a broken provider
+                    // strand the worker in Closing forever. Expiry is fatal; transport shutdown then
+                    // performs its bounded safe-drain/leak fallback rather than freeing live memory.
+                    self.sessions[slot].deadline = Some(now.saturating_add(self.drain_grace_ticks));
+                    self.arm(index);
+                    vec![Step::Close(index)]
+                } else {
+                    Vec::new()
                 }
             }
-            steps
+
+            /// Called only after the transport proved all completions from the old generation were
+            /// dequeued and its OVERLAPPED/RQ/socket can no longer be referenced by Windows.
+            pub fn on_generation_drained(&mut self, index: u32, now: u64) -> Vec<Step> {
+                let slot = index as usize;
+                if slot >= self.sessions.len() || self.sessions[slot].state != SessionState::Closing
+                {
+                    return Vec::new();
+                }
+                match self.reconnect_ticks {
+                    Some(delay) => {
+                        if self.sessions[slot].schedule_reconnect_ticks(now, delay) {
+                            self.arm(index);
+                        }
+                    }
+                    None => {
+                        self.sessions[slot].fail_permanently();
+                        self.heap.remove(index);
+                    }
+                }
+                Vec::new()
+            }
+
+            fn interval_send_due(&mut self, index: u32, now: u64) -> Vec<Step> {
+                let slot = index as usize;
+                let mut steps = Vec::new();
+                if self.sessions[slot].state != SessionState::Active {
+                    return steps;
+                }
+                self.sessions[slot].send_at = None;
+                if !self.can_request_more(slot) {
+                    return self.top_up(index, now);
+                }
+                self.post_one_send(index, &mut steps);
+                self.ensure_receive(index, &mut steps);
+                if steps.len() == 2 && matches!(steps[0], Step::Send { .. }) {
+                    steps.swap(0, 1);
+                }
+
+                if self.interval_ticks != 0
+                    && self.can_request_more(slot)
+                    && self.sessions[slot].send_at.is_none()
+                {
+                    self.sessions[slot].send_at = Some(now.saturating_add(self.interval_ticks));
+                }
+                self.refresh_active_timers(index, now);
+                steps
+            }
+
+            pub fn poll(&mut self, now: u64, expired: &mut Vec<u32>) -> Vec<Step> {
+                expired.clear();
+                let count = self.heap.pop_expired(now, expired);
+                let mut steps = Vec::new();
+
+                for position in 0..count {
+                    let index = expired[position];
+                    let slot = index as usize;
+                    if slot >= self.sessions.len() {
+                        self.statistics.fatal = true;
+                        continue;
+                    }
+
+                    match self.sessions[slot].state {
+                        SessionState::ReconnectWait => {
+                            if self.sessions[slot].reconnect_due(now, self.timeout_ticks) {
+                                self.arm(index);
+                                steps.push(Step::Connect(index));
+                            } else {
+                                self.arm(index);
+                            }
+                        }
+                        SessionState::Active => {
+                            // An already-expired native I/O deadline wins over a send timer when
+                            // both timestamps are equal; never post fresh work onto a timed-out
+                            // generation just because its pacing timer fired at the same instant.
+                            if self.sessions[slot].deadline.is_some_and(|at| now >= at) {
+                                steps.extend(self.on_transport_failure(index, now));
+                            } else if self.sessions[slot].send_at.is_some_and(|at| now >= at) {
+                                steps.extend(self.interval_send_due(index, now));
+                            } else {
+                                self.arm(index);
+                            }
+                        }
+                        SessionState::Connecting => {
+                            if self.sessions[slot].deadline.is_some_and(|at| now >= at) {
+                                steps.extend(self.on_transport_failure(index, now));
+                            } else {
+                                self.arm(index);
+                            }
+                        }
+                        SessionState::Closing => {
+                            if self.sessions[slot].deadline.is_some_and(|at| now >= at) {
+                                crate::worker::trace::event_args(
+                                    "GENERATION_DRAIN_TIMEOUT",
+                                    format_args!("session={index}"),
+                                );
+                                self.statistics.fatal = true;
+                                self.heap.remove(index);
+                            } else {
+                                self.arm(index);
+                            }
+                        }
+                        _ => self.arm(index),
+                    }
+                }
+                steps
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::types::{Options, Protocol};
+
+            fn scheduler(depth: u32, interval: u32, reconnect: Option<u32>) -> Scheduler {
+                let mut options = Options::default();
+                options.protocol = Protocol::Tcp;
+                options.pipeline_depth = depth;
+                options.interval_milliseconds = interval;
+                options.reconnect_seconds = reconnect;
+                options.echo_count = 10;
+                Scheduler::new(1, 6, &options)
+            }
+
+            #[test]
+            fn pacing_keeps_raw_counter_precision_until_wait_conversion() {
+                let mut scheduler = scheduler(1, 1, None);
+                scheduler.configure_clock(1_000_000);
+                assert_eq!(scheduler.start(0), vec![Step::Connect(0)]);
+                scheduler.on_connected(0, 1_000);
+                assert!(
+                    scheduler
+                        .on_received(0, b"abcdef", b"abcdef", 1_998)
+                        .is_empty()
+                );
+                assert!(scheduler.on_sent(0, 1_999).is_empty());
+                // C++ schedules 1 ms from the raw 1999-tick completion, not from a
+                // truncated 1-ms timestamp. No new attempt may start at tick 2000.
+                assert_eq!(scheduler.session(0).unwrap().send_at, Some(2_999));
+                assert_eq!(scheduler.wait_milliseconds(1_999, 1_000), 1);
+                let mut expired = Vec::new();
+                assert!(scheduler.poll(2_000, &mut expired).is_empty());
+                assert!(scheduler.poll(2_998, &mut expired).is_empty());
+                assert_eq!(scheduler.wait_milliseconds(2_998, 1_000), 1);
+                assert_eq!(
+                    scheduler.poll(2_999, &mut expired),
+                    vec![
+                        Step::Receive { index: 0, bytes: 6 },
+                        Step::Send { index: 0, bytes: 6 },
+                    ]
+                );
+            }
+
+            #[test]
+            fn reconnect_and_generation_drain_use_the_same_counter_domain() {
+                let mut scheduler = scheduler(1, 0, Some(2));
+                scheduler.configure_clock(1_000_000);
+                scheduler.start(0);
+                scheduler.on_connected(0, 1_000);
+                assert_eq!(
+                    scheduler.on_transport_failure(0, 1_999),
+                    vec![Step::Close(0)]
+                );
+                assert_eq!(scheduler.session(0).unwrap().deadline, Some(5_001_999));
+                scheduler.on_generation_drained(0, 2_999);
+                assert_eq!(scheduler.session(0).unwrap().reconnect_at, Some(2_002_999));
+                let mut expired = Vec::new();
+                assert!(scheduler.poll(2_002_998, &mut expired).is_empty());
+                assert_eq!(
+                    scheduler.poll(2_002_999, &mut expired),
+                    vec![Step::Connect(0)]
+                );
+            }
+
+            #[test]
+            fn pacing_interval_starts_after_completion_validation_finishes() {
+                let mut scheduler = scheduler(1, 1, None);
+                scheduler.configure_clock(1_000_000);
+                scheduler.start(0);
+                scheduler.on_connected(0, 1_000);
+                scheduler.on_received(0, b"abcdef", b"abcdef", 1_998);
+                scheduler.on_sent(0, 1_999);
+                // A busy worker finishes validating the completed batch at tick 4999.
+                scheduler.refresh_completed_pacing(0, 4_999);
+                assert_eq!(scheduler.session(0).unwrap().send_at, Some(5_999));
+                let mut expired = Vec::new();
+                assert!(scheduler.poll(5_998, &mut expired).is_empty());
+                assert_eq!(
+                    scheduler.poll(5_999, &mut expired),
+                    vec![
+                        Step::Receive { index: 0, bytes: 6 },
+                        Step::Send { index: 0, bytes: 6 },
+                    ]
+                );
+            }
+
+            #[test]
+            fn one_attempt_carries_the_batch_and_one_send_receive_pair() {
+                // /k 4 with a 6-byte payload is a single 24-byte send plus one 24-byte receive whose
+                // expected bytes are four copies of the pattern.
+                let mut scheduler = scheduler(4, 0, None);
+                assert_eq!(scheduler.start(0), vec![Step::Connect(0)]);
+                let steps = scheduler.on_connected(0, 1);
+                assert_eq!(
+                    steps,
+                    vec![
+                        Step::Receive {
+                            index: 0,
+                            bytes: 24
+                        },
+                        Step::Send {
+                            index: 0,
+                            bytes: 24
+                        }
+                    ]
+                );
+                assert_eq!(scheduler.inflight_echoes(0), Some(4));
+                assert_eq!(scheduler.statistics.attempted, 4);
+
+                let verified = scheduler.on_received(0, b"abcdefabcdefabcdefabcdef", b"abcdef", 2);
+                assert!(verified.is_empty());
+                assert_eq!(scheduler.statistics.echoes, 0);
+                assert_eq!(scheduler.statistics.bytes, 0);
+
+                // The attempt retires only once its send has completed too.
+                let next = scheduler.on_sent(0, 3);
+                assert_eq!(
+                    next,
+                    vec![
+                        Step::Receive {
+                            index: 0,
+                            bytes: 24
+                        },
+                        Step::Send {
+                            index: 0,
+                            bytes: 24
+                        }
+                    ]
+                );
+                assert_eq!(scheduler.statistics.echoes, 4);
+                assert_eq!(scheduler.statistics.bytes, 24);
+            }
+
+            #[test]
+            fn final_attempt_is_trimmed_to_the_remaining_quota() {
+                // /k 4 with a quota of 6 grants 4 then 2, so the last attempt is shorter than /k.
+                let mut options = Options::default();
+                options.protocol = Protocol::Tcp;
+                options.pipeline_depth = 4;
+                options.echo_count = 6;
+                let mut scheduler = Scheduler::new(1, 6, &options);
+                scheduler.start(0);
+                let first = scheduler.on_connected(0, 1);
+                assert_eq!(
+                    first,
+                    vec![
+                        Step::Receive {
+                            index: 0,
+                            bytes: 24
+                        },
+                        Step::Send {
+                            index: 0,
+                            bytes: 24
+                        }
+                    ]
+                );
+                scheduler.on_sent(0, 2);
+                let second = scheduler.on_received(0, b"abcdefabcdefabcdefabcdef", b"abcdef", 3);
+                assert_eq!(
+                    second,
+                    vec![
+                        Step::Receive {
+                            index: 0,
+                            bytes: 12
+                        },
+                        Step::Send {
+                            index: 0,
+                            bytes: 12
+                        }
+                    ]
+                );
+                assert_eq!(scheduler.statistics.attempted, 6);
+            }
+
+            #[test]
+            fn short_tcp_receive_fails_the_attempt() {
+                let mut scheduler = scheduler(1, 0, None);
+                scheduler.start(0);
+                scheduler.on_connected(0, 0);
+                let steps = scheduler.on_received(0, b"abc", b"abcdef", 10);
+                assert_eq!(steps, vec![Step::Close(0)]);
+                assert_eq!(scheduler.statistics.lost, 1);
+            }
+
+            #[test]
+            fn udp_short_datagram_is_not_reassembled_as_tcp_stream_data() {
+                let mut options = Options::default();
+                options.protocol = Protocol::Udp;
+                options.pipeline_depth = 1;
+                options.echo_count = 1;
+                let mut scheduler = Scheduler::new(1, 6, &options);
+                scheduler.start(0);
+                scheduler.on_connected(0, 0);
+                scheduler.on_sent(0, 1);
+                let steps = scheduler.on_received(0, b"abc", b"abcdef", 10);
+                assert_eq!(scheduler.statistics.corrupted, 1);
+                assert_eq!(scheduler.sessions[0].state, SessionState::Completed);
+                assert_eq!(steps, vec![Step::Close(0)]);
+            }
+
+            #[test]
+            fn corrupted_receive_settles_the_batch_and_continues_the_quota() {
+                let mut scheduler = scheduler(2, 0, Some(1));
+                scheduler.start(0);
+                scheduler.on_connected(0, 0);
+                scheduler.on_sent(0, 1);
+                let next = scheduler.on_received(0, b"abcdefabcdeg", b"abcdef", 2);
+                assert_eq!(
+                    next,
+                    vec![
+                        Step::Receive {
+                            index: 0,
+                            bytes: 12
+                        },
+                        Step::Send {
+                            index: 0,
+                            bytes: 12
+                        }
+                    ]
+                );
+                assert_eq!(scheduler.sessions[0].state, SessionState::Active);
+                // Integrity is counted per attempt: this attempt carried two echo units, and it is
+                // settled as corrupted alone. Counting it lost as well would settle one attempt twice.
+                assert_eq!(scheduler.statistics.corrupted, 2);
+                assert_eq!(scheduler.statistics.lost, 0);
+                assert_eq!(scheduler.statistics.reconnects, 0);
+            }
+
+            #[test]
+            fn receive_completion_waits_for_send_before_settling_the_attempt() {
+                let mut scheduler = scheduler(2, 0, None);
+                scheduler.start(0);
+                scheduler.on_connected(0, 1);
+                assert!(
+                    scheduler
+                        .on_received(0, b"abcdefabcdef", b"abcdef", 2)
+                        .is_empty()
+                );
+                assert_eq!(scheduler.statistics.echoes, 0);
+                assert_eq!(scheduler.statistics.bytes, 0);
+                assert_eq!(scheduler.sessions[0].deadline, Some(5_001));
+                scheduler.on_sent(0, 3);
+                assert_eq!(scheduler.statistics.echoes, 2);
+            }
+
+            #[test]
+            fn send_failure_after_a_receive_loses_the_whole_unsettled_batch() {
+                let mut scheduler = scheduler(2, 0, Some(0));
+                scheduler.start(0);
+                scheduler.on_connected(0, 1);
+                scheduler.on_received(0, b"abcdefabcdef", b"abcdef", 2);
+                scheduler.on_transport_failure(0, 3);
+                assert_eq!(scheduler.statistics.echoes, 0);
+                assert_eq!(scheduler.statistics.lost, 2);
+                assert_eq!(scheduler.statistics.network_failures, 1);
+            }
+
+            #[test]
+            fn failed_native_posts_keep_the_claimed_quota() {
+                let mut scheduler = scheduler(2, 0, Some(0));
+                scheduler.start(0);
+                scheduler.on_connected(0, 1);
+                scheduler.rollback_unposted_step(Step::Receive {
+                    index: 0,
+                    bytes: 12,
+                });
+                scheduler.rollback_unposted_step(Step::Send {
+                    index: 0,
+                    bytes: 12,
+                });
+                scheduler.on_transport_failure(0, 2);
+                assert_eq!(scheduler.statistics.attempted, 2);
+                assert_eq!(scheduler.statistics.lost, 2);
+                assert_eq!(scheduler.flows[0].requested, 2);
+            }
+
+            #[test]
+            fn reconnect_wait_begins_only_after_generation_drained() {
+                let mut scheduler = scheduler(1, 0, Some(2));
+                scheduler.start(0);
+                scheduler.on_connected(0, 0);
+                let close = scheduler.on_transport_failure(0, 100);
+                assert_eq!(close, vec![Step::Close(0)]);
+                assert_eq!(scheduler.sessions[0].state, SessionState::Closing);
+                assert!(scheduler.sessions[0].reconnect_at.is_none());
+
+                scheduler.on_generation_drained(0, 200);
+                assert_eq!(scheduler.sessions[0].state, SessionState::ReconnectWait);
+                assert_eq!(scheduler.sessions[0].reconnect_at, Some(2_200));
+
+                let mut expired = Vec::new();
+                assert!(scheduler.poll(2_199, &mut expired).is_empty());
+                assert_eq!(scheduler.poll(2_200, &mut expired), vec![Step::Connect(0)]);
+            }
+
+            #[test]
+            fn reconnect_preserves_verified_counter_baseline() {
+                let mut scheduler = scheduler(1, 0, Some(0));
+                scheduler.start(0);
+                scheduler.on_connected(0, 0);
+                scheduler.on_sent(0, 1);
+                let _ = scheduler.on_received(0, b"abcdef", b"abcdef", 2);
+                assert_eq!(scheduler.sessions[0].echoes, 1);
+
+                assert_eq!(scheduler.on_transport_failure(0, 3), vec![Step::Close(0)]);
+                scheduler.on_generation_drained(0, 4);
+                let mut expired = Vec::new();
+                assert_eq!(scheduler.poll(4, &mut expired), vec![Step::Connect(0)]);
+                let steps = scheduler.on_connected(0, 5);
+                assert!(!scheduler.statistics.fatal);
+                assert!(steps.iter().any(|step| matches!(step, Step::Send { .. })));
+                assert_eq!(scheduler.inflight_echoes(0), Some(1));
+            }
+
+            #[test]
+            fn receive_may_complete_before_send_without_posting_a_second_attempt() {
+                let mut scheduler = scheduler(1, 0, None);
+                scheduler.start(0);
+                let initial = scheduler.on_connected(0, 0);
+                assert_eq!(
+                    initial
+                        .iter()
+                        .filter(|step| matches!(step, Step::Send { .. }))
+                        .count(),
+                    1
+                );
+
+                // RIO completion ordering between send and receive is not a business ordering
+                // guarantee. Verify the echo first while the original send is still native-in-flight.
+                let after_receive = scheduler.on_received(0, b"abcdef", b"abcdef", 1);
+                assert!(
+                    !after_receive
+                        .iter()
+                        .any(|step| matches!(step, Step::Send { .. }))
+                );
+                assert_eq!(scheduler.flows[0].batch_units, 1);
+
+                // Once that native send completion retires, the next attempt may be posted.
+                let after_send = scheduler.on_sent(0, 2);
+                assert!(
+                    after_send
+                        .iter()
+                        .any(|step| matches!(step, Step::Send { .. }))
+                );
+                assert_eq!(scheduler.flows[0].batch_units, 1);
+                assert_eq!(scheduler.inflight_echoes(0), Some(1));
+            }
+
+            #[test]
+            fn interval_pacing_spaces_attempts_and_keeps_the_first_immediate() {
+                let mut scheduler = scheduler(4, 25, None);
+                scheduler.start(100);
+                let first = scheduler.on_connected(0, 100);
+                assert_eq!(
+                    first
+                        .iter()
+                        .filter(|step| matches!(step, Step::Send { .. }))
+                        .count(),
+                    1
+                );
+                assert!(first.iter().any(|step| matches!(
+                    step,
+                    Step::Receive {
+                        index: 0,
+                        bytes: 24
+                    }
+                )));
+                // The first attempt is immediate; the pause applies to the attempts after it.
+                assert_eq!(scheduler.sessions[0].send_at, None);
+
+                scheduler.on_sent(0, 101);
+                let paced = scheduler.on_received(0, b"abcdefabcdefabcdefabcdef", b"abcdef", 101);
+                assert!(paced.is_empty());
+                assert_eq!(scheduler.sessions[0].send_at, Some(126));
+
+                let mut expired = Vec::new();
+                assert!(scheduler.poll(125, &mut expired).is_empty());
+                let second = scheduler.poll(126, &mut expired);
+                assert_eq!(
+                    second
+                        .iter()
+                        .filter(|step| matches!(step, Step::Send { .. }))
+                        .count(),
+                    1
+                );
+            }
+
+            #[test]
+            fn closing_generation_has_a_finite_drain_deadline() {
+                let mut scheduler = scheduler(1, 0, Some(1));
+                scheduler.start(0);
+                scheduler.on_connected(0, 0);
+                assert_eq!(scheduler.on_transport_failure(0, 100), vec![Step::Close(0)]);
+                assert_eq!(scheduler.sessions[0].state, SessionState::Closing);
+                let deadline = scheduler.sessions[0].deadline.expect("closing deadline");
+
+                let mut expired = Vec::new();
+                assert!(
+                    scheduler
+                        .poll(deadline.saturating_sub(1), &mut expired)
+                        .is_empty()
+                );
+                assert!(!scheduler.statistics.fatal);
+                assert!(scheduler.poll(deadline, &mut expired).is_empty());
+                assert!(scheduler.statistics.fatal);
+            }
         }
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::types::{Options, Protocol};
-
-        fn scheduler(depth: u32, interval: u32, reconnect: Option<u32>) -> Scheduler {
-            let mut options = Options::default();
-            options.protocol = Protocol::Tcp;
-            options.pipeline_depth = depth;
-            options.interval_milliseconds = interval;
-            options.reconnect_seconds = reconnect;
-            options.echo_count = 10;
-            Scheduler::new(1, 6, &options)
-        }
-
-        #[test]
-        fn one_attempt_carries_the_batch_and_one_send_receive_pair() {
-            // /k 4 with a 6-byte payload is a single 24-byte send plus one 24-byte receive whose
-            // expected bytes are four copies of the pattern.
-            let mut scheduler = scheduler(4, 0, None);
-            assert_eq!(scheduler.start(0), vec![Step::Connect(0)]);
-            let steps = scheduler.on_connected(0, 1);
-            assert_eq!(steps, vec![Step::Send { index: 0, bytes: 24 }, Step::Receive { index: 0, bytes: 24 }]);
-            assert_eq!(scheduler.inflight_echoes(0), Some(4));
-            assert_eq!(scheduler.statistics.attempted, 4);
-
-            let verified = scheduler.on_received(0, b"abcdefabcdefabcdefabcdef", b"abcdef", 2);
-            assert!(verified.is_empty());
-            assert_eq!(scheduler.statistics.echoes, 4);
-            assert_eq!(scheduler.statistics.bytes, 24);
-
-            // The attempt retires only once its send has completed too.
-            let next = scheduler.on_sent(0, 3);
-            assert_eq!(next, vec![Step::Send { index: 0, bytes: 24 }, Step::Receive { index: 0, bytes: 24 }]);
-        }
-
-        #[test]
-        fn final_attempt_is_trimmed_to_the_remaining_quota() {
-            // /k 4 with a quota of 6 grants 4 then 2, so the last attempt is shorter than /k.
-            let mut options = Options::default();
-            options.protocol = Protocol::Tcp;
-            options.pipeline_depth = 4;
-            options.echo_count = 6;
-            let mut scheduler = Scheduler::new(1, 6, &options);
-            scheduler.start(0);
-            let first = scheduler.on_connected(0, 1);
-            assert_eq!(first, vec![Step::Send { index: 0, bytes: 24 }, Step::Receive { index: 0, bytes: 24 }]);
-            scheduler.on_sent(0, 2);
-            let second = scheduler.on_received(0, b"abcdefabcdefabcdefabcdef", b"abcdef", 3);
-            assert_eq!(second, vec![Step::Send { index: 0, bytes: 12 }, Step::Receive { index: 0, bytes: 12 }]);
-            assert_eq!(scheduler.statistics.attempted, 6);
-        }
-
-        #[test]
-        fn partial_receive_reposts_only_the_remaining_bytes() {
-            let mut scheduler = scheduler(1, 0, None);
-            scheduler.start(0);
-            scheduler.on_connected(0, 0);
-            let steps = scheduler.on_received(0, b"abc", b"abcdef", 10);
-            assert!(steps.iter().any(|s| matches!(s, Step::Receive { index: 0, bytes: 3 })));
-        }
-
-        #[test]
-        fn udp_short_datagram_is_not_reassembled_as_tcp_stream_data() {
-            let mut options = Options::default();
-            options.protocol = Protocol::Udp;
-            options.pipeline_depth = 1;
-            options.echo_count = 1;
-            let mut scheduler = Scheduler::new(1, 6, &options);
-            scheduler.start(0);
-            scheduler.on_connected(0, 0);
-            let steps = scheduler.on_received(0, b"abc", b"abcdef", 10);
-            assert_eq!(scheduler.statistics.corrupted, 1);
-            assert_eq!(scheduler.sessions[0].state, SessionState::Failed);
-            assert_eq!(steps, vec![Step::Close(0)]);
-        }
-
-        #[test]
-        fn corrupted_receive_is_terminal_even_when_reconnect_is_enabled() {
-            let mut scheduler = scheduler(2, 0, Some(1));
-            scheduler.start(0);
-            scheduler.on_connected(0, 0);
-            let close = scheduler.on_corrupted_receive(0);
-            assert_eq!(close, vec![Step::Close(0)]);
-            assert_eq!(scheduler.sessions[0].state, SessionState::Failed);
-            // Integrity is counted per attempt: this attempt carried two echo units, and it is
-            // settled as corrupted alone. Counting it lost as well would settle one attempt twice.
-            assert_eq!(scheduler.statistics.corrupted, 2);
-            assert_eq!(scheduler.statistics.lost, 0);
-            assert_eq!(scheduler.statistics.reconnects, 0);
-        }
-
-        #[test]
-        fn reconnect_wait_begins_only_after_generation_drained() {
-            let mut scheduler = scheduler(1, 0, Some(2));
-            scheduler.start(0);
-            scheduler.on_connected(0, 0);
-            let close = scheduler.on_transport_failure(0, 100);
-            assert_eq!(close, vec![Step::Close(0)]);
-            assert_eq!(scheduler.sessions[0].state, SessionState::Closing);
-            assert!(scheduler.sessions[0].reconnect_at.is_none());
-
-            scheduler.on_generation_drained(0, 200);
-            assert_eq!(scheduler.sessions[0].state, SessionState::ReconnectWait);
-            assert_eq!(scheduler.sessions[0].reconnect_at, Some(2_200));
-
-            let mut expired = Vec::new();
-            assert!(scheduler.poll(2_199, &mut expired).is_empty());
-            assert_eq!(scheduler.poll(2_200, &mut expired), vec![Step::Connect(0)]);
-        }
-
-        #[test]
-        fn reconnect_preserves_verified_counter_baseline() {
-            let mut scheduler = scheduler(1, 0, Some(0));
-            scheduler.start(0);
-            scheduler.on_connected(0, 0);
-            scheduler.on_sent(0, 1);
-            let _ = scheduler.on_received(0, b"abcdef", b"abcdef", 2);
-            assert_eq!(scheduler.sessions[0].echoes, 1);
-
-            assert_eq!(scheduler.on_transport_failure(0, 3), vec![Step::Close(0)]);
-            scheduler.on_generation_drained(0, 4);
-            let mut expired = Vec::new();
-            assert_eq!(scheduler.poll(4, &mut expired), vec![Step::Connect(0)]);
-            let steps = scheduler.on_connected(0, 5);
-            assert!(!scheduler.statistics.fatal);
-            assert!(steps.iter().any(|step| matches!(step, Step::Send { .. })));
-            assert_eq!(scheduler.inflight_echoes(0), Some(1));
-        }
-
-        #[test]
-        fn receive_may_complete_before_send_without_posting_a_second_attempt() {
-            let mut scheduler = scheduler(1, 0, None);
-            scheduler.start(0);
-            let initial = scheduler.on_connected(0, 0);
-            assert_eq!(initial.iter().filter(|step| matches!(step, Step::Send { .. })).count(), 1);
-
-            // RIO completion ordering between send and receive is not a business ordering
-            // guarantee. Verify the echo first while the original send is still native-in-flight.
-            let after_receive = scheduler.on_received(0, b"abcdef", b"abcdef", 1);
-            assert!(!after_receive.iter().any(|step| matches!(step, Step::Send { .. })));
-            assert_eq!(scheduler.flows[0].batch_units, 1);
-
-            // Once that native send completion retires, the next attempt may be posted.
-            let after_send = scheduler.on_sent(0, 2);
-            assert!(after_send.iter().any(|step| matches!(step, Step::Send { .. })));
-            assert_eq!(scheduler.flows[0].batch_units, 1);
-            assert_eq!(scheduler.inflight_echoes(0), Some(1));
-        }
-
-        #[test]
-        fn interval_pacing_spaces_attempts_and_keeps_the_first_immediate() {
-            let mut scheduler = scheduler(4, 25, None);
-            scheduler.start(100);
-            let first = scheduler.on_connected(0, 100);
-            assert_eq!(first.iter().filter(|step| matches!(step, Step::Send { .. })).count(), 1);
-            assert!(first.iter().any(|step| matches!(step, Step::Receive { index: 0, bytes: 24 })));
-            // The first attempt is immediate; the pause applies to the attempts after it.
-            assert_eq!(scheduler.sessions[0].send_at, None);
-
-            scheduler.on_sent(0, 101);
-            let paced = scheduler.on_received(0, b"abcdefabcdefabcdefabcdef", b"abcdef", 101);
-            assert!(paced.is_empty());
-            assert_eq!(scheduler.sessions[0].send_at, Some(126));
-
-            let mut expired = Vec::new();
-            assert!(scheduler.poll(125, &mut expired).is_empty());
-            let second = scheduler.poll(126, &mut expired);
-            assert_eq!(second.iter().filter(|step| matches!(step, Step::Send { .. })).count(), 1);
-        }
-
-        #[test]
-        fn closing_generation_has_a_finite_drain_deadline() {
-            let mut scheduler = scheduler(1, 0, Some(1));
-            scheduler.start(0);
-            scheduler.on_connected(0, 0);
-            assert_eq!(scheduler.on_transport_failure(0, 100), vec![Step::Close(0)]);
-            assert_eq!(scheduler.sessions[0].state, SessionState::Closing);
-            let deadline = scheduler.sessions[0].deadline.expect("closing deadline");
-
-            let mut expired = Vec::new();
-            assert!(scheduler.poll(deadline.saturating_sub(1), &mut expired).is_empty());
-            assert!(!scheduler.statistics.fatal);
-            assert!(scheduler.poll(deadline, &mut expired).is_empty());
-            assert!(scheduler.statistics.fatal);
-        }
-    }
-}
 }
 
 pub mod worker {
@@ -1119,7 +1404,8 @@ pub mod worker {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
-    use crate::native::completion::{Operation, WSAEMSGSIZE, is_connection_level};
+    use crate::native::clock::milliseconds_to_ticks;
+    use crate::native::completion::Operation;
     use crate::session::scheduler::{Scheduler, Step};
     use crate::types::Options;
 
@@ -1141,6 +1427,17 @@ pub mod worker {
         fn send(&mut self, index: u32, bytes: u32) -> Result<(), String>;
         fn receive(&mut self, index: u32, bytes: u32) -> Result<(), String>;
         fn close(&mut self, index: u32);
+
+        fn try_close(&mut self, index: u32) -> Result<(), String> {
+            self.close(index);
+            Ok(())
+        }
+
+        /// A native transport counts every successful send segment, including partial attempts
+        /// that later fail. Test transports can leave accounting to whole-send completions.
+        fn sent_bytes(&self) -> Option<u64> {
+            None
+        }
 
         /// Applies protocol-specific work after a successful connect completion.
         fn connected(&mut self, _index: u32, _generation: u32) -> Result<(), String> {
@@ -1186,9 +1483,20 @@ pub mod worker {
     pub trait Clock {
         fn now_milliseconds(&mut self) -> u64;
         fn wait(&mut self, milliseconds: u32);
+
+        /// Test clocks use millisecond ticks by default; production overrides both methods
+        /// with the cached QPC frequency and its raw counter.
+        fn ticks_per_second(&self) -> u64 {
+            1_000
+        }
+
+        fn now_ticks(&mut self) -> u64 {
+            self.now_milliseconds()
+        }
     }
 
     static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+    static FATAL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
     /// Process-wide stop token. A console control handler can set it without locks or allocation.
     #[derive(Clone, Copy, Debug, Default)]
@@ -1197,10 +1505,20 @@ pub mod worker {
     impl StopFlag {
         pub fn clear_global() {
             STOP_REQUESTED.store(false, Ordering::Release);
+            FATAL_REQUESTED.store(false, Ordering::Release);
         }
 
         pub fn request_global() {
             STOP_REQUESTED.store(true, Ordering::Release);
+        }
+
+        pub fn request_fatal_global() {
+            FATAL_REQUESTED.store(true, Ordering::Release);
+            Self::request_global();
+        }
+
+        pub fn is_fatal(&self) -> bool {
+            FATAL_REQUESTED.load(Ordering::Acquire)
         }
 
         pub fn request(&self) {
@@ -1214,6 +1532,9 @@ pub mod worker {
 
     pub const DRAIN_BATCHES: u32 = 64;
 
+    pub type Progress = std::sync::Arc<std::sync::Mutex<(crate::metrics::Statistics, u32)>>;
+    pub type WakePort = std::sync::Arc<std::sync::Mutex<usize>>;
+
     #[derive(Debug, Default, PartialEq, Eq)]
     pub struct RunOutcome {
         pub controlled_stop: bool,
@@ -1226,9 +1547,9 @@ pub mod worker {
         scheduler: Scheduler,
         payload_bytes: u32,
         payload: std::sync::Arc<[u8]>,
-        report_seconds: u32,
-        quiet: bool,
-        next_report: u64,
+        progress: Option<Progress>,
+        progress_interval: u64,
+        next_progress: u64,
         run_seconds: u32,
         run_deadline: Option<u64>,
         started_at: Instant,
@@ -1244,10 +1565,10 @@ pub mod worker {
             Self {
                 scheduler: Scheduler::new(session_count, payload_bytes, options),
                 payload_bytes,
-                payload: std::sync::Arc::from(vec![0u8; payload_bytes as usize].into_boxed_slice()),
-                report_seconds: options.report_seconds,
-                quiet: options.quiet,
-                next_report: 0,
+                payload: std::sync::Arc::from(&[][..]),
+                progress: None,
+                progress_interval: 0,
+                next_progress: 0,
                 run_seconds: options.run_seconds,
                 run_deadline: None,
                 started_at: Instant::now(),
@@ -1272,6 +1593,33 @@ pub mod worker {
             &mut self.scheduler
         }
 
+        pub fn set_progress(&mut self, progress: Progress, interval: u64) {
+            self.progress = Some(progress);
+            self.progress_interval = interval.max(1);
+        }
+
+        fn publish_progress(&mut self, now: u64, force: bool) {
+            if !force && now < self.next_progress {
+                return;
+            }
+            if let Some(progress) = &self.progress {
+                match progress.lock() {
+                    Ok(mut snapshot) => {
+                        let active = self
+                            .scheduler
+                            .sessions()
+                            .iter()
+                            .filter(|session| session.active_counted)
+                            .count() as u32;
+                        snapshot.0 = self.scheduler.statistics();
+                        snapshot.1 = active;
+                    }
+                    Err(_) => self.scheduler.mark_fatal(),
+                }
+                self.next_progress = now.saturating_add(self.progress_interval);
+            }
+        }
+
         fn clear_latency_queue(&mut self, index: u32) {
             if let Some(started) = self.attempt_started.get_mut(index as usize) {
                 *started = None;
@@ -1290,7 +1638,7 @@ pub mod worker {
             let micros = Instant::now()
                 .duration_since(sent)
                 .as_micros()
-                .min(u128::from(u32::MAX)) as u32;
+                .min(u128::from(u64::MAX)) as u64;
             self.scheduler.record_latency(micros);
         }
 
@@ -1306,13 +1654,14 @@ pub mod worker {
             self.dispatch(&steps, transport, outcome, now);
         }
 
-        fn handle_completion<T: Transport>(
+        fn handle_completion<C: Clock, T: Transport>(
             &mut self,
             completion: Completion,
-            now: u64,
+            clock: &mut C,
             transport: &mut T,
             outcome: &mut RunOutcome,
         ) {
+            let now = clock.now_ticks();
             crate::worker::trace::event_args(
                 "COMPLETION",
                 format_args!(
@@ -1348,44 +1697,18 @@ pub mod worker {
 
             if completion.status != 0 {
                 outcome.failures = outcome.failures.saturating_add(1);
-                if completion.operation == Operation::Receive && completion.status == WSAEMSGSIZE {
-                    // A connected UDP receive that does not fit the expected echo buffer is a
-                    // protocol/data-integrity failure, not a reason to reconnect indefinitely.
-                    self.clear_latency_queue(completion.index);
-                    let steps = self.scheduler.on_corrupted_receive(completion.index);
-                    self.dispatch(&steps, transport, outcome, now);
-                } else if is_connection_level(completion.status) {
-                    crate::worker::trace::event_args(
-                        "CONNECTION_FAILURE",
-                        format_args!(
-                            "session={} generation={} status={}",
-                            completion.index, completion.generation, completion.status
-                        ),
-                    );
-                    self.fail_session(completion.index, now, transport, outcome);
-                } else {
-                    // An unknown native completion status is not safely attributable to an
-                    // ordinary peer/network failure. Reconnecting would hide provider/state
-                    // corruption and could loop forever, so make the run fatal. Transport
-                    // shutdown still performs the bounded cancellation/drain protocol.
-                    crate::worker::trace::event_args(
-                        "NATIVE_OPERATION_FATAL",
-                        format_args!(
-                            "session={} generation={} op={:?} status={}",
-                            completion.index,
-                            completion.generation,
-                            completion.operation,
-                            completion.status
-                        ),
-                    );
-                    self.scheduler.mark_fatal();
-                }
+                // Native operation errors, including WSAEMSGSIZE, fail the connection and spend
+                // the attempt's quota. Only invalid ownership/CQ/IOCP state is an internal error.
+                self.fail_session(completion.index, now, transport, outcome);
                 return;
             }
 
+            let before = self.scheduler.statistics();
             let steps = match completion.operation {
                 Operation::Connect => {
-                    if let Err(reason) = transport.connected(completion.index, completion.generation) {
+                    if let Err(reason) =
+                        transport.connected(completion.index, completion.generation)
+                    {
                         crate::worker::trace::event("CONNECT_FINALIZE_FAILED", &reason);
                         outcome.failures = outcome.failures.saturating_add(1);
                         self.fail_session(completion.index, now, transport, outcome);
@@ -1402,48 +1725,37 @@ pub mod worker {
                             "SHORT_SEND",
                             format_args!(
                                 "session={} generation={} bytes={} expected={}",
-                                completion.index,
-                                completion.generation,
-                                completion.bytes,
-                                expected
+                                completion.index, completion.generation, completion.bytes, expected
                             ),
                         );
                         outcome.failures = outcome.failures.saturating_add(1);
                         self.fail_session(completion.index, now, transport, outcome);
                         return;
                     }
-                    self.scheduler.on_sent_bytes(u64::from(completion.bytes));
+                    if transport.sent_bytes().is_none() {
+                        self.scheduler.on_sent_bytes(u64::from(completion.bytes));
+                    }
                     self.scheduler.on_sent(completion.index, now)
-                },
+                }
                 Operation::Receive => {
-                    let before = self
-                        .scheduler
-                        .session(completion.index)
-                        .map(|session| session.echoes)
-                        .unwrap_or(0);
                     let chunk = transport.received(
                         completion.index,
                         completion.generation,
                         completion.bytes,
                     );
-                    let steps = self.scheduler.on_received(
-                        completion.index,
-                        chunk,
-                        &self.payload,
-                        now,
-                    );
-                    let after = self
-                        .scheduler
-                        .session(completion.index)
-                        .map(|session| session.echoes)
-                        .unwrap_or(before);
-                    if after > before {
-                        self.record_verified_latency(completion.index);
-                    }
-                    steps
+                    self.scheduler
+                        .on_received(completion.index, chunk, &self.payload, now)
                 }
                 Operation::GenerationDrained => unreachable!(),
             };
+            let after = self.scheduler.statistics();
+            if after.echoes > before.echoes || after.corrupted > before.corrupted {
+                self.record_verified_latency(completion.index);
+                if self.scheduler.has_pacing() {
+                    self.scheduler
+                        .refresh_completed_pacing(completion.index, clock.now_ticks());
+                }
+            }
             self.dispatch(&steps, transport, outcome, now);
         }
 
@@ -1457,17 +1769,18 @@ pub mod worker {
             stop: &StopFlag,
         ) -> RunOutcome {
             let mut outcome = RunOutcome::default();
-            let started = clock.now_milliseconds();
+            let frequency = clock.ticks_per_second();
+            self.scheduler.configure_clock(frequency);
+            self.progress_interval = milliseconds_to_ticks(self.progress_interval, frequency);
+            let started = clock.now_ticks();
             self.started_at = Instant::now();
             self.run_deadline = if self.run_seconds == 0 {
                 None
             } else {
-                Some(started.saturating_add(u64::from(self.run_seconds).saturating_mul(1_000)))
-            };
-            self.next_report = if self.report_seconds == 0 {
-                0
-            } else {
-                started.saturating_add(u64::from(self.report_seconds).saturating_mul(1_000))
+                Some(started.saturating_add(milliseconds_to_ticks(
+                    u64::from(self.run_seconds).saturating_mul(1_000),
+                    frequency,
+                )))
             };
 
             let steps = self.scheduler.start(started);
@@ -1476,10 +1789,11 @@ pub mod worker {
 
             loop {
                 if stop.is_requested() {
-                    outcome.controlled_stop = true;
+                    outcome.controlled_stop = !stop.is_fatal();
                     break;
                 }
-                let now = clock.now_milliseconds();
+                let now = clock.now_ticks();
+                self.publish_progress(now, false);
                 if self.run_deadline.is_some_and(|deadline| now >= deadline) {
                     outcome.controlled_stop = true;
                     break;
@@ -1490,7 +1804,7 @@ pub mod worker {
 
                 let wait = self.scheduler.wait_milliseconds(now, 1_000);
                 if wait == 0 {
-                    let poll_now = clock.now_milliseconds();
+                    let poll_now = clock.now_ticks();
                     let steps = self.scheduler.poll(poll_now, &mut expired);
                     self.dispatch(&steps, transport, &mut outcome, poll_now);
                     continue;
@@ -1499,7 +1813,6 @@ pub mod worker {
                 // Test clocks advance here. The production clock intentionally does nothing;
                 // RioTransport::wait_and_drain performs the blocking GQCS wait.
                 clock.wait(wait);
-                let now = clock.now_milliseconds();
                 let completions = match transport.wait_and_drain(wait, DRAIN_BATCHES) {
                     Ok(completions) => completions,
                     Err(reason) => {
@@ -1509,30 +1822,25 @@ pub mod worker {
                         break;
                     }
                 };
+                if let Some(bytes) = transport.sent_bytes() {
+                    self.scheduler.set_sent_bytes(bytes);
+                }
+                if stop.is_requested() {
+                    transport.recycle(completions);
+                    outcome.controlled_stop = !stop.is_fatal();
+                    break;
+                }
 
                 for position in 0..completions.len() {
                     let completion = completions[position];
-                    self.handle_completion(completion, now, transport, &mut outcome);
+                    self.handle_completion(completion, clock, transport, &mut outcome);
                     if self.scheduler.statistics().fatal {
                         break;
                     }
                 }
                 transport.recycle(completions);
 
-                if self.report_seconds != 0 && !self.quiet {
-                    let reported_at = clock.now_milliseconds();
-                    if reported_at >= self.next_report {
-                        // The periodic report uses the terminal line's schema, so the live counters are
-                        // read from the scheduler at the moment of the report.
-                        let sessions = self.scheduler.sessions().len() as u32;
-                        let active = self.scheduler.sessions().iter().filter(|s| !s.is_finished()).count() as u32;
-                        println!("{}", self.scheduler.statistics().line("final", sessions, active));
-                        self.next_report = reported_at
-                            .saturating_add(u64::from(self.report_seconds).saturating_mul(1_000));
-                    }
-                }
-
-                let poll_now = clock.now_milliseconds();
+                let poll_now = clock.now_ticks();
                 let steps = self.scheduler.poll(poll_now, &mut expired);
                 self.dispatch(&steps, transport, &mut outcome, poll_now);
                 outcome.batches = outcome.batches.saturating_add(1);
@@ -1544,17 +1852,21 @@ pub mod worker {
             // own generation never reaches the drain event that counts its network failure.
             let terminal = self.scheduler.statistics();
             if !outcome.controlled_stop && terminal.fatal {
-                StopFlag::request_global();
+                StopFlag::request_fatal_global();
             }
 
             if let Err(reason) = transport.shutdown() {
                 crate::worker::trace::event("TRANSPORT_SHUTDOWN_FAILED", &reason);
                 self.scheduler.mark_fatal();
-                StopFlag::request_global();
+                StopFlag::request_fatal_global();
                 outcome.failures = outcome.failures.saturating_add(1);
+            }
+            if let Some(bytes) = transport.sent_bytes() {
+                self.scheduler.set_sent_bytes(bytes);
             }
             self.scheduler
                 .set_elapsed_milliseconds(self.started_at.elapsed().as_millis() as u64);
+            self.publish_progress(clock.now_ticks(), true);
             outcome
         }
 
@@ -1575,18 +1887,26 @@ pub mod worker {
                     Step::Send { index, .. } | Step::Receive { index, .. } => index,
                 };
                 if failed_session == Some(step_index) {
-                    crate::worker::trace::event_args("STEP_SKIPPED_AFTER_FAILURE", format_args!("{step:?}"));
+                    crate::worker::trace::event_args(
+                        "STEP_SKIPPED_AFTER_FAILURE",
+                        format_args!("{step:?}"),
+                    );
                     continue;
                 }
 
+                if let Step::Receive { index, .. } = *step {
+                    if let Some(started) = self.attempt_started.get_mut(index as usize) {
+                        *started = Some(Instant::now());
+                    }
+                }
                 let result = match *step {
                     Step::Connect(index) => transport.connect(index),
                     Step::Send { index, bytes } => transport.send(index, bytes),
                     Step::Receive { index, bytes } => transport.receive(index, bytes),
                     Step::Close(index) => {
-                        transport.close(index);
+                        let result = transport.try_close(index);
                         self.clear_latency_queue(index);
-                        Ok(())
+                        result
                     }
                 };
 
@@ -1594,15 +1914,16 @@ pub mod worker {
                     Ok(()) => {
                         outcome.steps = outcome.steps.saturating_add(1);
                         crate::worker::trace::event_args("STEP_OK", format_args!("{step:?}"));
-                        if let Step::Send { index, .. } = *step {
-                            if let Some(started) = self.attempt_started.get_mut(index as usize) {
-                                *started = Some(Instant::now());
-                            }
-                        }
                     }
                     Err(reason) => {
-                        crate::worker::trace::event_args("STEP_FAILED", format_args!("{step:?} reason={reason}"));
+                        crate::worker::trace::event_args(
+                            "STEP_FAILED",
+                            format_args!("{step:?} reason={reason}"),
+                        );
                         outcome.failures = outcome.failures.saturating_add(1);
+                        if reason.contains("RIONotify") || matches!(step, Step::Close(_)) {
+                            self.scheduler.mark_fatal();
+                        }
 
                         // The scheduler reserved every step in this precomputed batch before
                         // dispatch began. The failed native post and later steps for this same
@@ -1625,7 +1946,6 @@ pub mod worker {
                 }
             }
         }
-
     }
 
     #[cfg(test)]
@@ -1730,314 +2050,315 @@ pub mod worker {
 
     // The worker owns the IOCP loop, the RIONotify lifecycle, the timer wheel and the trace helpers.
 
-pub mod timer {
-    //! Worker-private index minimum heap over deadlines.
-    //!
-    //! Only the owning thread touches it, so no synchronisation is needed. The heap keeps a
-    //! position map so a session's deadline can be updated or removed in place, and its
-    //! capacity is fixed for the whole run: it is never allowed to grow.
+    pub mod timer {
+        //! Worker-private index minimum heap over deadlines.
+        //!
+        //! Only the owning thread touches it, so no synchronisation is needed. The heap keeps a
+        //! position map so a session's deadline can be updated or removed in place, and its
+        //! capacity is fixed for the whole run: it is never allowed to grow.
 
-    /// One scheduled deadline.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct TimerNode {
-        pub deadline: u64,
-        pub connection_index: u32,
-    }
-
-    #[derive(Debug)]
-    pub struct TimerHeap {
-        capacity: usize,
-        size: usize,
-        nodes: Vec<TimerNode>,
-        /// Index of a session inside `nodes`, or -1 when the session has no deadline.
-        positions: Vec<i32>,
-    }
-
-    impl TimerHeap {
-        pub fn new(capacity: usize) -> Self {
-            Self {
-                capacity,
-                size: 0,
-                nodes: vec![TimerNode::default(); capacity],
-                positions: vec![-1; capacity],
-            }
+        /// One scheduled deadline.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct TimerNode {
+            pub deadline: u64,
+            pub connection_index: u32,
         }
 
-        pub fn capacity(&self) -> usize {
-            self.capacity
+        #[derive(Debug)]
+        pub struct TimerHeap {
+            capacity: usize,
+            size: usize,
+            nodes: Vec<TimerNode>,
+            /// Index of a session inside `nodes`, or -1 when the session has no deadline.
+            positions: Vec<i32>,
         }
 
-        pub fn len(&self) -> usize {
-            self.size
-        }
-
-        pub fn is_empty(&self) -> bool {
-            self.size == 0
-        }
-
-        pub fn contains(&self, connection_index: u32) -> bool {
-            (connection_index as usize) < self.capacity
-                && self.positions[connection_index as usize] >= 0
-        }
-
-        /// Deadline of the nearest entry, or None when the heap is empty.
-        pub fn next_deadline(&self) -> Option<u64> {
-            if self.size == 0 {
-                None
-            } else {
-                Some(self.nodes[0].deadline)
-            }
-        }
-
-        fn less(&self, a: usize, b: usize) -> bool {
-            let left = self.nodes[a];
-            let right = self.nodes[b];
-            (left.deadline, left.connection_index) < (right.deadline, right.connection_index)
-        }
-
-        fn swap(&mut self, a: usize, b: usize) {
-            self.nodes.swap(a, b);
-            let left = self.nodes[a].connection_index as usize;
-            let right = self.nodes[b].connection_index as usize;
-            self.positions[left] = a as i32;
-            self.positions[right] = b as i32;
-        }
-
-        fn sift_up(&mut self, mut index: usize) {
-            while index > 0 {
-                let parent = (index - 1) / 2;
-                if !self.less(index, parent) {
-                    break;
+        impl TimerHeap {
+            pub fn new(capacity: usize) -> Self {
+                Self {
+                    capacity,
+                    size: 0,
+                    nodes: vec![TimerNode::default(); capacity],
+                    positions: vec![-1; capacity],
                 }
-                self.swap(index, parent);
-                index = parent;
             }
-        }
 
-        fn sift_down(&mut self, mut index: usize) {
-            loop {
-                let left = index * 2 + 1;
-                if left >= self.size {
-                    break;
-                }
-                let right = left + 1;
-                let smallest = if right < self.size && self.less(right, left) {
-                    right
-                } else {
-                    left
-                };
-                if !self.less(smallest, index) {
-                    break;
-                }
-                self.swap(index, smallest);
-                index = smallest;
+            pub fn capacity(&self) -> usize {
+                self.capacity
             }
-        }
 
-        /// Schedules or reschedules a session. Returns false when the session has no slot and
-        /// the heap is already full: the caller must treat that as a hard failure instead of
-        /// silently dropping a deadline.
-        pub fn insert_or_update(&mut self, deadline: u64, connection_index: u32) -> bool {
-            let slot = connection_index as usize;
-            if slot >= self.capacity {
-                return false;
+            pub fn len(&self) -> usize {
+                self.size
             }
-            let existing = self.positions[slot];
-            if existing >= 0 {
-                let position = existing as usize;
-                let previous = self.nodes[position].deadline;
-                self.nodes[position].deadline = deadline;
-                if deadline < previous {
-                    self.sift_up(position);
-                } else if deadline > previous {
-                    self.sift_down(position);
-                }
-                return true;
-            }
-            if self.size == self.capacity {
-                return false;
-            }
-            let position = self.size;
-            self.size += 1;
-            self.nodes[position] = TimerNode {
-                deadline,
-                connection_index,
-            };
-            self.positions[slot] = position as i32;
-            self.sift_up(position);
-            true
-        }
 
-        /// Drops a session's deadline. Removing an unscheduled session is not an error.
-        pub fn remove(&mut self, connection_index: u32) -> bool {
-            let slot = connection_index as usize;
-            if slot >= self.capacity {
-                return false;
+            pub fn is_empty(&self) -> bool {
+                self.size == 0
             }
-            let position = self.positions[slot];
-            if position < 0 {
-                return false;
+
+            pub fn contains(&self, connection_index: u32) -> bool {
+                (connection_index as usize) < self.capacity
+                    && self.positions[connection_index as usize] >= 0
             }
-            let position = position as usize;
-            let last = self.size - 1;
-            self.positions[slot] = -1;
-            if position != last {
-                self.nodes.swap(position, last);
-                self.positions[self.nodes[position].connection_index as usize] = position as i32;
-                let moved_deadline = self.nodes[position].deadline;
-                self.size = last;
-                // Repair in whichever direction the moved entry can violate the invariant.
-                let parent = if position > 0 {
-                    Some((position - 1) / 2)
-                } else {
+
+            /// Deadline of the nearest entry, or None when the heap is empty.
+            pub fn next_deadline(&self) -> Option<u64> {
+                if self.size == 0 {
                     None
-                };
-                if let Some(parent) = parent {
-                    if self.less(position, parent) {
+                } else {
+                    Some(self.nodes[0].deadline)
+                }
+            }
+
+            fn less(&self, a: usize, b: usize) -> bool {
+                let left = self.nodes[a];
+                let right = self.nodes[b];
+                (left.deadline, left.connection_index) < (right.deadline, right.connection_index)
+            }
+
+            fn swap(&mut self, a: usize, b: usize) {
+                self.nodes.swap(a, b);
+                let left = self.nodes[a].connection_index as usize;
+                let right = self.nodes[b].connection_index as usize;
+                self.positions[left] = a as i32;
+                self.positions[right] = b as i32;
+            }
+
+            fn sift_up(&mut self, mut index: usize) {
+                while index > 0 {
+                    let parent = (index - 1) / 2;
+                    if !self.less(index, parent) {
+                        break;
+                    }
+                    self.swap(index, parent);
+                    index = parent;
+                }
+            }
+
+            fn sift_down(&mut self, mut index: usize) {
+                loop {
+                    let left = index * 2 + 1;
+                    if left >= self.size {
+                        break;
+                    }
+                    let right = left + 1;
+                    let smallest = if right < self.size && self.less(right, left) {
+                        right
+                    } else {
+                        left
+                    };
+                    if !self.less(smallest, index) {
+                        break;
+                    }
+                    self.swap(index, smallest);
+                    index = smallest;
+                }
+            }
+
+            /// Schedules or reschedules a session. Returns false when the session has no slot and
+            /// the heap is already full: the caller must treat that as a hard failure instead of
+            /// silently dropping a deadline.
+            pub fn insert_or_update(&mut self, deadline: u64, connection_index: u32) -> bool {
+                let slot = connection_index as usize;
+                if slot >= self.capacity {
+                    return false;
+                }
+                let existing = self.positions[slot];
+                if existing >= 0 {
+                    let position = existing as usize;
+                    let previous = self.nodes[position].deadline;
+                    self.nodes[position].deadline = deadline;
+                    if deadline < previous {
                         self.sift_up(position);
-                        return true;
+                    } else if deadline > previous {
+                        self.sift_down(position);
+                    }
+                    return true;
+                }
+                if self.size == self.capacity {
+                    return false;
+                }
+                let position = self.size;
+                self.size += 1;
+                self.nodes[position] = TimerNode {
+                    deadline,
+                    connection_index,
+                };
+                self.positions[slot] = position as i32;
+                self.sift_up(position);
+                true
+            }
+
+            /// Drops a session's deadline. Removing an unscheduled session is not an error.
+            pub fn remove(&mut self, connection_index: u32) -> bool {
+                let slot = connection_index as usize;
+                if slot >= self.capacity {
+                    return false;
+                }
+                let position = self.positions[slot];
+                if position < 0 {
+                    return false;
+                }
+                let position = position as usize;
+                let last = self.size - 1;
+                self.positions[slot] = -1;
+                if position != last {
+                    self.nodes.swap(position, last);
+                    self.positions[self.nodes[position].connection_index as usize] =
+                        position as i32;
+                    let moved_deadline = self.nodes[position].deadline;
+                    self.size = last;
+                    // Repair in whichever direction the moved entry can violate the invariant.
+                    let parent = if position > 0 {
+                        Some((position - 1) / 2)
+                    } else {
+                        None
+                    };
+                    if let Some(parent) = parent {
+                        if self.less(position, parent) {
+                            self.sift_up(position);
+                            return true;
+                        }
+                    }
+                    let _ = moved_deadline;
+                    self.sift_down(position);
+                } else {
+                    self.size = last;
+                }
+                true
+            }
+
+            /// Wakes up only the sessions whose deadline has passed. Each removed session is
+            /// reported so the caller can drive its timeout path.
+            pub fn pop_expired(&mut self, now: u64, out: &mut Vec<u32>) -> usize {
+                let mut count = 0;
+                while self.size > 0 && self.nodes[0].deadline <= now {
+                    let node = self.nodes[0];
+                    self.remove(node.connection_index);
+                    out.push(node.connection_index);
+                    count += 1;
+                }
+                count
+            }
+
+            /// Milliseconds to wait for the nearest deadline, clamped so a caller can pass its own
+            /// idle bound (for example a run deadline or an infinite wait).
+            pub fn timeout_milliseconds(&self, now: u64, maximum: u32) -> u32 {
+                match self.next_deadline() {
+                    None => maximum,
+                    Some(deadline) if deadline <= now => 0,
+                    Some(deadline) => {
+                        let delta = deadline - now;
+                        let capped = delta.min(u64::from(maximum));
+                        capped as u32
                     }
                 }
-                let _ = moved_deadline;
-                self.sift_down(position);
-            } else {
-                self.size = last;
             }
-            true
         }
 
-        /// Wakes up only the sessions whose deadline has passed. Each removed session is
-        /// reported so the caller can drive its timeout path.
-        pub fn pop_expired(&mut self, now: u64, out: &mut Vec<u32>) -> usize {
-            let mut count = 0;
-            while self.size > 0 && self.nodes[0].deadline <= now {
-                let node = self.nodes[0];
-                self.remove(node.connection_index);
-                out.push(node.connection_index);
-                count += 1;
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn orders_by_deadline_then_index() {
+                let mut heap = TimerHeap::new(8);
+                assert!(heap.insert_or_update(30, 2));
+                assert!(heap.insert_or_update(10, 1));
+                assert!(heap.insert_or_update(20, 0));
+                assert_eq!(heap.next_deadline(), Some(10));
+                let mut expired = Vec::new();
+                assert_eq!(heap.pop_expired(25, &mut expired), 2);
+                assert_eq!(expired, vec![1, 0]);
+                assert_eq!(heap.next_deadline(), Some(30));
+                assert_eq!(heap.len(), 1);
             }
-            count
+
+            #[test]
+            fn update_moves_the_entry_in_both_directions() {
+                let mut heap = TimerHeap::new(4);
+                assert!(heap.insert_or_update(100, 0));
+                assert!(heap.insert_or_update(200, 1));
+                assert!(heap.insert_or_update(5, 0));
+                assert_eq!(heap.next_deadline(), Some(5));
+                assert_eq!(heap.len(), 2);
+                assert!(heap.insert_or_update(500, 0));
+                assert_eq!(heap.next_deadline(), Some(200));
+                assert!(heap.contains(0));
+            }
+
+            #[test]
+            fn remove_reports_missing_entries_and_repairs_the_heap() {
+                let mut heap = TimerHeap::new(4);
+                assert!(!heap.remove(0));
+                assert!(heap.insert_or_update(10, 0));
+                assert!(heap.insert_or_update(20, 1));
+                assert!(heap.insert_or_update(30, 2));
+                assert!(heap.remove(0));
+                assert!(!heap.contains(0));
+                assert_eq!(heap.next_deadline(), Some(20));
+                assert_eq!(heap.len(), 2);
+                assert!(heap.remove(2));
+                assert_eq!(heap.next_deadline(), Some(20));
+            }
+
+            #[test]
+            fn capacity_is_fixed_and_indices_are_bounds_checked() {
+                let mut heap = TimerHeap::new(2);
+                assert!(heap.insert_or_update(1, 0));
+                assert!(heap.insert_or_update(2, 1));
+                // Full: a third distinct session is refused instead of growing the heap.
+                assert!(!heap.insert_or_update(3, 2));
+                // Out-of-range indices are refused even when a slot is free.
+                assert!(!heap.insert_or_update(3, 99));
+                assert_eq!(heap.len(), 2);
+            }
+
+            #[test]
+            fn timeout_is_clamped() {
+                let mut heap = TimerHeap::new(2);
+                assert_eq!(heap.timeout_milliseconds(1_000, 250), 250);
+                assert!(heap.insert_or_update(1_500, 0));
+                assert_eq!(heap.timeout_milliseconds(1_000, 250), 250);
+                assert!(heap.insert_or_update(1_100, 0));
+                assert_eq!(heap.timeout_milliseconds(1_000, 250), 100);
+                assert_eq!(heap.timeout_milliseconds(2_000, 250), 0);
+            }
+        }
+    }
+
+    pub mod trace {
+        //! Stage tracing for the completion-driven engine.
+        //!
+        //! Off by default: set CEC_TRACE=1 and every stage transition prints one line. The flag is
+        //! cached once and formatted trace details use `format_args!`, so disabled tracing performs
+        //! no heap allocation on the completion path.
+
+        use std::fmt;
+        use std::sync::OnceLock;
+
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+
+        /// Whether tracing is requested for this process.
+        pub fn enabled() -> bool {
+            *ENABLED.get_or_init(|| std::env::var_os("CEC_TRACE").is_some())
         }
 
-        /// Milliseconds to wait for the nearest deadline, clamped so a caller can pass its own
-        /// idle bound (for example a run deadline or an infinite wait).
-        pub fn timeout_milliseconds(&self, now: u64, maximum: u32) -> u32 {
-            match self.next_deadline() {
-                None => maximum,
-                Some(deadline) if deadline <= now => 0,
-                Some(deadline) => {
-                    let delta = deadline - now;
-                    let capped = delta.min(u64::from(maximum));
-                    capped as u32
+        /// Records a stage with an already-borrowed string detail.
+        pub fn event(stage: &str, detail: &str) {
+            if enabled() {
+                if detail.is_empty() {
+                    eprintln!("{stage}");
+                } else {
+                    eprintln!("{stage} {detail}");
                 }
             }
         }
-    }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn orders_by_deadline_then_index() {
-            let mut heap = TimerHeap::new(8);
-            assert!(heap.insert_or_update(30, 2));
-            assert!(heap.insert_or_update(10, 1));
-            assert!(heap.insert_or_update(20, 0));
-            assert_eq!(heap.next_deadline(), Some(10));
-            let mut expired = Vec::new();
-            assert_eq!(heap.pop_expired(25, &mut expired), 2);
-            assert_eq!(expired, vec![1, 0]);
-            assert_eq!(heap.next_deadline(), Some(30));
-            assert_eq!(heap.len(), 1);
-        }
-
-        #[test]
-        fn update_moves_the_entry_in_both_directions() {
-            let mut heap = TimerHeap::new(4);
-            assert!(heap.insert_or_update(100, 0));
-            assert!(heap.insert_or_update(200, 1));
-            assert!(heap.insert_or_update(5, 0));
-            assert_eq!(heap.next_deadline(), Some(5));
-            assert_eq!(heap.len(), 2);
-            assert!(heap.insert_or_update(500, 0));
-            assert_eq!(heap.next_deadline(), Some(200));
-            assert!(heap.contains(0));
-        }
-
-        #[test]
-        fn remove_reports_missing_entries_and_repairs_the_heap() {
-            let mut heap = TimerHeap::new(4);
-            assert!(!heap.remove(0));
-            assert!(heap.insert_or_update(10, 0));
-            assert!(heap.insert_or_update(20, 1));
-            assert!(heap.insert_or_update(30, 2));
-            assert!(heap.remove(0));
-            assert!(!heap.contains(0));
-            assert_eq!(heap.next_deadline(), Some(20));
-            assert_eq!(heap.len(), 2);
-            assert!(heap.remove(2));
-            assert_eq!(heap.next_deadline(), Some(20));
-        }
-
-        #[test]
-        fn capacity_is_fixed_and_indices_are_bounds_checked() {
-            let mut heap = TimerHeap::new(2);
-            assert!(heap.insert_or_update(1, 0));
-            assert!(heap.insert_or_update(2, 1));
-            // Full: a third distinct session is refused instead of growing the heap.
-            assert!(!heap.insert_or_update(3, 2));
-            // Out-of-range indices are refused even when a slot is free.
-            assert!(!heap.insert_or_update(3, 99));
-            assert_eq!(heap.len(), 2);
-        }
-
-        #[test]
-        fn timeout_is_clamped() {
-            let mut heap = TimerHeap::new(2);
-            assert_eq!(heap.timeout_milliseconds(1_000, 250), 250);
-            assert!(heap.insert_or_update(1_500, 0));
-            assert_eq!(heap.timeout_milliseconds(1_000, 250), 250);
-            assert!(heap.insert_or_update(1_100, 0));
-            assert_eq!(heap.timeout_milliseconds(1_000, 250), 100);
-            assert_eq!(heap.timeout_milliseconds(2_000, 250), 0);
-        }
-    }
-}
-
-pub mod trace {
-    //! Stage tracing for the completion-driven engine.
-    //!
-    //! Off by default: set CEC_TRACE=1 and every stage transition prints one line. The flag is
-    //! cached once and formatted trace details use `format_args!`, so disabled tracing performs
-    //! no heap allocation on the completion path.
-
-    use std::fmt;
-    use std::sync::OnceLock;
-
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-
-    /// Whether tracing is requested for this process.
-    pub fn enabled() -> bool {
-        *ENABLED.get_or_init(|| std::env::var_os("CEC_TRACE").is_some())
-    }
-
-    /// Records a stage with an already-borrowed string detail.
-    pub fn event(stage: &str, detail: &str) {
-        if enabled() {
-            if detail.is_empty() {
-                eprintln!("{stage}");
-            } else {
+        /// Allocation-free formatted tracing. `format_args!` only renders when tracing is enabled.
+        pub fn event_args(stage: &str, detail: fmt::Arguments<'_>) {
+            if enabled() {
                 eprintln!("{stage} {detail}");
             }
         }
     }
-
-    /// Allocation-free formatted tracing. `format_args!` only renders when tracing is enabled.
-    pub fn event_args(stage: &str, detail: fmt::Arguments<'_>) {
-        if enabled() {
-            eprintln!("{stage} {detail}");
-        }
-    }
-}
 }

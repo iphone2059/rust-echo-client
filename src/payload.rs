@@ -1,7 +1,9 @@
 //! Echo payload construction and byte-exact verification, plus the run statistics the
 //! exit code is derived from.
 
-use crate::types::{ArgumentError, Options, Pattern, MAXIMUM_TCP_BATCH_BYTES, MAXIMUM_UDP_PAYLOAD_BYTES};
+use crate::types::{
+    ArgumentError, MAXIMUM_TCP_BATCH_BYTES, MAXIMUM_UDP_PAYLOAD_BYTES, Options, Pattern,
+};
 
 /// The default payload of the baseline: the literal text below, sent as ASCII.
 pub const DEFAULT_TEXT_PREFIX: &str = "echo from ";
@@ -25,7 +27,9 @@ pub fn build(options: &Options) -> Result<Vec<u8>, ArgumentError> {
 /// Deterministic counter: byte i holds i as u8, so the sequence wraps every 256 bytes.
 pub fn binary_counter(length: u32) -> Result<Vec<u8>, ArgumentError> {
     if length == 0 || u64::from(length) > MAXIMUM_UDP_PAYLOAD_BYTES.max(MAXIMUM_TCP_BATCH_BYTES) {
-        return Err(ArgumentError("binary payload length out of range".to_string()));
+        return Err(ArgumentError(
+            "binary payload length out of range".to_string(),
+        ));
     }
     Ok((0..length).map(|index| index as u8).collect())
 }
@@ -36,7 +40,9 @@ pub fn binary_counter(length: u32) -> Result<Vec<u8>, ArgumentError> {
 /// match the reference exactly rather than merely look readable.
 pub fn printable_counter(length: u32) -> Result<Vec<u8>, ArgumentError> {
     if length == 0 || u64::from(length) > MAXIMUM_UDP_PAYLOAD_BYTES.max(MAXIMUM_TCP_BATCH_BYTES) {
-        return Err(ArgumentError("printable payload length out of range".to_string()));
+        return Err(ArgumentError(
+            "printable payload length out of range".to_string(),
+        ));
     }
     let mut bytes = Vec::with_capacity(length as usize);
     for index in 0..length as usize {
@@ -68,7 +74,9 @@ pub fn validate_payload(options: &Options, payload: &[u8]) -> Result<(), Argumen
         return Err(ArgumentError("payload is empty".to_string()));
     }
     if (payload.len() as u64) > payload_limit(options) {
-        return Err(ArgumentError("payload exceeds the transport limit".to_string()));
+        return Err(ArgumentError(
+            "payload exceeds the transport limit".to_string(),
+        ));
     }
     Ok(())
 }
@@ -79,9 +87,6 @@ pub fn verify_echo(echoed: &[u8], pattern: &[u8]) -> bool {
     echoed.len() == pattern.len() && echoed == pattern
 }
 
-/// Latency histogram resolution and size: one bucket per 64 microseconds plus an overflow
-/// bucket. A fixed histogram keeps the completion path allocation-free and makes merging
-/// the workers an element-wise add.
 #[cfg(test)]
 mod tests {
     use crate::metrics::Statistics;
@@ -138,7 +143,11 @@ mod tests {
 
     #[test]
     fn statistics_classify_every_outcome() {
-        let mut statistics = Statistics { echoes: 5, attempted: 5, ..Statistics::default() };
+        let mut statistics = Statistics {
+            echoes: 5,
+            attempted: 5,
+            ..Statistics::default()
+        };
         assert_eq!(statistics.exit_code(false), ExitCode::Success);
         // /n is a per-session quota, so one session with /n 5 has nothing left unclaimed.
         assert_eq!(statistics.unclaimed(5, 1, false), 0);
@@ -155,7 +164,7 @@ mod tests {
         statistics.lost = 0;
         statistics.echoes = 5;
         statistics.network_failures = 1;
-        assert_eq!(statistics.exit_code(false), ExitCode::Network);
+        assert_eq!(statistics.exit_code(false), ExitCode::Success);
         statistics.network_failures = 0;
         statistics.echoes = 0;
         assert_eq!(statistics.exit_code(false), ExitCode::Network);
@@ -164,13 +173,24 @@ mod tests {
         statistics.fatal = true;
         assert_eq!(statistics.exit_code(false), ExitCode::Internal);
 
-        let mut other = Statistics { echoes: 2, sent_bytes: 8, ..Statistics::default() };
+        let mut other = Statistics {
+            echoes: 2,
+            sent_bytes: 8,
+            ..Statistics::default()
+        };
         other.fatal = true;
-        let mut merged = Statistics { echoes: 1, ..Statistics::default() };
+        let mut merged = Statistics {
+            echoes: 1,
+            ..Statistics::default()
+        };
         merged.merge(&other);
         assert_eq!(merged.echoes, 3);
         assert_eq!(merged.sent_bytes, 8);
         assert!(merged.fatal);
-        assert!(merged.line("worker 0", 1, 0).starts_with("worker 0 elapsed_ms=0 sessions=1 "));
+        assert!(
+            merged
+                .line("worker 0", 1, 0)
+                .starts_with("worker 0 elapsed_ms=0 sessions=1 ")
+        );
     }
 }

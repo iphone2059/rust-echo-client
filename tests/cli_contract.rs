@@ -13,9 +13,15 @@ fn help_exits_zero_and_lists_the_contract() {
         let output = client().arg(switch).output().expect("run client");
         assert!(output.status.success(), "{switch} must succeed");
         let text = String::from_utf8_lossy(&output.stdout);
-        assert!(text.contains("Usage: rust-echo-client"), "{switch} must print usage");
+        assert!(
+            text.contains("Usage: rust-echo-client"),
+            "{switch} must print usage"
+        );
         assert!(text.contains("/p tcp|udp"), "{switch} must document /p");
-        assert!(text.contains("always RIO"), "{switch} must state the RIO contract");
+        assert!(
+            text.contains("always RIO"),
+            "{switch} must state the RIO contract"
+        );
     }
 }
 
@@ -25,7 +31,11 @@ fn the_help_switch_does_not_mask_a_malformed_command_line() {
         .args(["/h", "/p", "sctp"])
         .output()
         .expect("run client");
-    assert_eq!(output.status.code(), Some(1), "a bad protocol is still a usage error");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a bad protocol is still a usage error"
+    );
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(text.contains("Invalid arguments"));
 }
@@ -55,7 +65,19 @@ fn the_udp_path_runs_the_datagram_engine() {
     // Port 1 has no listener; the datagram path must still start the engine and report a
     // transport outcome instead of being refused as an unknown mode.
     let output = client()
-        .args(["127.0.0.1", "/p", "udp", "/r", "1", "/n", "1", "/t", "1", "/c", "1"])
+        .args([
+            "127.0.0.1",
+            "/p",
+            "udp",
+            "/r",
+            "1",
+            "/n",
+            "1",
+            "/t",
+            "1",
+            "/c",
+            "1",
+        ])
         .output()
         .expect("run client");
     assert!(
@@ -72,7 +94,19 @@ fn a_connection_to_a_closed_port_reports_a_transport_failure() {
     // Port 1 has no listener in a normal session, so the connect is refused; the run must
     // end with the network/echo class rather than hanging or claiming success.
     let output = client()
-        .args(["127.0.0.1", "/p", "tcp", "/r", "1", "/n", "1", "/t", "1", "/c", "1"])
+        .args([
+            "127.0.0.1",
+            "/p",
+            "tcp",
+            "/r",
+            "1",
+            "/n",
+            "1",
+            "/t",
+            "1",
+            "/c",
+            "1",
+        ])
         .output()
         .expect("run client");
     assert!(
@@ -80,4 +114,44 @@ fn a_connection_to_a_closed_port_reports_a_transport_failure() {
         "unexpected exit code {:?}",
         output.status.code()
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn invalid_utf16_arguments_are_usage_errors_instead_of_panics() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let output = client()
+        .arg(OsString::from_wide(&[0xd800]))
+        .output()
+        .expect("run client");
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(text.starts_with("Invalid arguments: invalid-utf16"));
+    let output = client()
+        .arg("/unknown")
+        .arg(OsString::from_wide(&[0xd800]))
+        .output()
+        .expect("run client");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).starts_with("Invalid arguments: unknown-switch")
+    );
+    for (switch, expected) in [
+        ("/p", "out-of-range"),
+        ("/n", "invalid-number"),
+        ("/d", "invalid-utf16"),
+    ] {
+        let output = client()
+            .args(["/h", switch])
+            .arg(OsString::from_wide(&[0xd800]))
+            .output()
+            .expect("run client");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .starts_with(&format!("Invalid arguments: {expected}"))
+        );
+    }
 }

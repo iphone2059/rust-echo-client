@@ -109,10 +109,11 @@ pub fn resolved_worker_count(worker_count: u32, processors: u32) -> u32 {
     processors.clamp(1, AUTOMATIC_WORKER_CAP)
 }
 
-/// Active processors. The reference asks GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); this asks the
-/// standard library, which is affinity-aware, so the two can differ on a machine that pins threads.
+/// Active processors across all processor groups, matching the Windows reference.
 pub fn available_processors() -> u32 {
-    std::thread::available_parallelism()
-        .map(|count| count.get() as u32)
-        .unwrap_or(1)
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn GetActiveProcessorCount(group_number: u16) -> u32;
+    }
+    unsafe { GetActiveProcessorCount(u16::MAX) }
 }
