@@ -300,15 +300,20 @@ pub mod scheduler {
         /// The first attempt of this transport generation is immediate. `/i` spaces only later
         /// cycles, matching the baseline behaviour.
         started: bool,
+        /// Echo units this session claimed and then settled as lost or corrupted. The ledger is
+        /// `requested = echoes + settled + inflight`, which is what lets a reconnect keep the
+        /// quota a failed attempt already spent instead of handing it back.
+        settled: u32,
     }
 
     impl Flow {
-        /// Starts a fresh transport generation without rewinding the lifetime business counter.
-        /// `Session::echoes` is cumulative across reconnects, so requested must restart at the
-        /// same verified baseline rather than at zero.
-        fn at_verified(verified: u64) -> Self {
+        /// Starts a fresh transport generation without rewinding the ledger. The claimed units of
+        /// a failed attempt stay claimed and settled, exactly as the reference spends the quota
+        /// when it begins an attempt, so a reconnect only claims what the run has left.
+        fn after_failure(previous: &Flow) -> Self {
             Self {
-                requested: verified,
+                requested: previous.requested,
+                settled: previous.settled,
                 ..Self::default()
             }
         }
@@ -402,11 +407,14 @@ pub mod scheduler {
             delta.min(u64::from(maximum)) as u32
         }
 
+        /// Units this session claimed that are neither verified nor already settled as lost or
+        /// corrupted. Subtracting the settled units is what keeps the pipeline bound and the loss
+        /// accounting correct across a reconnect.
         fn inflight_echoes(&self, slot: usize) -> Option<u64> {
-            self.flows
-                .get(slot)?
-                .requested
-                .checked_sub(self.sessions.get(slot)?.echoes)
+            let flow = self.flows.get(slot)?;
+            flow.requested
+                .checked_sub(self.sessions.get(slot)?.echoes)?
+                .checked_sub(u64::from(flow.settled))
         }
 
         fn arm(&mut self, index: u32) {
@@ -591,7 +599,7 @@ pub mod scheduler {
                 return Vec::new();
             }
             self.statistics.connections = self.statistics.connections.saturating_add(1);
-            self.flows[slot] = Flow::at_verified(self.sessions[slot].echoes);
+            self.flows[slot] = Flow::after_failure(&self.flows[slot]);
             self.top_up(index, now)
         }
 
@@ -753,17 +761,10 @@ pub mod scheduler {
             }
             crate::worker::trace::event_args("RECV_CORRUPT", format_args!("session={index}"));
             // Integrity is judged per attempt: a corrupted batch is as many corrupted echoes as the
-            // batch carried, which is how the reference counts it.
+            // batch carried, which is how the reference counts it. That attempt is accounted for,
+            // so it must not also be counted as lost: one attempt has one terminal classification.
             let units = u64::from(self.flows[slot].batch_units.max(1));
             self.statistics.corrupted = self.statistics.corrupted.saturating_add(units);
-            let lost = match self.inflight_echoes(slot) {
-                Some(inflight) => inflight.max(1),
-                None => {
-                    self.statistics.fatal = true;
-                    1
-                }
-            };
-            self.statistics.lost = self.statistics.lost.saturating_add(lost);
             self.flows[slot] = Flow::default();
             self.sessions[slot].fail_permanently();
             self.heap.remove(index);
@@ -795,7 +796,8 @@ pub mod scheduler {
                 }
             };
             self.statistics.lost = self.statistics.lost.saturating_add(lost);
-            self.flows[slot] = Flow::at_verified(self.sessions[slot].echoes);
+            self.flows[slot].settled = self.flows[slot].settled.saturating_add(lost.min(u64::from(u32::MAX)) as u32);
+            self.flows[slot] = Flow::after_failure(&self.flows[slot]);
             self.heap.remove(index);
             if self.sessions[slot].begin_closing() {
                 // Cancellation completion is normally prompt, but never let a broken provider
@@ -1001,9 +1003,10 @@ pub mod scheduler {
             let close = scheduler.on_corrupted_receive(0);
             assert_eq!(close, vec![Step::Close(0)]);
             assert_eq!(scheduler.sessions[0].state, SessionState::Failed);
-            // Integrity is counted per attempt: this attempt carried two echo units.
+            // Integrity is counted per attempt: this attempt carried two echo units, and it is
+            // settled as corrupted alone. Counting it lost as well would settle one attempt twice.
             assert_eq!(scheduler.statistics.corrupted, 2);
-            assert!(scheduler.statistics.lost >= 1);
+            assert_eq!(scheduler.statistics.lost, 0);
             assert_eq!(scheduler.statistics.reconnects, 0);
         }
 
