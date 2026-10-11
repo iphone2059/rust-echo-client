@@ -2,7 +2,12 @@ param(
     [string] $Filter = '',
     [int] $SoakSeconds = 10,
     [int] $PerfSeconds = 5,
-    [int] $PortBase = 26000
+    [int] $PortBase = 26000,
+    [string] $ExecutablePath = '',
+    [string] $PeerPath = '',
+    [ValidateSet('Release', 'Debug')] [string] $Configuration = 'Release',
+    [string] $ArtifactDirectory = '',
+    [switch] $GateSelfTest
 )
 
 Set-StrictMode -Version Latest
@@ -19,18 +24,20 @@ if ($Project -notmatch $ProjectPattern) {
 $Implementation = $Matches[1]
 $Component      = $Matches[2]
 $PeerKind       = if ($Component -eq 'client') { 'server' } else { 'client' }
-$ResultsDir = Join-Path $PSScriptRoot 'results'
+$ResultsDir = if ($ArtifactDirectory) { [System.IO.Path]::GetFullPath($ArtifactDirectory) } else { Join-Path $PSScriptRoot 'results' }
 $ArchiveDir = Join-Path $ResultsDir 'archive'
 New-Item -ItemType Directory -Force -Path $ArchiveDir | Out-Null
+$CaseDir = Join-Path $ResultsDir 'cases'
+New-Item -ItemType Directory -Force -Path $CaseDir | Out-Null
 
 $ExecutableFile = Join-Path $PSScriptRoot 'executable.txt'
 $PeerFile       = Join-Path $PSScriptRoot ("peer-" + $PeerKind + ".txt")
 $FeaturesFile   = Join-Path $PSScriptRoot 'features.txt'
 
-if (-not (Test-Path -LiteralPath $ExecutableFile -PathType Leaf)) { throw "executable.txt is missing: $ExecutableFile" }
-if (-not (Test-Path -LiteralPath $PeerFile -PathType Leaf)) { throw "$PeerKind file is missing: $PeerFile" }
-$Executable = (Join-Path $PSScriptRoot ((Get-Content -LiteralPath $ExecutableFile -Raw).Trim()))
-$Peer       = (Join-Path $PSScriptRoot ((Get-Content -LiteralPath $PeerFile -Raw).Trim()))
+if (-not $ExecutablePath -and -not (Test-Path -LiteralPath $ExecutableFile -PathType Leaf)) { throw "executable.txt is missing: $ExecutableFile" }
+if (-not $PeerPath -and -not (Test-Path -LiteralPath $PeerFile -PathType Leaf)) { throw "$PeerKind file is missing: $PeerFile" }
+$Executable = if ($ExecutablePath) { [System.IO.Path]::GetFullPath($ExecutablePath) } else { [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ((Get-Content -LiteralPath $ExecutableFile -Raw).Trim()))) }
+$Peer = if ($PeerPath) { [System.IO.Path]::GetFullPath($PeerPath) } else { [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ((Get-Content -LiteralPath $PeerFile -Raw).Trim()))) }
 $Features   = @()
 if (Test-Path -LiteralPath $FeaturesFile -PathType Leaf) {
     $Features = @(Get-Content -LiteralPath $FeaturesFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
@@ -54,15 +61,26 @@ if ($ContractVersion -ne 'echo-binary-contract-v1') {
     throw "contract-version.txt does not declare echo-binary-contract-v1"
 }
 
-$Columns = @('timestamp','project','implementation','component','git_head','git_dirty','executable','build_type',
+$Columns = @('timestamp','project','implementation','component','git_head','git_dirty','executable','peer_executable','build_type',
     'test_id','category','protocol','result','exit_code','expected_exit_code','duration_ms','sessions','workers',
     'payload_bytes','pipeline_depth','echoed','attempted','pending','corrupted','lost','cancelled','connections',
     'reconnects','network_errors','echo_per_sec','mib_per_sec','p50_us','p99_us','p999_us','notify_arms',
-    'notify_deliveries','notify_gap','notify_timeouts','stdout_valid','stderr_empty','message')
+    'notify_deliveries','notify_gap','notify_timeouts','stdout_valid','stderr_empty','peer_exit_code',
+    'peer_stdout_valid','peer_stderr_empty','artifact_directory','message')
 $Rows = [System.Collections.Generic.List[object]]::new()
 $Script:Port = $PortBase
 
 function Get-NextPort { $Script:Port = $Script:Port + 1; return $Script:Port }
+
+function Test-CaseSelected {
+    param([string] $TestId)
+    if (-not $Filter) { return $true }
+    foreach ($pattern in ($Filter -split ',')) {
+        $pattern = $pattern.Trim()
+        if ($pattern -and $TestId -like $pattern) { return $true }
+    }
+    return $false
+}
 
 function Save-Results {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -93,54 +111,168 @@ function Add-Row {
     $row['git_head']         = $GitHead
     $row['git_dirty']        = $GitDirty
     $row['executable']       = $Executable
-    $row['build_type']       = 'release'
+    $row['peer_executable']  = $Peer
+    $row['build_type']       = $Configuration.ToLowerInvariant()
     foreach ($key in $Values.Keys) { if ($row.Contains($key)) { $row[$key] = $Values[$key] } }
     $Rows.Add([pscustomobject]$row)
     Write-Host ("{0,-8} {1,-16} {2}" -f $row['result'], $row['test_id'], $row['message'])
 }
 
 function Convert-FinalLine {
-    param([string] $Text)
-    $fields = @{}
-    $final = @($Text -split "\r?\n" | Where-Object { $_ -match '^final ' } | Select-Object -Last 1)
-    if ($final.Count -eq 0) { return $fields }
-    foreach ($match in [regex]::Matches($final[0], '([A-Za-z_0-9]+)[=~]([0-9]+(?:\.[0-9]+)?)')) {
-        $fields[$match.Groups[1].Value] = $match.Groups[2].Value
+    param([string] $Text, [string] $Role, [bool] $Quiet = $true)
+    $fields = @{ _error = '' }
+    $outputLines = @($Text -split "\r?\n" | Where-Object { $_.Trim() -ne '' })
+    $lines = @($outputLines | Where-Object { $_ -match '^\s*final(?:\s|$)' })
+    if ($lines.Count -ne 1) { $fields._error = "expected exactly one final line, saw $($lines.Count)"; return $fields }
+    $integer = '(?:0|[1-9][0-9]*)'
+    $decimal = '(?:0|[1-9][0-9]*)\.[0-9]{2}'
+    if ($Role -eq 'client') {
+        $schema = [ordered]@{ elapsed_ms=$integer; sessions=$integer; active=$integer; attempted=$integer;
+            pending=$integer; echoed=$integer; corrupted=$integer; lost=$integer; cancelled=$integer;
+            sent_bytes=$integer; received_bytes=$integer; bytes=$integer; connections=$integer;
+            reconnects=$integer; network_errors=$integer; echo_per_sec=$decimal; MiB_per_sec=$decimal;
+            p50_us=$integer; p99_us=$integer; p999_us=$integer; mean_us=$integer; max_us=$integer;
+            latency_sample='batch' }
+    } else {
+        $schema = [ordered]@{ protocol='(?:tcp|udp)'; elapsed_ms=$integer; workers=$integer;
+            accepted=$integer; active=$integer; outstanding=$integer; completions=$integer;
+            receives=$integer; sends=$integer; received_bytes=$integer; sent_bytes=$integer;
+            bytes=$integer; network_errors=$integer; rejected=$integer; MiB_per_sec=$decimal }
+    }
+    $parts = foreach ($key in $schema.Keys) {
+        $separator = if ($key -in @('p50_us','p99_us','p999_us','max_us')) { '~' } else { '=' }
+        '(?<' + $key + '>' + [regex]::Escape($key) + $separator + $schema[$key] + ')'
+    }
+    $match = [regex]::Match($lines[0], '^final ' + ($parts -join ' ') + '$')
+    if (-not $match.Success) { $fields._error = 'final schema, field order, type or separator differs'; return $fields }
+    foreach ($line in $outputLines) {
+        if ($line -ceq $lines[0]) { continue }
+        if ($Quiet -or $Role -ne 'client' -or $line -notmatch '^report ') {
+            $fields._error = 'unexpected stdout line'; return $fields
+        }
+        $report = [regex]::Match($line, '^report ' + ($parts -join ' ') + '$')
+        if (-not $report.Success) { $fields._error = 'report schema, field order, type or separator differs'; return $fields }
+        foreach ($key in $schema.Keys) {
+            if ($schema[$key] -ne $integer) { continue }
+            $value = $report.Groups[$key].Value -replace ('^' + [regex]::Escape($key) + '[=~]'), ''
+            $parsed = [uint64]0
+            if (-not [uint64]::TryParse($value, [ref]$parsed)) { $fields._error = "report $key exceeds uint64"; return $fields }
+        }
+    }
+    foreach ($key in $schema.Keys) {
+        $value = $match.Groups[$key].Value -replace ('^' + [regex]::Escape($key) + '[=~]'), ''
+        if ($schema[$key] -eq $integer) {
+            $parsed = [uint64]0
+            if (-not [uint64]::TryParse($value, [ref]$parsed)) { $fields._error = "final $key exceeds uint64"; return $fields }
+        }
+        $fields[$key] = $value
+    }
+    if ($Role -eq 'client') {
+        if ($fields.active -ne '0' -or $fields.pending -ne '0') { $fields._error = 'client terminal active or pending is nonzero' }
+        $total = [System.Numerics.BigInteger]::Parse($fields.echoed) + [System.Numerics.BigInteger]::Parse($fields.corrupted) +
+            [System.Numerics.BigInteger]::Parse($fields.lost) + [System.Numerics.BigInteger]::Parse($fields.cancelled)
+        if ($total -ne [System.Numerics.BigInteger]::Parse($fields.attempted)) { $fields._error = 'client attempted does not equal terminal outcomes' }
+    } elseif ($fields.active -ne '0' -or $fields.outstanding -ne '0') {
+        $fields._error = 'server terminal active or outstanding is nonzero'
     }
     return $fields
 }
 
-function Convert-Diagnostics {
-    param([string] $Path)
-    $totals = @{ arms = ''; deliveries = ''; gap = ''; timeouts = '' }
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $totals }
-    $arms = 0; $deliveries = 0; $gap = 0; $timeouts = 0; $seen = $false
-    foreach ($line in (Get-Content -LiteralPath $Path)) {
-        if ($line -notmatch 'notify_arms=(\d+) notify_deliveries=(\d+) notify_gap=(\d+) timeout_wakeups_while_outstanding=(\d+)') { continue }
-        $seen = $true
-        $arms = $arms + [int64]$Matches[1]; $deliveries = $deliveries + [int64]$Matches[2]
-        $gap = $gap + [int64]$Matches[3]; $timeouts = $timeouts + [int64]$Matches[4]
-        if ([int64]$Matches[2] -gt [int64]$Matches[1]) { throw 'diagnostics: deliveries exceed arms' }
-        if (([int64]$Matches[1] - [int64]$Matches[2]) -gt 1) { throw 'diagnostics: more than one notification in flight' }
-        if ([int64]$Matches[3] -ne ([int64]$Matches[1] - [int64]$Matches[2])) { throw 'diagnostics: gap disagrees with the counters' }
-        if ([int64]$Matches[4] -ne 0) { throw 'diagnostics: starvation wakeups detected' }
+function Get-WorkerCount {
+    param([string] $Role, [string] $Protocol, [string[]] $Arguments)
+    $requested = 0; $sessions = 1
+    for ($i = 0; $i -lt $Arguments.Count - 1; $i++) {
+        if ($Arguments[$i] -eq '/threads') { $requested = [int]$Arguments[$i + 1] }
+        if ($Arguments[$i] -eq '/c') { $sessions = [int]$Arguments[$i + 1] }
     }
-    if (-not $seen) { return $totals }
-    Write-Host ('  diagnostics ' + $Path + ' -> arms=' + $arms + ' deliveries=' + $deliveries)
-    return @{ arms = $arms; deliveries = $deliveries; gap = $gap; timeouts = $timeouts }
+    if ($Role -eq 'server' -and $Protocol -eq 'udp') { return 1 }
+    if ($requested -eq 0) {
+        if (-not ('EchoVerification.Processors' -as [type])) {
+            Add-Type -TypeDefinition 'namespace EchoVerification { public static class Processors { [System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern uint GetActiveProcessorCount(ushort groupNumber); } }'
+        }
+        $requested = [int][Math]::Min([EchoVerification.Processors]::GetActiveProcessorCount([uint16]65535), 64)
+        if ($requested -lt 1) { $requested = 1 }
+    }
+    if ($Role -eq 'client') { return [Math]::Min($requested, $sessions) }
+    return $requested
 }
 
-function Get-FreePort {
-    $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
-    $probe.Start()
-    $value = $probe.LocalEndpoint.Port
-    $probe.Stop()
-    return $value
+function Convert-Diagnostics {
+    param([string] $Path, [string] $Role, [string] $Protocol, [int] $ExpectedWorkers)
+    $totals = @{ arms = ''; deliveries = ''; gap = ''; timeouts = '' }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "diagnostics missing: $Path" }
+    $lines = @(Get-Content -LiteralPath $Path)
+    if ($lines.Count -ne $ExpectedWorkers) { throw "diagnostics: expected $ExpectedWorkers worker lines, saw $($lines.Count)" }
+    $workers = [System.Collections.Generic.HashSet[int]]::new()
+    $arms = [System.Numerics.BigInteger]::Zero; $deliveries = $arms; $gap = $arms; $timeouts = $arms
+    $pattern = '^role=' + $Role + ' protocol=' + $Protocol + ' worker=([0-9]+) notify_arms=([0-9]+) notify_deliveries=([0-9]+) notify_gap=([0-9]+) timeout_wakeups_while_outstanding=([0-9]+)$'
+    foreach ($line in $lines) {
+        $match = [regex]::Match($line, $pattern)
+        if (-not $match.Success) { throw "diagnostics: malformed line: $line" }
+        $worker = 0
+        if (-not [int]::TryParse($match.Groups[1].Value, [ref]$worker) -or $worker -ge $ExpectedWorkers -or -not $workers.Add($worker)) {
+            throw 'diagnostics: duplicate or invalid worker index'
+        }
+        $values = @()
+        for ($i = 2; $i -le 5; $i++) {
+            $parsed = [uint64]0
+            if (-not [uint64]::TryParse($match.Groups[$i].Value, [ref]$parsed)) { throw 'diagnostics: counter exceeds uint64' }
+            $values += [System.Numerics.BigInteger]$parsed
+        }
+        $difference = $values[0] - $values[1]
+        if ($difference -lt 0 -or $difference -gt 1 -or
+            $values[2] -ne ($values[0] - $values[1]) -or $values[3] -ne 0) {
+            throw 'diagnostics: notification accounting or timeout wakeups invalid'
+        }
+        $arms += $values[0]; $deliveries += $values[1]; $gap += $values[2]; $timeouts += $values[3]
+    }
+    return @{ arms = [string]$arms; deliveries = [string]$deliveries; gap = [string]$gap; timeouts = [string]$timeouts }
 }
 
-function Test-Feature {
-    param([string] $Name)
-    return $Features -contains $Name
+function Test-ExpectedPattern {
+    param([string] $Text, [string] $Pattern)
+    if (-not $Pattern) { return $true }
+    $bounded = [regex]::Replace($Pattern, '[0-9]+', '${0}(?![0-9])')
+    $bounded = [regex]::Replace($bounded, '([A-Za-z_][A-Za-z_0-9]*)([=~])', '(?<![A-Za-z0-9_])${1}${2}')
+    return [regex]::IsMatch($Text, $bounded)
+}
+
+function Invoke-GateSelfTest {
+    $clientLine = 'final elapsed_ms=1 sessions=1 active=0 attempted=1 pending=0 echoed=1 corrupted=0 lost=0 cancelled=0 sent_bytes=1 received_bytes=1 bytes=1 connections=1 reconnects=0 network_errors=0 echo_per_sec=1.00 MiB_per_sec=0.00 p50_us~1 p99_us~1 p999_us~1 mean_us=1 max_us~1 latency_sample=batch'
+    $serverLine = 'final protocol=tcp elapsed_ms=1 workers=1 accepted=1 active=0 outstanding=0 completions=2 receives=1 sends=1 received_bytes=1 sent_bytes=1 bytes=1 network_errors=0 rejected=0 MiB_per_sec=0.00'
+    if ((Convert-FinalLine -Text $clientLine -Role 'client')._error -or (Convert-FinalLine -Text $serverLine -Role 'server')._error) { throw 'gate self-test: valid final rejected' }
+    $reportLine = ($clientLine -replace '^final ', 'report ' -replace 'active=0 ', 'active=1 ' -replace 'attempted=1 ', 'attempted=2 ' -replace 'pending=0 ', 'pending=1 ')
+    if ((Convert-FinalLine -Text ($reportLine + "`n" + $clientLine) -Role 'client' -Quiet:$false)._error) { throw 'gate self-test: valid periodic report rejected' }
+    foreach ($invalid in @(
+        ($clientLine + "`n" + $clientLine),
+        ($clientLine + "`nextra output"),
+        ("extra output`n" + $clientLine),
+        ($clientLine -replace 'echoed=1 ', 'echoed=2 '),
+        ($clientLine -replace 'pending=0 ', 'pending=1 '),
+        ($clientLine -replace 'p50_us~1 ', 'p50_us=1 '),
+        ($clientLine + ' extra=1'),
+        ($clientLine -replace 'attempted=1 ', 'attempted=18446744073709551616 ')
+    )) { if (-not (Convert-FinalLine -Text $invalid -Role 'client')._error) { throw 'gate self-test: invalid client final accepted' } }
+    if (-not (Convert-FinalLine -Text ($reportLine + "`n" + $clientLine) -Role 'client' -Quiet:$true)._error) { throw 'gate self-test: quiet report accepted' }
+    if (-not (Convert-FinalLine -Text (($reportLine -replace 'active=1 ', 'active=x ') + "`n" + $clientLine) -Role 'client' -Quiet:$false)._error) { throw 'gate self-test: malformed report accepted' }
+    if (-not (Convert-FinalLine -Text ($serverLine -replace 'outstanding=0 ', 'outstanding=1 ') -Role 'server')._error) { throw 'gate self-test: outstanding server accepted' }
+    if (Test-ExpectedPattern -Text ($clientLine -replace 'echoed=1 ', 'echoed=100 ') -Pattern 'echoed=1') { throw 'gate self-test: integer prefix matched' }
+    $path = Join-Path $CaseDir ('gate-selftest-' + [Guid]::NewGuid().ToString('N') + '.diag')
+    try {
+        Set-Content -LiteralPath $path -Value 'role=client protocol=tcp worker=0 notify_arms=2 notify_deliveries=1 notify_gap=1 timeout_wakeups_while_outstanding=0'
+        [void](Convert-Diagnostics -Path $path -Role 'client' -Protocol 'tcp' -ExpectedWorkers 1)
+        foreach ($bad in @(
+            'role=client protocol=tcp worker=0 notify_arms=2 notify_deliveries=0 notify_gap=2 timeout_wakeups_while_outstanding=0',
+            'role=client protocol=tcp worker=0 notify_arms=2 notify_deliveries=1 notify_gap=0 timeout_wakeups_while_outstanding=0',
+            'role=client protocol=tcp worker=0 notify_arms=2 notify_deliveries=1 notify_gap=1 timeout_wakeups_while_outstanding=1'
+        )) {
+            Set-Content -LiteralPath $path -Value $bad
+            $rejected = $false
+            try { [void](Convert-Diagnostics -Path $path -Role 'client' -Protocol 'tcp' -ExpectedWorkers 1) } catch { $rejected = $true }
+            if (-not $rejected) { throw 'gate self-test: invalid diagnostics accepted' }
+        }
+    } finally { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    Write-Host 'gate parser self-test passed'
 }
 
 function Get-FreePort {
@@ -196,16 +328,20 @@ function Invoke-Test {
         [int] $TimeoutMs = 40000,
         [bool] $WithPeer = $true
     )
-    if ($Filter -ne '' -and $TestId -notlike $Filter) { return }
+    if (-not (Test-CaseSelected -TestId $TestId)) { return }
     $port = Get-FreePort
     $tag = [Guid]::NewGuid().ToString('N')
-    $outFile = Join-Path $env:TEMP ("verif-" + $tag + ".out")
-    $errFile = Join-Path $env:TEMP ("verif-" + $tag + ".err")
-    $diagFile = Join-Path $env:TEMP ("verif-" + $tag + ".diag")
-    $peerOut = Join-Path $env:TEMP ("verif-peer-" + $tag + ".out")
-    $peerErr = Join-Path $env:TEMP ("verif-peer-" + $tag + ".err")
+    $casePath = Join-Path $CaseDir ($TestId + '-' + $tag)
+    New-Item -ItemType Directory -Path $casePath | Out-Null
+    $outFile = Join-Path $casePath 'stdout.txt'
+    $errFile = Join-Path $casePath 'stderr.txt'
+    $diagFile = Join-Path $casePath 'diagnostics.txt'
+    $peerOut = Join-Path $casePath 'peer-stdout.txt'
+    $peerErr = Join-Path $casePath 'peer-stderr.txt'
+    $peerDiag = Join-Path $casePath 'peer-diagnostics.txt'
     $arguments = @($Arguments | ForEach-Object { $_ -replace '@PORT@', [string]$port })
-    if ($arguments -notcontains '/w') { $arguments += @('/w', '20') }
+    $runtime = $arguments -contains '/stats'
+    if ($runtime -and $arguments -notcontains '/w') { $arguments += @('/w', '20') }
     $started = Get-Date
     $peerProcess = $null
     $process = $null
@@ -213,27 +349,58 @@ function Invoke-Test {
     $exit = -1
     $stdout = ''
     $stderr = ''
+    $peerDone = -not $WithPeer
+    $peerExit = -1
+    $peerText = ''
+    $peerError = ''
+    $peerMetrics = @{}
+    $peerArgs = @()
     $metrics = @{}
     $notify = @{ arms = ''; deliveries = ''; gap = ''; timeouts = '' }
     $failure = ''
     try {
         if ($WithPeer) {
-            $peerArgs = @('127.0.0.1', '/p', $Protocol, '/r', [string]$port, '/n', '20', '/z', '256', '/q')
-            if ($Component -eq 'client') { $peerArgs = @('/p', $Protocol, '/s', [string]$port, '/q') }
+            $peerArgs = @('127.0.0.1', '/p', $Protocol, '/r', [string]$port, '/n', '20', '/z', '256', '/q', '/stats')
+            if ($Component -eq 'client') {
+                $mainRun = 0
+                for ($i = 0; $i -lt $arguments.Count - 1; $i++) { if ($arguments[$i] -eq '/w') { $mainRun = [int]$arguments[$i + 1] } }
+                $peerSeconds = if ($arguments -contains '/n' -and $mainRun -eq 20) { 5 } else { [Math]::Max(5, $mainRun + 5) }
+                $peerArgs = @('/p', $Protocol, '/s', [string]$port, '/w', [string]$peerSeconds, '/q', '/stats')
+            }
+            if (Test-Feature 'notify-diagnostics') {
+                if ($PeerKind -eq 'client') { $env:CEC_DIAG_FILE = $peerDiag } else { $env:CES_DIAG_FILE = $peerDiag }
+            }
             $peerProcess = Start-Process -FilePath $Peer -ArgumentList $peerArgs -RedirectStandardOutput $peerOut -RedirectStandardError $peerErr -PassThru -NoNewWindow
+            Remove-Item Env:CEC_DIAG_FILE, Env:CES_DIAG_FILE -ErrorAction SilentlyContinue
             Wait-ForServer -Port $port -ForProtocol $Protocol | Out-Null
         }
         if ($Component -eq 'client' -and (Test-Feature 'notify-diagnostics')) { $env:CEC_DIAG_FILE = $diagFile }
         if ($Component -eq 'server' -and (Test-Feature 'notify-diagnostics')) { $env:CES_DIAG_FILE = $diagFile }
         $quoted = @($arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } })
-        $process = Start-Process -FilePath $Executable -ArgumentList $quoted -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -NoNewWindow
+        $startParams = @{ FilePath=$Executable; RedirectStandardOutput=$outFile;
+            RedirectStandardError=$errFile; PassThru=$true; NoNewWindow=$true }
+        if ($quoted.Count -gt 0) { $startParams.ArgumentList = $quoted }
+        $process = Start-Process @startParams
         $finished = $process.WaitForExit($TimeoutMs)
         if ($finished) { $exit = $process.ExitCode } else { $process.Kill($true) | Out-Null }
         $stdout = Read-TextFile -Path $outFile
         $stderr = Read-TextFile -Path $errFile
-        $metrics = Convert-FinalLine -Text $stdout
-        if ($peerProcess) { if (-not $peerProcess.WaitForExit(25000)) { $peerProcess.Kill($true) | Out-Null } }
-        $notify = Convert-Diagnostics -Path $diagFile
+        if ($runtime) { $metrics = Convert-FinalLine -Text $stdout -Role $Component -Quiet:($arguments -contains '/q') }
+        if ($peerProcess) {
+            $peerDone = $peerProcess.WaitForExit(30000)
+            if ($peerDone) { $peerExit = $peerProcess.ExitCode } else { $peerProcess.Kill($true) | Out-Null }
+            $peerText = Read-TextFile -Path $peerOut
+            $peerError = Read-TextFile -Path $peerErr
+            $peerMetrics = Convert-FinalLine -Text $peerText -Role $PeerKind -Quiet:($peerArgs -contains '/q')
+            if (Test-Feature 'notify-diagnostics') {
+                $peerWorkers = Get-WorkerCount -Role $PeerKind -Protocol $Protocol -Arguments $peerArgs
+                [void](Convert-Diagnostics -Path $peerDiag -Role $PeerKind -Protocol $Protocol -ExpectedWorkers $peerWorkers)
+            }
+        }
+        if ($runtime -and (Test-Feature 'notify-diagnostics')) {
+            $workers = Get-WorkerCount -Role $Component -Protocol $Protocol -Arguments $arguments
+            $notify = Convert-Diagnostics -Path $diagFile -Role $Component -Protocol $Protocol -ExpectedWorkers $workers
+        }
     } catch {
         $failure = $_.Exception.Message
     } finally {
@@ -246,12 +413,22 @@ function Invoke-Test {
         if ($failure -ne '') { $message = 'case error: ' + $failure }
         elseif (-not $finished) { $message = 'timeout after ' + $TimeoutMs + ' ms' }
         elseif ($exit -ne $ExpectedExit -and ($AllowExitCodes -notcontains $exit)) { $message = 'exit ' + $exit + ', expected ' + $ExpectedExit }
-        elseif ($exit -ne $ExpectedExit -and ([string]$metrics['corrupted']) -ne '0') { $message = 'tolerated exit ' + $exit + ' but the run reported corrupted echoes' }
-        elseif ($ExpectPattern -ne '' -and (($stdout + [char]10 + $stderr) -notmatch $ExpectPattern)) { $message = 'output does not match ' + $ExpectPattern }
+        elseif ($runtime -and $metrics._error) { $message = $metrics._error }
+        elseif ($runtime -and $Component -eq 'client' -and $metrics.corrupted -ne '0') { $message = 'client reported corrupted echoes' }
+        elseif ($ExpectPattern -ne '' -and -not (Test-ExpectedPattern -Text ($stdout + [char]10 + $stderr) -Pattern $ExpectPattern)) { $message = 'output does not match ' + $ExpectPattern }
         elseif ($ExpectStream -eq 'stderr' -and $stderr.Trim() -eq '') { $message = 'expected the diagnostic on stderr, got none' }
         elseif ($ExpectStream -eq 'stderr' -and $stdout.Trim() -ne '') { $message = 'expected the diagnostic on stderr, got it on stdout' }
         elseif ($ExpectStream -eq 'stdout' -and $stdout.Trim() -eq '') { $message = 'expected the message on stdout, got none' }
-        elseif ($ExpectedExit -eq 0 -and $stderr.Trim() -ne '') { $message = 'stderr: ' + $stderr.Trim() }
+        elseif (-not $runtime -and $ExpectedExit -eq 1 -and ($stderr.Trim() -eq '' -or $stdout.Trim() -ne '')) { $message = 'CLI error must be only on stderr' }
+        elseif ($runtime -and $exit -eq 3 -and $stderr.Trim() -ne '' -and
+            @($stderr.Trim() -split "\r?\n" | Where-Object { $_ -notmatch '^.+ failed: native_error=[0-9]+$' }).Count -gt 0) {
+            $message = 'unexpected stderr for runtime failure'
+        }
+        elseif (($exit -eq 0 -or ($runtime -and $exit -ne 3)) -and $stderr.Trim() -ne '') { $message = 'stderr: ' + $stderr.Trim() }
+        elseif ($WithPeer -and -not $peerDone) { $message = 'peer did not stop' }
+        elseif ($WithPeer -and $peerExit -ne 0) { $message = 'peer exit ' + $peerExit }
+        elseif ($WithPeer -and $peerError.Trim() -ne '') { $message = 'peer stderr: ' + $peerError.Trim() }
+        elseif ($WithPeer -and $peerMetrics._error) { $message = 'peer ' + $peerMetrics._error }
         else { $result = 'PASS'; $message = 'ok' }
         $expectedText = ''
         if ($finished) { $expectedText = [string]$ExpectedExit }
@@ -266,25 +443,33 @@ function Invoke-Test {
             mib_per_sec = $metrics['MiB_per_sec']; p50_us = $metrics['p50_us']; p99_us = $metrics['p99_us']
             p999_us = $metrics['p999_us']; notify_arms = $notify.arms; notify_deliveries = $notify.deliveries
             notify_gap = $notify.gap; notify_timeouts = $notify.timeouts
-            stdout_valid = ($stdout -match 'final ').ToString().ToLower()
+            stdout_valid = ($(if ($runtime) { -not $metrics._error } elseif ($ExpectedExit -eq 1) { $stdout.Trim() -eq '' } else { $stdout -match 'Usage:' })).ToString().ToLower()
             stderr_empty = ($stderr.Trim() -eq '').ToString().ToLower()
-            message = $message
+            peer_exit_code = $peerExit; peer_stdout_valid = ((-not $WithPeer) -or (-not $peerMetrics._error)).ToString().ToLower()
+            peer_stderr_empty = ($peerError.Trim() -eq '').ToString().ToLower()
+            artifact_directory = $casePath; message = $message
         }
-        Remove-Item -LiteralPath $outFile, $errFile, $diagFile, $peerOut, $peerErr -Force -ErrorAction SilentlyContinue
+        [pscustomobject]@{ test_id=$TestId; protocol=$Protocol; configuration=$Configuration;
+            executable=$Executable; peer=$Peer; arguments=$arguments; peer_arguments=$peerArgs;
+            port=$port; exit_code=$exit; peer_exit_code=$peerExit; result=$result } |
+            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $casePath 'run.json') -Encoding utf8
     }
 }
 
 
 function Invoke-StopTest {
     param([string] $TestId, [string] $Category, [string] $Protocol, [string[]] $PeerArguments, [int] $TimeoutMs = 40000)
-    if ($Filter -ne '' -and $TestId -notlike $Filter) { return }
+    if (-not (Test-CaseSelected -TestId $TestId)) { return }
     $port = Get-FreePort
     $tag = [Guid]::NewGuid().ToString('N')
-    $outFile = Join-Path $env:TEMP ("verif-" + $tag + ".out")
-    $errFile = Join-Path $env:TEMP ("verif-" + $tag + ".err")
-    $diagFile = Join-Path $env:TEMP ("verif-" + $tag + ".diag")
-    $peerOut = Join-Path $env:TEMP ("verif-peer-" + $tag + ".out")
-    $peerErr = Join-Path $env:TEMP ("verif-peer-" + $tag + ".err")
+    $casePath = Join-Path $CaseDir ($TestId + '-' + $tag)
+    New-Item -ItemType Directory -Path $casePath | Out-Null
+    $outFile = Join-Path $casePath 'stdout.txt'
+    $errFile = Join-Path $casePath 'stderr.txt'
+    $diagFile = Join-Path $casePath 'diagnostics.txt'
+    $peerOut = Join-Path $casePath 'peer-stdout.txt'
+    $peerErr = Join-Path $casePath 'peer-stderr.txt'
+    $peerDiag = Join-Path $casePath 'peer-diagnostics.txt'
     $started = Get-Date
     $server = $null
     $client = $null
@@ -293,8 +478,12 @@ function Invoke-StopTest {
     $clientDone = $false
     $peerExit = -1
     $peerOk = $false
-    $serverFinalLines = 0
     $serverErr = ''
+    $peerError = ''
+    $peerText = ''
+    $peerMetrics = @{}
+    $serverArgs = @()
+    $arguments = @()
     $metrics = @{}
     $notify = @{ arms = ''; deliveries = ''; gap = ''; timeouts = '' }
     $failure = ''
@@ -307,7 +496,8 @@ function Invoke-StopTest {
         $peerRun = 0
         for ($i = 0; $i -lt $arguments.Count - 1; $i++) { if ($arguments[$i] -eq '/w') { [void][int64]::TryParse($arguments[$i + 1], [ref]$peerRun) } }
         $serverSeconds = [int]([Math]::Max(5, $peerRun + 5))
-        $server = Start-Process -FilePath $Executable -ArgumentList @('/p', $Protocol, '/s', [string]$port, '/w', [string]$serverSeconds, '/q', '/stats') -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -NoNewWindow
+        $serverArgs = @('/p', $Protocol, '/s', [string]$port, '/w', [string]$serverSeconds, '/q', '/stats')
+        $server = Start-Process -FilePath $Executable -ArgumentList $serverArgs -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -NoNewWindow
         Wait-ForServer -Port $port -ForProtocol $Protocol | Out-Null
         # The peer's /n is the quota the case expects it to complete on a reliable transport.
         $quota = 0
@@ -321,23 +511,32 @@ function Invoke-StopTest {
         # leaves one partial echo on the server and none on the peer, and UDP may lose datagrams.
         $strictQuota = ($Protocol -eq 'tcp') -and ($quota -gt 0) -and ($Category -in @('TCP','CAPACITY','ADMISSION','RESET'))
         $quoted = @($arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } })
+        if (Test-Feature 'notify-diagnostics') { $env:CEC_DIAG_FILE = $peerDiag }
         $client = Start-Process -FilePath $Peer -ArgumentList $quoted -RedirectStandardOutput $peerOut -RedirectStandardError $peerErr -PassThru -NoNewWindow
+        Remove-Item Env:CEC_DIAG_FILE -ErrorAction SilentlyContinue
         $clientDone = $client.WaitForExit($TimeoutMs)
-        if ($clientDone) { $peerExit = $client.ExitCode; $peerOk = $true }
+        if ($clientDone) { $peerExit = $client.ExitCode }
         if (-not $clientDone) { $client.Kill($true) | Out-Null }
         $serverDone = $server.WaitForExit(($serverSeconds + 15) * 1000)
         if ($serverDone) { $serverExit = $server.ExitCode } else { $server.Kill($true) | Out-Null }
         $serverErr = Read-TextFile -Path $errFile
-        $peerMetrics = Convert-FinalLine -Text (Read-TextFile -Path $peerOut)
+        $peerText = Read-TextFile -Path $peerOut
+        $peerError = Read-TextFile -Path $peerErr
+        $peerMetrics = Convert-FinalLine -Text $peerText -Role 'client' -Quiet:($arguments -contains '/q')
+        $peerOk = ($peerExit -eq 0 -or ($Protocol -eq 'udp' -and $peerExit -eq 3 -and $peerMetrics.corrupted -eq '0'))
         $serverText = Read-TextFile -Path $outFile
-        $serverFinalLines = @($serverText -split "?
-" | Where-Object { $_ -match '^final ' }).Count
-        $metrics = Convert-FinalLine -Text $serverText
-        $notify = Convert-Diagnostics -Path $diagFile
+        $metrics = Convert-FinalLine -Text $serverText -Role 'server' -Quiet:($serverArgs -contains '/q')
+        if (Test-Feature 'notify-diagnostics') {
+            $serverWorkers = Get-WorkerCount -Role 'server' -Protocol $Protocol -Arguments $serverArgs
+            $notify = Convert-Diagnostics -Path $diagFile -Role 'server' -Protocol $Protocol -ExpectedWorkers $serverWorkers
+            $clientWorkers = Get-WorkerCount -Role 'client' -Protocol $Protocol -Arguments $arguments
+            [void](Convert-Diagnostics -Path $peerDiag -Role 'client' -Protocol $Protocol -ExpectedWorkers $clientWorkers)
+        }
     } catch {
         $failure = $_.Exception.Message
     } finally {
         Remove-Item Env:CES_DIAG_FILE -ErrorAction SilentlyContinue
+        Remove-Item Env:CEC_DIAG_FILE -ErrorAction SilentlyContinue
         if ($server -and -not $server.HasExited) { $server.Kill($true) | Out-Null }
         if ($client -and -not $client.HasExited) { $client.Kill($true) | Out-Null }
         $duration = [int]((Get-Date) - $started).TotalMilliseconds
@@ -347,16 +546,18 @@ function Invoke-StopTest {
         elseif (-not $serverDone) { $message = 'server did not stop' }
         elseif ($serverExit -ne 0) { $message = 'server exit ' + $serverExit }
         elseif ($serverErr.Trim() -ne '') { $message = 'server stderr: ' + $serverErr.Trim() }
+        elseif ($metrics._error) { $message = $metrics._error }
+        elseif ($metrics.protocol -ne $Protocol) { $message = 'server reported wrong protocol' }
+        elseif ($metrics.workers -ne [string](Get-WorkerCount -Role 'server' -Protocol $Protocol -Arguments $serverArgs)) { $message = 'server reported wrong worker count' }
         elseif (-not $clientDone) { $message = 'peer did not stop' }
-        elseif ($Category -ne 'CLI' -and ([int64]($peerMetrics['echoed']) -le 0)) { $message = 'peer reported no echo traffic' }
-        elseif ($Category -ne 'CLI' -and -not $peerOk) { $message = 'peer exit ' + $peerExit }
+        elseif ($peerMetrics._error) { $message = 'peer ' + $peerMetrics._error }
+        elseif ($peerError.Trim() -ne '') { $message = 'peer stderr: ' + $peerError.Trim() }
+        elseif (-not $peerOk) { $message = 'peer exit ' + $peerExit }
+        elseif ([uint64]($peerMetrics['echoed']) -le 0) { $message = 'peer reported no echo traffic' }
         elseif ([int64]($peerMetrics['corrupted']) -gt 0) { $message = 'peer reported corrupted echoes: ' + $peerMetrics['corrupted'] }
         elseif ($Protocol -eq 'tcp' -and [int64]($peerMetrics['lost']) -gt 0) { $message = 'peer reported lost echoes: ' + $peerMetrics['lost'] }
-        elseif ($serverFinalLines -ne 1) { $message = 'expected exactly one final line, saw ' + $serverFinalLines }
         elseif ($strictQuota -and [int64]($peerMetrics['echoed']) -ne $expectedEchoes) { $message = 'peer echoed ' + $peerMetrics['echoed'] + ' of ' + $expectedEchoes + ' (' + $quota + ' per session over ' + $peerSessions + ')' }
         elseif ($strictQuota -and $metrics['bytes'] -ne '' -and $peerMetrics['bytes'] -ne '' -and $metrics['bytes'] -ne $peerMetrics['bytes']) { $message = 'byte accounting differs: server ' + $metrics['bytes'] + ', peer ' + $peerMetrics['bytes'] }
-        elseif ($Protocol -eq 'tcp' -and $metrics['active'] -ne '' -and $metrics['active'] -ne '0') { $message = 'server still reports active=' + $metrics['active'] }
-        elseif ($Protocol -eq 'udp' -and $metrics['outstanding'] -ne '' -and $metrics['outstanding'] -ne '0') { $message = 'server still reports outstanding=' + $metrics['outstanding'] }
         else { $result = 'PASS'; $message = 'ok' }
         Add-Row @{
             test_id = $TestId; category = $Category; protocol = $Protocol; result = $result
@@ -369,13 +570,20 @@ function Invoke-StopTest {
             p50_us = $metrics['p50_us']; p99_us = $metrics['p99_us']; p999_us = $metrics['p999_us']
             notify_arms = $notify.arms; notify_deliveries = $notify.deliveries
             notify_gap = $notify.gap; notify_timeouts = $notify.timeouts
-            stdout_valid = ((Read-TextFile -Path $outFile) -match 'final ').ToString().ToLower()
+            stdout_valid = (-not $metrics._error).ToString().ToLower()
             stderr_empty = ($serverErr.Trim() -eq '').ToString().ToLower()
-            message = $message
+            peer_exit_code = $peerExit; peer_stdout_valid = (-not $peerMetrics._error).ToString().ToLower()
+            peer_stderr_empty = ($peerError.Trim() -eq '').ToString().ToLower()
+            artifact_directory = $casePath; message = $message
         }
-        Remove-Item -LiteralPath $outFile, $errFile, $diagFile, $peerOut, $peerErr -Force -ErrorAction SilentlyContinue
+        [pscustomobject]@{ test_id=$TestId; protocol=$Protocol; configuration=$Configuration;
+            executable=$Executable; peer=$Peer; arguments=$serverArgs; peer_arguments=$arguments;
+            port=$port; exit_code=$serverExit; peer_exit_code=$peerExit; result=$result } |
+            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $casePath 'run.json') -Encoding utf8
     }
 }
+
+if ($GateSelfTest) { Invoke-GateSelfTest; exit 0 }
 
 $PortBase = $PortBase
 $Soak = [string]$SoakSeconds
@@ -473,6 +681,12 @@ if ($Component -eq 'client') {
     Invoke-Test -TestId 'CLI-003' -Category 'CLI' -Protocol 'tcp' -Arguments @('/h', '/b', '1.0') -ExpectedExit 1 -WithPeer $false
     Invoke-Test -TestId 'PARSE-001' -Category 'PARSE' -Protocol 'tcp' -Arguments @('/h', '/p', 'udp', '/t', '1') -ExpectedExit 1 -ExpectPattern 'Invalid arguments: protocol-option' -ExpectStream 'stderr' -WithPeer $false
     Invoke-Test -TestId 'PARSE-002' -Category 'PARSE' -Protocol 'tcp' -Arguments @('/zzz') -ExpectedExit 1 -ExpectPattern 'Invalid arguments: unknown-switch' -ExpectStream 'stderr' -WithPeer $false
+    # The raw UDP arena fits 1,050,416 bytes, but VirtualAlloc rounds it to 1,052,672.
+    # Validation precedes /h; the exact rounded budget must reach Usage.
+    Invoke-Test -TestId 'UDP-MEM-001' -Category 'MEM' -Protocol 'udp' -Arguments @('/h', '/p', 'udp', '/k', '16', '/memory', '1050416') -ExpectedExit 1 -ExpectPattern 'Invalid arguments: memory-capacity' -ExpectStream 'stderr' -WithPeer $false
+    Invoke-Test -TestId 'UDP-MEM-002' -Category 'MEM' -Protocol 'udp' -Arguments @('/h', '/p', 'udp', '/k', '16', '/memory', '1052671') -ExpectedExit 1 -ExpectPattern 'Invalid arguments: memory-capacity' -ExpectStream 'stderr' -WithPeer $false
+    Invoke-Test -TestId 'UDP-MEM-003' -Category 'MEM' -Protocol 'udp' -Arguments @('/h', '/p', 'udp', '/k', '16', '/memory', '1052672') -ExpectedExit 0 -ExpectPattern 'Usage:' -ExpectStream 'stdout' -WithPeer $false
+    Invoke-Test -TestId 'UDP-MEM-004' -Category 'MEM' -Protocol 'udp' -Arguments @('/h', '/p', 'udp', '/k', '4097', '/cq', '16384', '/rio-buffer', '1048176', '/memory', '4294967296') -ExpectedExit 0 -ExpectPattern 'Usage:' -ExpectStream 'stdout' -WithPeer $false
     Invoke-Test -TestId 'ORDER-001' -Category 'ORDER' -Protocol 'tcp' -Arguments @('/h', '/t', '1', '/p', 'udp') -ExpectedExit 1 -ExpectPattern 'Invalid arguments: protocol-option' -ExpectStream 'stderr' -WithPeer $false
     Invoke-Test -TestId 'ORDER-002' -Category 'ORDER' -Protocol 'tcp' -Arguments @('/h', '/k', '4', '/p', 'tcp') -ExpectedExit 1 -ExpectPattern 'Invalid arguments: protocol-option' -ExpectStream 'stderr' -WithPeer $false
     # Missing arguments are part of the contract: the reference reports the missing protocol first and

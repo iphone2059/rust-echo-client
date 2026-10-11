@@ -1,0 +1,228 @@
+{
+  "contract": "echo-binary-contract-v1",
+  "validation_date": "2026-10-11",
+  "repository": "rust-echo-client",
+  "base_head": "3f223d1db75521e09e7a6be35bf069e696c10759",
+  "verified_working_tree_changes": true,
+  "provenance": "Source file hashes identify the validated code before the final commit; final four repository SHAs are in the external archive manifest.",
+  "environment": {
+    "captured_at": "2026-10-11T15:49:39.1796786+08:00",
+    "operating_system": "Microsoft Windows Server 2022 Datacenter",
+    "os_version": "10.0.20348",
+    "build": "20348",
+    "architecture": "64-bit",
+    "rustc": [
+      "rustc 1.101.0-nightly (32dba69d6 2026-10-09)",
+      "binary: rustc",
+      "commit-hash: 32dba69d69c5b10ea89a4042de8d0619f7756203",
+      "commit-date: 2026-10-09",
+      "host: x86_64-pc-windows-msvc",
+      "release: 1.101.0-nightly",
+      "LLVM version: 23.1.3"
+    ],
+    "cargo": "cargo 1.101.0-nightly (29c5daa1a 2026-10-07)",
+    "visual_studio": "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise",
+    "msvc_compiler": "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise\\VC\\Tools\\MSVC\\14.51.36231\\bin\\Hostx64\\x64\\cl.exe",
+    "msvc_version": "19.51.36260.0",
+    "provider_dll": "C:\\Windows\\System32\\mswsock.dll",
+    "provider_version": "10.0.20348.1 (WinBuild.160101.0800)",
+    "provider_sha256": "54ACE887D3ADC9F0A6492FCC1EB80BE892999A1A4EF11030D436BBAC38D2E5BA"
+  },
+  "source_files": [
+    {
+      "path": "Cargo.toml",
+      "sha256": "B2A315C51F62A88C6A0E4A0CD8ECF35A3BD3EE5DD819F91819866EECFFAA0E52"
+    },
+    {
+      "path": "src/contract.rs",
+      "sha256": "0FE8197C0BBB79D4965A0511A63CCF7A5D29705713B7789B9305379755EEE8F1"
+    },
+    {
+      "path": "src/engine.rs",
+      "sha256": "4417C195D18CE7FC49BAE553AF757AE3073FB393D66BF7613177077B84710573"
+    },
+    {
+      "path": "src/internal.rs",
+      "sha256": "F1DD3E348274C2AB7E82A51E25C24E56FE610FE148DFFA2B0472A32EAD5FCF99"
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "3702F1AB9E73B1ED4EA2ADC9EB2E96614CB30F87F16F7EB2E0D806F4D425606F"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "AA4CD55339B1BA314FCC06D72A8CE8677426EA1B754C0E1C9C8E06424DE74947"
+    },
+    {
+      "path": "src/metrics.rs",
+      "sha256": "BA72B98AF687AC772C5DB5742D0EE2EA48231ABF5B73448EC6918BACACFDF671"
+    },
+    {
+      "path": "src/native.rs",
+      "sha256": "26272CB590DDF2BEFA41883295F076CB00E19A10856038EF9DDEB6BC9F580C80"
+    },
+    {
+      "path": "src/payload.rs",
+      "sha256": "15D8F2F475BEA4F1BF98F813A15D227C5D19479921A959B7331E91D4E7EB1EAC"
+    },
+    {
+      "path": "src/types.rs",
+      "sha256": "43DDE3905C1CCE27497D338E4D0CD59C7CD72F022521B5C7AE933E8599049429"
+    },
+    {
+      "path": "tests/cli_contract.rs",
+      "sha256": "1C843D97EBBFC7E9EC5D210C85AA9C58DFBB557FEF57495BC23096423609091F"
+    },
+    {
+      "path": "tests/interop_echo_tests.ps1",
+      "sha256": "F6F80E28E1C2D4AC88ECC9FF6E5EAEB233A30C88703269E038458A1746D2B5A9"
+    },
+    {
+      "path": "tests/transport_contract.rs",
+      "sha256": "8C29F8C6B29B82B211F79B9709D7E6A8D09C739D9625B3A7A6BADA20C672C008"
+    },
+    {
+      "path": "tools/verification/contract-version.txt",
+      "sha256": "C8DE57B588CAEBD8BB43D5B82F19042719ADD2DE5DA09CFB06B9E5956C821FAD"
+    },
+    {
+      "path": "tools/verification/executable.txt",
+      "sha256": "6136B891B5FEE6819D5ADB7384A224C98D179FB606C453A8A7BD6FE32397B846"
+    },
+    {
+      "path": "tools/verification/features.txt",
+      "sha256": "7D26F073907D8151575E9BEADCB51DBD48E956584D979716066F3479825EFC89"
+    },
+    {
+      "path": "tools/verification/peer-server.txt",
+      "sha256": "0115BD7340BECA4C12401D08823FF230BC9B6D4D2B62C4015E7ECBEAC50B787B"
+    },
+    {
+      "path": "tools/verification/results/.gitignore",
+      "sha256": "12BC126C5F9C824602C3DCC816FD57F935CD86D3D9CCC9E6C9C89253FFE2094D"
+    },
+    {
+      "path": "tools/verification/test.ps1",
+      "sha256": "39107313082EF84E5B4DCAC33B31F45E368B1D7EFECC3F7E419981B804136073"
+    }
+  ],
+  "binaries": [
+    {
+      "profile": "Release",
+      "path": "target/release/rust-echo-client.exe",
+      "sha256": "4B8496146F09D320B086519AB3D2FCDF0A8AA206F9D34013343A18F15DC88BA0"
+    },
+    {
+      "profile": "Debug",
+      "path": "target/debug/rust-echo-client.exe",
+      "sha256": "E0EE15760CD09953914015E6770EE689F5B753223D4ADAAA84A19C7FD43C9672"
+    }
+  ],
+  "dependencies": [
+    {
+      "profile": "Release",
+      "windows_rs_sha": "d5b6a1f68f4fdd0c79495954d162901ea90da4f4",
+      "source": "https://github.com/microsoft/windows-rs",
+      "tracks": "default branch, no fixed rev"
+    },
+    {
+      "profile": "Debug",
+      "windows_rs_sha": "d5b6a1f68f4fdd0c79495954d162901ea90da4f4",
+      "source": "https://github.com/microsoft/windows-rs",
+      "tracks": "default branch, no fixed rev"
+    }
+  ],
+  "gates": [
+    "format.ps1 PASS",
+    "build_release.ps1 PASS",
+    "build_debug.ps1 PASS"
+  ],
+  "reset_storm": "Both C++ and Rust servers passed 400 pre-accept RST connections in Release and Debug",
+  "common_suite": {
+    "profile": "Release",
+    "cases": 57,
+    "failed": 0,
+    "csv": "repair-validation-2026-10-11.csv",
+    "sha256": "44E51CB268AA293D107FCF0FFD05E8397865A5707424EC3D65A71944A966F714"
+  },
+  "matrix": [
+    {
+      "client": "cpp",
+      "server": "cpp",
+      "profile": "Release",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "suite-cpp-echo-client-Release",
+      "csv_sha256": "5F4150A1748C394C4FB486D01E05ED6C894C329741E47F23E8DD790A57612B0F"
+    },
+    {
+      "client": "cpp",
+      "server": "rust",
+      "profile": "Release",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-cpp-to-rust-Release",
+      "csv_sha256": "E26B473539AF30B4D5F05DF581A8915340593D141BFD4AC3F54DDDD892B084BC"
+    },
+    {
+      "client": "rust",
+      "server": "cpp",
+      "profile": "Release",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-rust-to-cpp-Release",
+      "csv_sha256": "424CBB229975CB215C21A8079C4AA83C29D62412482E18520C614871958607D0"
+    },
+    {
+      "client": "rust",
+      "server": "rust",
+      "profile": "Release",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "suite-rust-echo-client-Release",
+      "csv_sha256": "44E51CB268AA293D107FCF0FFD05E8397865A5707424EC3D65A71944A966F714"
+    },
+    {
+      "client": "cpp",
+      "server": "cpp",
+      "profile": "Debug",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-cpp-to-cpp-Debug",
+      "csv_sha256": "A638E74D72A6A68E56DB1890C5DDA36DDEA05B8940455C7FC83A5D73C0AD9CBD"
+    },
+    {
+      "client": "cpp",
+      "server": "rust",
+      "profile": "Debug",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-cpp-to-rust-Debug",
+      "csv_sha256": "AACCE809FA463D33FA89B4AA85946F074826AEE787EBEA20DFFE7F683AB2552D"
+    },
+    {
+      "client": "rust",
+      "server": "cpp",
+      "profile": "Debug",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-rust-to-cpp-Debug",
+      "csv_sha256": "25B91DFE51985B4C02AC77004D531D3C77F078F3D05AFCD72D0742034022412F"
+    },
+    {
+      "client": "rust",
+      "server": "rust",
+      "profile": "Debug",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-rust-to-rust-Debug",
+      "csv_sha256": "A7E2550C9FD000150496134573D4F3D222BBFB008CD6A6AE8772CF31A46198A0"
+    }
+  ],
+  "native_fault_limits": "AcceptEx statuses and Rust partial-send/error are injected at native function-table entry points. C++ partial-send regression covers real window arithmetic; normal provider partial-send behavior was not forced.",
+  "retained_differences": [
+    "Compatible historical crate and module names",
+    "Existing abnormal-provider shutdown safety policies",
+    "Vec step queue; no unmeasured performance claim"
+  ]
+}

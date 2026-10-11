@@ -234,6 +234,11 @@ impl RioFunctions {
     pub fn table(&self) -> &RIO_EXTENSION_FUNCTION_TABLE {
         &self.table
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_table(table: RIO_EXTENSION_FUNCTION_TABLE) -> Self {
+        Self { table }
+    }
 }
 
 /// {25A207B9-DDF3-4660-8EE9-76E58C74063E}: the ConnectEx extension identifier.

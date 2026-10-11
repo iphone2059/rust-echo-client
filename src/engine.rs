@@ -1386,6 +1386,10 @@ pub mod transport {
         }
 
         fn connect(&mut self, index: u32) -> Result<(), String> {
+            self.connect_at(index, &mut || {})
+        }
+
+        fn connect_at(&mut self, index: u32, before_post: &mut dyn FnMut()) -> Result<(), String> {
             self.prepare(index)?;
             let slot_index = index as usize;
             let generation = self.generation_of(index)?;
@@ -1395,6 +1399,7 @@ pub mod transport {
                     let slot = &self.sessions[slot_index];
                     (slot.socket()?, slot.target)
                 };
+                before_post();
                 connect_udp(socket, &target).map_err(stage)?;
                 // Keep the transport in Connecting until the synthetic completion is consumed
                 // by the worker and `connected()` performs the same state transition as TCP.
@@ -1420,6 +1425,7 @@ pub mod transport {
                 let socket = slot.socket()?;
                 let target = slot.target;
                 let overlapped = slot.overlapped.as_mut_ptr();
+                before_post();
                 begin_connect(connect_ex, socket, &target, overlapped)
             };
             match result {
@@ -1656,6 +1662,222 @@ pub mod transport {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        use std::cell::RefCell;
+        use windows::Win32::mswsock::{RIO_EXTENSION_FUNCTION_TABLE, RIO_NOTIFICATION_COMPLETION};
+        use windows::Win32::mswsockdef::{RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_RQ};
+
+        #[derive(Default)]
+        struct SendProbe {
+            ranges: Vec<(usize, u32, u32)>,
+            fail_post: Option<usize>,
+        }
+
+        thread_local! {
+            static SEND_PROBE: RefCell<SendProbe> = RefCell::new(SendProbe::default());
+        }
+
+        unsafe extern "system" fn fake_send(
+            _queue: RIO_RQ,
+            buffer: *mut RIO_BUF,
+            _count: u32,
+            _flags: u32,
+            _context: *const c_void,
+        ) -> windows::core::BOOL {
+            let buffer = unsafe { &*buffer };
+            let fail = SEND_PROBE.with(|probe| {
+                let mut probe = probe.borrow_mut();
+                probe
+                    .ranges
+                    .push((buffer.BufferId as usize, buffer.Offset, buffer.Length));
+                probe.fail_post == Some(probe.ranges.len())
+            });
+            if fail {
+                unsafe { windows::Win32::winsock2::WSASetLastError(10_054) };
+            }
+            windows::core::BOOL(i32::from(!fail))
+        }
+
+        unsafe extern "system" fn fake_register(base: *mut i8, _length: u32) -> RIO_BUFFERID {
+            base.cast()
+        }
+
+        unsafe extern "system" fn fake_deregister(_buffer: RIO_BUFFERID) {}
+
+        unsafe extern "system" fn fake_create_cq(
+            _size: u32,
+            _notification: *mut RIO_NOTIFICATION_COMPLETION,
+        ) -> RIO_CQ {
+            core::ptr::NonNull::dangling().as_ptr()
+        }
+
+        unsafe extern "system" fn fake_close_cq(_queue: RIO_CQ) {}
+
+        unsafe extern "system" fn fake_notify(_queue: RIO_CQ) -> i32 {
+            0
+        }
+
+        unsafe extern "system" fn fake_create_rq(
+            _socket: SOCKET,
+            _receives: u32,
+            _receive_buffers: u32,
+            _sends: u32,
+            _send_buffers: u32,
+            _receive_cq: RIO_CQ,
+            _send_cq: RIO_CQ,
+            _context: *const c_void,
+        ) -> RIO_RQ {
+            core::ptr::NonNull::dangling().as_ptr()
+        }
+
+        /// Inject only the provider boundary: exercise the production arena views, send posting,
+        /// completion retirement, continuation and slot ownership with deterministic native results.
+        fn send_transport(fail_post: Option<usize>) -> RioTransport {
+            SEND_PROBE.with(|probe| {
+                *probe.borrow_mut() = SendProbe {
+                    fail_post,
+                    ..SendProbe::default()
+                }
+            });
+            let table = RIO_EXTENSION_FUNCTION_TABLE {
+                RIOSend: Some(fake_send),
+                RIORegisterBuffer: Some(fake_register),
+                RIODeregisterBuffer: Some(fake_deregister),
+                RIOCreateCompletionQueue: Some(fake_create_cq),
+                RIOCloseCompletionQueue: Some(fake_close_cq),
+                RIOCreateRequestQueue: Some(fake_create_rq),
+                RIONotify: Some(fake_notify),
+                ..RIO_EXTENSION_FUNCTION_TABLE::default()
+            };
+            let rio = RioFunctions::from_test_table(table);
+            let options = Options {
+                protocol: Protocol::Tcp,
+                ..Options::default()
+            };
+            let target = SOCKADDR_IN::default();
+            let mut transport = RioTransport::new(
+                &options,
+                1,
+                std::sync::Arc::from(&b"abcdef"[..]),
+                4096,
+                target,
+                rio,
+                None,
+            )
+            .unwrap();
+            let queue = RequestQueue::create(
+                &rio,
+                0,
+                1,
+                1,
+                1,
+                1,
+                transport.queue().unwrap().raw(),
+                transport.queue().unwrap().raw(),
+                ptr::null_mut(),
+            )
+            .unwrap();
+            transport.sessions[0].request_queue = Some(queue);
+            transport.sessions[0].state = GenerationState::Active;
+            transport.sessions[0].generation = 1;
+            transport
+        }
+
+        fn send_context() -> RequestContext {
+            RequestContext {
+                index: 0,
+                generation: 1,
+                slot: 0,
+                operation: Operation::Send,
+            }
+        }
+
+        #[test]
+        fn native_partial_send_preserves_registration_and_reports_whole_attempt() {
+            let mut transport = send_transport(None);
+            transport.send(0, 6).unwrap();
+            let mut completions = Vec::new();
+            transport
+                .retire_into(send_context(), 0, 2, &mut completions)
+                .unwrap();
+            assert!(completions.is_empty());
+            assert_eq!(transport.rio_outstanding, 1);
+            assert_eq!(transport.sessions[0].send_outstanding, 1);
+            assert!(transport.sessions[0].tx_in_use);
+            assert_eq!(transport.sent_bytes, 2);
+            transport
+                .retire_into(send_context(), 0, 4, &mut completions)
+                .unwrap();
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].bytes, 6);
+            assert_eq!(completions[0].status, 0);
+            assert_eq!(transport.sent_bytes, 6);
+            assert_eq!(transport.rio_outstanding, 0);
+            assert!(!transport.sessions[0].tx_in_use);
+            SEND_PROBE.with(|probe| {
+                let probe = probe.borrow();
+                assert_eq!(probe.ranges.len(), 2);
+                assert_eq!(probe.ranges[0].0, probe.ranges[1].0);
+                assert_eq!((probe.ranges[0].1, probe.ranges[0].2), (0, 6));
+                assert_eq!((probe.ranges[1].1, probe.ranges[1].2), (2, 4));
+            });
+            transport.shutdown().unwrap();
+        }
+
+        #[test]
+        fn native_partial_send_failure_retires_slot_and_counts_only_successful_prefix() {
+            for synchronous_failure in [false, true] {
+                let mut transport = send_transport(synchronous_failure.then_some(2));
+                transport.send(0, 6).unwrap();
+                let mut completions = Vec::new();
+                transport
+                    .retire_into(send_context(), 0, 2, &mut completions)
+                    .unwrap();
+                if !synchronous_failure {
+                    assert!(completions.is_empty());
+                    transport
+                        .retire_into(send_context(), 10_054, 0, &mut completions)
+                        .unwrap();
+                }
+                assert_eq!(completions.len(), 1);
+                assert_eq!(completions[0].status, 10_054);
+                assert_eq!(transport.sent_bytes, 2);
+                assert_eq!(transport.rio_outstanding, 0);
+                assert_eq!(transport.sessions[0].send_outstanding, 0);
+                assert!(!transport.sessions[0].tx_in_use);
+                assert!(transport.sessions[0].failure_pending);
+                transport.shutdown().unwrap();
+            }
+        }
+
+        #[test]
+        fn native_synchronous_send_failure_rolls_back_unaccepted_slot() {
+            let mut transport = send_transport(Some(1));
+            assert!(transport.send(0, 6).is_err());
+            assert_eq!(transport.rio_outstanding, 0);
+            assert_eq!(transport.sessions[0].send_outstanding, 0);
+            assert!(!transport.sessions[0].tx_in_use);
+            assert_eq!(transport.sent_bytes, 0);
+            transport.shutdown().unwrap();
+        }
+
+        #[test]
+        fn native_invalid_successful_send_lengths_fail_without_counting_bytes() {
+            for bytes in [0, 7] {
+                let mut transport = send_transport(None);
+                transport.send(0, 6).unwrap();
+                let mut completions = Vec::new();
+                transport
+                    .retire_into(send_context(), 0, bytes, &mut completions)
+                    .unwrap();
+                assert_eq!(completions.len(), 1);
+                assert_eq!(completions[0].status, 10_054);
+                assert_eq!(transport.sent_bytes, 0);
+                assert_eq!(transport.rio_outstanding, 0);
+                assert!(!transport.sessions[0].tx_in_use);
+                transport.shutdown().unwrap();
+            }
+        }
 
         #[test]
         fn tx_slot_cannot_be_reused_before_completion() {

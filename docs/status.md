@@ -52,3 +52,11 @@ Build scripts refresh the official Git dependency before building and remove the
 `--release`. `format.ps1` runs `cargo fmt`. Reference-server interop is optional when
 `-InteropServerPath` is supplied. No test result is implied by this source inventory;
 use the current build output for verification results.
+
+The 2026-10-11 repair uses the same arbitration in both clients: settle the acquired bounded
+completion batch, then controlled stop, then expired session timers. Zero-wait iterations still
+read queued completions. Connection deadlines start after socket preparation immediately before
+ConnectEx; new attempt deadlines use the first receive posting clock after prior batch validation.
+Deterministic Worker event permutations and injected native partial-send/error tests cover these
+boundaries. The shared verifier records exact final schemas, peer exits and mandatory per-worker
+notify diagnostics for Debug/Release cross-language runs.

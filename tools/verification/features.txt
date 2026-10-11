@@ -3,3 +3,4 @@ udp
 quota
 reconnect
 latency
+notify-diagnostics

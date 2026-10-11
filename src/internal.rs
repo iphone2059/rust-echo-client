@@ -437,6 +437,22 @@ pub mod session {
                 steps
             }
 
+            /// Step construction can precede expensive socket preparation or payload validation.
+            /// The worker refreshes this provisional deadline at the native posting boundary.
+            pub(crate) fn anchor_posted_timeout(&mut self, index: u32, now: u64) {
+                let Some(session) = self.sessions.get_mut(index as usize) else {
+                    self.statistics.fatal = true;
+                    return;
+                };
+                if matches!(
+                    session.state,
+                    SessionState::Connecting | SessionState::Active
+                ) {
+                    session.deadline = Some(now.saturating_add(self.timeout_ticks));
+                    self.arm(index);
+                }
+            }
+
             pub fn wait_milliseconds(&self, now: u64, maximum: u32) -> u32 {
                 let Some(deadline) = self.heap.next_deadline() else {
                     return maximum;
@@ -1424,6 +1440,13 @@ pub mod worker {
     /// Narrow interface driven by the worker. Production uses `RioTransport`; tests use a recorder.
     pub trait Transport {
         fn connect(&mut self, index: u32) -> Result<(), String>;
+
+        /// Invoke immediately before posting, after any socket preparation. Native transports
+        /// override this boundary so earlier sessions do not consume this session's timeout.
+        fn connect_at(&mut self, index: u32, before_post: &mut dyn FnMut()) -> Result<(), String> {
+            before_post();
+            self.connect(index)
+        }
         fn send(&mut self, index: u32, bytes: u32) -> Result<(), String>;
         fn receive(&mut self, index: u32, bytes: u32) -> Result<(), String>;
         fn close(&mut self, index: u32);
@@ -1642,16 +1665,17 @@ pub mod worker {
             self.scheduler.record_latency(micros);
         }
 
-        fn fail_session<T: Transport>(
+        fn fail_session<C: Clock, T: Transport>(
             &mut self,
             index: u32,
-            now: u64,
+            clock: &mut C,
             transport: &mut T,
             outcome: &mut RunOutcome,
         ) {
             self.clear_latency_queue(index);
+            let now = clock.now_ticks();
             let steps = self.scheduler.on_transport_failure(index, now);
-            self.dispatch(&steps, transport, outcome, now);
+            self.dispatch(&steps, transport, outcome, clock);
         }
 
         fn handle_completion<C: Clock, T: Transport>(
@@ -1677,7 +1701,7 @@ pub mod worker {
 
             if completion.operation == Operation::GenerationDrained {
                 let steps = self.scheduler.on_generation_drained(completion.index, now);
-                self.dispatch(&steps, transport, outcome, now);
+                self.dispatch(&steps, transport, outcome, clock);
                 return;
             }
 
@@ -1699,7 +1723,7 @@ pub mod worker {
                 outcome.failures = outcome.failures.saturating_add(1);
                 // Native operation errors, including WSAEMSGSIZE, fail the connection and spend
                 // the attempt's quota. Only invalid ownership/CQ/IOCP state is an internal error.
-                self.fail_session(completion.index, now, transport, outcome);
+                self.fail_session(completion.index, clock, transport, outcome);
                 return;
             }
 
@@ -1711,7 +1735,7 @@ pub mod worker {
                     {
                         crate::worker::trace::event("CONNECT_FINALIZE_FAILED", &reason);
                         outcome.failures = outcome.failures.saturating_add(1);
-                        self.fail_session(completion.index, now, transport, outcome);
+                        self.fail_session(completion.index, clock, transport, outcome);
                         return;
                     }
                     self.scheduler.on_connected(completion.index, now)
@@ -1729,7 +1753,7 @@ pub mod worker {
                             ),
                         );
                         outcome.failures = outcome.failures.saturating_add(1);
-                        self.fail_session(completion.index, now, transport, outcome);
+                        self.fail_session(completion.index, clock, transport, outcome);
                         return;
                     }
                     if transport.sent_bytes().is_none() {
@@ -1756,7 +1780,7 @@ pub mod worker {
                         .refresh_completed_pacing(completion.index, clock.now_ticks());
                 }
             }
-            self.dispatch(&steps, transport, outcome, now);
+            self.dispatch(&steps, transport, outcome, clock);
         }
 
         /// Runs until all sessions finish, a controlled stop/run deadline fires, or a fatal
@@ -1784,31 +1808,30 @@ pub mod worker {
             };
 
             let steps = self.scheduler.start(started);
-            self.dispatch(&steps, transport, &mut outcome, started);
+            self.dispatch(&steps, transport, &mut outcome, clock);
             let mut expired = Vec::new();
 
             loop {
-                if stop.is_requested() {
-                    outcome.controlled_stop = !stop.is_fatal();
-                    break;
-                }
                 let now = clock.now_ticks();
                 self.publish_progress(now, false);
-                if self.run_deadline.is_some_and(|deadline| now >= deadline) {
-                    outcome.controlled_stop = true;
-                    break;
-                }
                 if self.scheduler.all_finished() || self.scheduler.statistics().fatal {
                     break;
                 }
 
-                let wait = self.scheduler.wait_milliseconds(now, 1_000);
-                if wait == 0 {
-                    let poll_now = clock.now_ticks();
-                    let steps = self.scheduler.poll(poll_now, &mut expired);
-                    self.dispatch(&steps, transport, &mut outcome, poll_now);
-                    continue;
-                }
+                // Even an already-due stop/deadline permits one bounded zero-wait drain. Never
+                // skip queued completions, nor drain indefinitely ahead of the control path.
+                let maximum = if stop.is_requested() {
+                    0
+                } else if let Some(deadline) = self.run_deadline {
+                    crate::native::clock::ticks_to_wait_milliseconds(
+                        deadline.saturating_sub(now),
+                        frequency,
+                    )
+                    .min(1_000) as u32
+                } else {
+                    1_000
+                };
+                let wait = self.scheduler.wait_milliseconds(now, maximum);
 
                 // Test clocks advance here. The production clock intentionally does nothing;
                 // RioTransport::wait_and_drain performs the blocking GQCS wait.
@@ -1825,12 +1848,6 @@ pub mod worker {
                 if let Some(bytes) = transport.sent_bytes() {
                     self.scheduler.set_sent_bytes(bytes);
                 }
-                if stop.is_requested() {
-                    transport.recycle(completions);
-                    outcome.controlled_stop = !stop.is_fatal();
-                    break;
-                }
-
                 for position in 0..completions.len() {
                     let completion = completions[position];
                     self.handle_completion(completion, clock, transport, &mut outcome);
@@ -1839,11 +1856,25 @@ pub mod worker {
                     }
                 }
                 transport.recycle(completions);
+                outcome.batches = outcome.batches.saturating_add(1);
 
                 let poll_now = clock.now_ticks();
+                if stop.is_requested() {
+                    outcome.controlled_stop = !stop.is_fatal();
+                    break;
+                }
+                if self
+                    .run_deadline
+                    .is_some_and(|deadline| poll_now >= deadline)
+                {
+                    outcome.controlled_stop = true;
+                    break;
+                }
+                if self.scheduler.statistics().fatal {
+                    break;
+                }
                 let steps = self.scheduler.poll(poll_now, &mut expired);
-                self.dispatch(&steps, transport, &mut outcome, poll_now);
-                outcome.batches = outcome.batches.saturating_add(1);
+                self.dispatch(&steps, transport, &mut outcome, clock);
             }
 
             // Only an internal failure means no further progress is possible anywhere, and only then
@@ -1870,12 +1901,12 @@ pub mod worker {
             outcome
         }
 
-        fn dispatch<T: Transport>(
+        fn dispatch<C: Clock, T: Transport>(
             &mut self,
             steps: &[Step],
             transport: &mut T,
             outcome: &mut RunOutcome,
-            now: u64,
+            clock: &mut C,
         ) {
             // A top_up() can emit several operations for one session. If one post fails, its
             // generation immediately enters Closing; the remaining precomputed steps for that
@@ -1896,11 +1927,18 @@ pub mod worker {
 
                 if let Step::Receive { index, .. } = *step {
                     if let Some(started) = self.attempt_started.get_mut(index as usize) {
-                        *started = Some(Instant::now());
+                        if started.is_none() {
+                            self.scheduler
+                                .anchor_posted_timeout(index, clock.now_ticks());
+                            *started = Some(Instant::now());
+                        }
                     }
                 }
                 let result = match *step {
-                    Step::Connect(index) => transport.connect(index),
+                    Step::Connect(index) => transport.connect_at(index, &mut || {
+                        self.scheduler
+                            .anchor_posted_timeout(index, clock.now_ticks());
+                    }),
                     Step::Send { index, bytes } => transport.send(index, bytes),
                     Step::Receive { index, bytes } => transport.receive(index, bytes),
                     Step::Close(index) => {
@@ -1941,7 +1979,7 @@ pub mod worker {
                         }
 
                         failed_session = Some(step_index);
-                        self.fail_session(step_index, now, transport, outcome);
+                        self.fail_session(step_index, clock, transport, outcome);
                     }
                 }
             }
@@ -1952,7 +1990,317 @@ pub mod worker {
     mod tests {
         use super::*;
         use crate::native::completion::NO_SEND_SLOT;
+        use std::cell::Cell;
         use std::collections::VecDeque;
+        use std::rc::Rc;
+
+        static WORKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        struct SharedClock(Rc<Cell<u64>>);
+
+        impl Clock for SharedClock {
+            fn now_milliseconds(&mut self) -> u64 {
+                self.0.get()
+            }
+
+            fn wait(&mut self, _milliseconds: u32) {}
+        }
+
+        struct TimedTransport {
+            now: Rc<Cell<u64>>,
+            pending: Vec<Completion>,
+            waits: Vec<u32>,
+            posts: Vec<(u32, u64)>,
+            live: bool,
+            receive_first: bool,
+            corrupt: bool,
+            stop_on_echo: bool,
+            expire_on_echo: bool,
+            delay_after_connect: bool,
+            preparation_ticks: u64,
+            validation_ticks: u64,
+            omit_receive: bool,
+        }
+
+        impl TimedTransport {
+            fn new(now: Rc<Cell<u64>>) -> Self {
+                Self {
+                    now,
+                    pending: Vec::new(),
+                    waits: Vec::new(),
+                    posts: Vec::new(),
+                    live: true,
+                    receive_first: false,
+                    corrupt: false,
+                    stop_on_echo: false,
+                    expire_on_echo: false,
+                    delay_after_connect: false,
+                    preparation_ticks: 0,
+                    validation_ticks: 0,
+                    omit_receive: false,
+                }
+            }
+
+            fn completion(index: u32, operation: Operation, bytes: u32) -> Completion {
+                Completion {
+                    index,
+                    generation: 1,
+                    slot: NO_SEND_SLOT,
+                    operation,
+                    status: 0,
+                    bytes,
+                }
+            }
+        }
+
+        impl Transport for TimedTransport {
+            fn connect_at(
+                &mut self,
+                index: u32,
+                before_post: &mut dyn FnMut(),
+            ) -> Result<(), String> {
+                self.now.set(self.now.get() + self.preparation_ticks);
+                before_post();
+                self.connect(index)
+            }
+
+            fn connect(&mut self, index: u32) -> Result<(), String> {
+                self.posts.push((index, self.now.get()));
+                self.pending
+                    .push(Self::completion(index, Operation::Connect, 0));
+                if self.delay_after_connect {
+                    self.now.set(self.now.get() + 1_000);
+                }
+                Ok(())
+            }
+
+            fn send(&mut self, index: u32, bytes: u32) -> Result<(), String> {
+                let send = Self::completion(index, Operation::Send, bytes);
+                let receive = Self::completion(index, Operation::Receive, bytes);
+                if self.omit_receive {
+                    self.pending.push(send);
+                } else if self.receive_first {
+                    self.pending.extend([receive, send]);
+                } else {
+                    self.pending.extend([send, receive]);
+                }
+                Ok(())
+            }
+
+            fn receive(&mut self, _index: u32, _bytes: u32) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn received(&self, _index: u32, _generation: u32, _length: u32) -> &[u8] {
+                self.now.set(self.now.get() + self.validation_ticks);
+                if self.corrupt { b"xbcdef" } else { b"abcdef" }
+            }
+
+            fn close(&mut self, index: u32) {
+                self.live = false;
+                self.pending
+                    .push(Self::completion(index, Operation::GenerationDrained, 0));
+            }
+
+            fn completion_is_live(&self, _index: u32, _generation: u32) -> bool {
+                self.live
+            }
+
+            fn wait_and_drain(
+                &mut self,
+                wait: u32,
+                budget: u32,
+            ) -> Result<Vec<Completion>, String> {
+                assert_eq!(budget, 64, "drain must stay bounded");
+                self.waits.push(wait);
+                assert!(self.waits.len() <= 4, "worker failed to terminate");
+                if self.waits.len() == 2 {
+                    if self.expire_on_echo {
+                        self.now.set(self.now.get() + 1_000);
+                    }
+                    if self.stop_on_echo {
+                        StopFlag::request_global();
+                    }
+                }
+                Ok(std::mem::take(&mut self.pending))
+            }
+        }
+
+        fn timed_worker(count: u64) -> Worker {
+            let options = Options {
+                protocol: crate::types::Protocol::Tcp,
+                echo_count: count,
+                timeout_seconds: 1,
+                ..Options::default()
+            };
+            let mut worker = Worker::new(&options, 1, 6, 0);
+            worker.set_payload(std::sync::Arc::from(&b"abcdef"[..]));
+            worker
+        }
+
+        #[test]
+        fn acquired_echoes_settle_before_stop_and_deadlines_in_both_orders() {
+            let _guard = WORKER_TEST_LOCK.lock().unwrap();
+            for receive_first in [false, true] {
+                for corrupt in [false, true] {
+                    for stop in [false, true] {
+                        for expire in [false, true] {
+                            for run_deadline in [false, true] {
+                                StopFlag::clear_global();
+                                let now = Rc::new(Cell::new(0));
+                                let mut clock = SharedClock(now.clone());
+                                let mut transport = TimedTransport::new(now);
+                                transport.receive_first = receive_first;
+                                transport.corrupt = corrupt;
+                                transport.stop_on_echo = stop;
+                                transport.expire_on_echo = expire;
+                                let mut worker = timed_worker(1);
+                                worker.run_seconds = u32::from(run_deadline);
+                                let outcome = worker.run(&mut clock, &mut transport, &StopFlag);
+                                let stats = worker.scheduler.statistics();
+                                assert_eq!(stats.echoes, u64::from(!corrupt));
+                                assert_eq!(stats.corrupted, u64::from(corrupt));
+                                assert_eq!(stats.received_bytes, 6);
+                                assert_eq!(stats.sent_bytes, 6);
+                                assert_eq!(stats.latency_samples, 1);
+                                assert_eq!(stats.lost, 0);
+                                assert_eq!(stats.network_failures, 0);
+                                assert!(!stats.fatal);
+                                assert_eq!(
+                                    outcome.controlled_stop,
+                                    stop || (expire && run_deadline)
+                                );
+                                assert_eq!(
+                                    stats.exit_code(outcome.controlled_stop),
+                                    if corrupt {
+                                        crate::types::ExitCode::EchoFailure
+                                    } else {
+                                        crate::types::ExitCode::Success
+                                    }
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            StopFlag::clear_global();
+        }
+
+        #[test]
+        fn expired_connect_timer_still_reads_queued_completion_with_zero_wait() {
+            let _guard = WORKER_TEST_LOCK.lock().unwrap();
+            StopFlag::clear_global();
+            let now = Rc::new(Cell::new(0));
+            let mut clock = SharedClock(now.clone());
+            let mut transport = TimedTransport::new(now);
+            transport.delay_after_connect = true;
+            let mut worker = timed_worker(1);
+            worker.run(&mut clock, &mut transport, &StopFlag);
+            assert_eq!(transport.waits[0], 0);
+            assert_eq!(worker.scheduler.statistics().echoes, 1);
+            assert_eq!(worker.scheduler.statistics().network_failures, 0);
+        }
+
+        #[test]
+        fn stop_wins_over_expired_timer_after_acquired_partial_batch() {
+            let _guard = WORKER_TEST_LOCK.lock().unwrap();
+            for external_stop in [false, true] {
+                StopFlag::clear_global();
+                let now = Rc::new(Cell::new(0));
+                let mut clock = SharedClock(now.clone());
+                let mut transport = TimedTransport::new(now);
+                transport.stop_on_echo = external_stop;
+                transport.expire_on_echo = true;
+                transport.omit_receive = true;
+                let mut worker = timed_worker(1);
+                worker.run_seconds = u32::from(!external_stop);
+                let outcome = worker.run(&mut clock, &mut transport, &StopFlag);
+                assert!(outcome.controlled_stop);
+                let stats = worker.scheduler.statistics();
+                assert_eq!(stats.sent_bytes, 6);
+                assert_eq!(stats.echoes, 0);
+                assert_eq!(stats.lost, 0);
+                assert_eq!(stats.network_failures, 0);
+            }
+            StopFlag::clear_global();
+        }
+
+        #[test]
+        fn acquired_batch_does_not_give_future_completions_unbounded_priority_over_stop() {
+            let _guard = WORKER_TEST_LOCK.lock().unwrap();
+            StopFlag::clear_global();
+            let now = Rc::new(Cell::new(0));
+            let mut clock = SharedClock(now.clone());
+            let mut transport = TimedTransport::new(now);
+            transport.stop_on_echo = true;
+            let mut worker = timed_worker(2);
+            let outcome = worker.run(&mut clock, &mut transport, &StopFlag);
+            assert!(outcome.controlled_stop);
+            assert_eq!(transport.waits.len(), 2);
+            assert_eq!(worker.scheduler.statistics().echoes, 1);
+            assert_eq!(worker.scheduler.statistics().attempted, 2);
+            assert_eq!(
+                transport.pending.len(),
+                2,
+                "new batch stays outside the acquired set"
+            );
+            StopFlag::clear_global();
+        }
+
+        #[test]
+        fn each_connection_anchors_timeout_after_its_own_preparation() {
+            let now = Rc::new(Cell::new(0));
+            let mut clock = SharedClock(now.clone());
+            let mut transport = TimedTransport::new(now);
+            transport.preparation_ticks = 700;
+            let options = Options {
+                timeout_seconds: 1,
+                ..Options::default()
+            };
+            let mut worker = Worker::new(&options, 3, 6, 0);
+            let steps = worker.scheduler.start(0);
+            worker.dispatch(
+                &steps,
+                &mut transport,
+                &mut RunOutcome::default(),
+                &mut clock,
+            );
+            assert_eq!(transport.posts, vec![(0, 700), (1, 1_400), (2, 2_100)]);
+            for (index, posted) in transport.posts {
+                assert_eq!(
+                    worker.scheduler.session(index).unwrap().deadline,
+                    Some(posted + 1_000)
+                );
+            }
+        }
+
+        #[test]
+        fn next_attempt_gets_fresh_clock_after_expensive_echo_validation() {
+            let now = Rc::new(Cell::new(100));
+            let mut clock = SharedClock(now.clone());
+            let mut transport = TimedTransport::new(now);
+            transport.validation_ticks = 700;
+            let mut worker = timed_worker(2);
+            worker.scheduler.start(0);
+            let steps = worker.scheduler.on_connected(0, 100);
+            let mut outcome = RunOutcome::default();
+            worker.dispatch(&steps, &mut transport, &mut outcome, &mut clock);
+            worker.handle_completion(
+                TimedTransport::completion(0, Operation::Send, 6),
+                &mut clock,
+                &mut transport,
+                &mut outcome,
+            );
+            worker.handle_completion(
+                TimedTransport::completion(0, Operation::Receive, 6),
+                &mut clock,
+                &mut transport,
+                &mut outcome,
+            );
+            assert_eq!(worker.scheduler.session(0).unwrap().deadline, Some(1_800));
+            assert_eq!(worker.scheduler.statistics().echoes, 1);
+            assert_eq!(worker.scheduler.statistics().attempted, 2);
+        }
 
         #[derive(Default)]
         struct TestClock {
@@ -2032,6 +2380,7 @@ pub mod worker {
 
         #[test]
         fn receive_step_carries_requested_length() {
+            let _guard = WORKER_TEST_LOCK.lock().unwrap();
             let mut options = Options::default();
             options.echo_count = 1;
             options.pipeline_depth = 1;
