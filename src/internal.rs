@@ -282,9 +282,9 @@ pub mod session {
         //! while the old generation can still produce completions.
 
         use crate::metrics::Statistics;
-        use crate::native::clock::{milliseconds_to_ticks, ticks_to_wait_milliseconds};
         use crate::session::{ReceiveOutcome, Session, SessionState};
         use crate::types::{Options, Protocol};
+        use crate::types::{milliseconds_to_ticks, ticks_to_wait_milliseconds};
         use crate::worker::timer::TimerHeap;
 
         const GENERATION_DRAIN_GRACE_MS: u64 = 5_000;
@@ -295,6 +295,116 @@ pub mod session {
             Send { index: u32, bytes: u32 },
             Receive { index: u32, bytes: u32 },
             Close(u32),
+        }
+
+        /// A single session emits at most receive/send/close. This value never allocates.
+        #[derive(Clone, Copy, Debug)]
+        pub struct ActionBatch {
+            entries: [Step; 3],
+            len: usize,
+        }
+
+        impl ActionBatch {
+            pub fn new() -> Self {
+                Self {
+                    entries: [Step::Close(0); 3],
+                    len: 0,
+                }
+            }
+
+            fn one(step: Step) -> Self {
+                let mut batch = Self::new();
+                batch.push(step);
+                batch
+            }
+
+            fn push(&mut self, step: Step) {
+                assert!(self.len < self.entries.len(), "session action capacity");
+                self.entries[self.len] = step;
+                self.len += 1;
+            }
+        }
+
+        impl core::ops::Deref for ActionBatch {
+            type Target = [Step];
+            fn deref(&self) -> &[Step] {
+                &self.entries[..self.len]
+            }
+        }
+
+        impl core::ops::DerefMut for ActionBatch {
+            fn deref_mut(&mut self) -> &mut [Step] {
+                &mut self.entries[..self.len]
+            }
+        }
+
+        impl IntoIterator for ActionBatch {
+            type Item = Step;
+            type IntoIter = core::iter::Take<core::array::IntoIter<Step, 3>>;
+            fn into_iter(self) -> Self::IntoIter {
+                self.entries.into_iter().take(self.len)
+            }
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Action {
+            Step(Step),
+            DrainTimeout(u32),
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Event {
+            Connected(u32),
+            Sent(u32),
+            Received {
+                index: u32,
+                bytes: u32,
+                expected: bool,
+                echoed: bool,
+            },
+            TransportFailure {
+                index: u32,
+                failure: Option<crate::types::Failure>,
+            },
+            GenerationDrained(u32),
+            CloseRequested(u32),
+        }
+
+        trait ActionSink {
+            fn clear(&mut self);
+            fn push(&mut self, step: Step);
+            fn extend(&mut self, batch: ActionBatch) {
+                for step in batch {
+                    self.push(step);
+                }
+            }
+            fn drain_timeout(&mut self, index: u32);
+        }
+        impl ActionSink for Vec<Step> {
+            fn clear(&mut self) {
+                Vec::clear(self);
+            }
+            fn push(&mut self, step: Step) {
+                Vec::push(self, step);
+            }
+            fn drain_timeout(&mut self, _index: u32) {}
+        }
+        impl ActionSink for Vec<Action> {
+            fn clear(&mut self) {
+                Vec::clear(self);
+            }
+            fn push(&mut self, step: Step) {
+                Vec::push(self, Action::Step(step));
+            }
+            fn drain_timeout(&mut self, index: u32) {
+                Vec::push(self, Action::DrainTimeout(index));
+            }
+        }
+
+        impl PartialEq<Vec<Step>> for ActionBatch {
+            fn eq(&self, other: &Vec<Step>) -> bool {
+                &**self == other.as_slice()
+            }
         }
 
         #[derive(Clone, Copy, Debug, Default)]
@@ -313,7 +423,7 @@ pub mod session {
             /// The first attempt of this transport generation is immediate. `/i` spaces only later
             /// cycles, matching the baseline behaviour.
             started: bool,
-            /// Echo units this session claimed and then settled as lost or corrupted. The ledger is
+            /// Echo units this session claimed and then settled as lost, corrupted, or cancelled. The ledger is
             /// `requested = echoes + settled + inflight`, which is what lets a reconnect keep the
             /// quota a failed attempt already spent instead of handing it back.
             settled: u64,
@@ -348,6 +458,8 @@ pub mod session {
             /// reference sizes one send/receive pair.
             batch_capacity: u32,
             flows: Vec<Flow>,
+            close_anchored: Vec<bool>,
+            stopping: bool,
         }
 
         impl Scheduler {
@@ -373,6 +485,8 @@ pub mod session {
                         1
                     },
                     flows: vec![Flow::default(); count],
+                    close_anchored: vec![false; count],
+                    stopping: false,
                 }
             }
 
@@ -418,6 +532,39 @@ pub mod session {
                 self.statistics.fatal = true;
             }
 
+            /// Settle the claimed business attempt before the runtime cancels native requests.
+            /// Native ownership stays in the transport until its drain completion is reported.
+            pub fn begin_shutdown(&mut self, now: u64) {
+                if self.stopping {
+                    return;
+                }
+                self.stopping = true;
+                for index in 0..self.sessions.len() as u32 {
+                    let slot = index as usize;
+                    if self.sessions[slot].state == SessionState::Active {
+                        let unsettled = self.inflight_echoes(slot).unwrap_or_else(|| {
+                            self.statistics.fatal = true;
+                            0
+                        });
+                        if self.statistics.fatal {
+                            self.statistics.lost = self.statistics.lost.saturating_add(unsettled);
+                        } else {
+                            self.statistics.cancelled =
+                                self.statistics.cancelled.saturating_add(unsettled);
+                        }
+                        self.flows[slot].settled =
+                            self.flows[slot].settled.saturating_add(unsettled);
+                        self.flows[slot] = Flow::after_failure(&self.flows[slot]);
+                    }
+                    if self.sessions[slot].begin_closing() {
+                        self.sessions[slot].deadline =
+                            Some(now.saturating_add(self.drain_grace_ticks));
+                        self.close_anchored[slot] = true;
+                        self.arm(index);
+                    }
+                }
+            }
+
             pub fn record_latency(&mut self, micros: u64) {
                 self.statistics.record_latency(micros);
             }
@@ -428,13 +575,75 @@ pub mod session {
 
             pub fn start(&mut self, now: u64) -> Vec<Step> {
                 let mut steps = Vec::with_capacity(self.sessions.len());
+                self.start_into(now, &mut steps);
+                steps
+            }
+
+            pub fn start_into(&mut self, now: u64, steps: &mut Vec<Step>) {
+                steps.clear();
                 for index in 0..self.sessions.len() as u32 {
                     if self.sessions[index as usize].begin_connect(now, self.timeout_ticks) {
                         self.arm(index);
                         steps.push(Step::Connect(index));
                     }
                 }
-                steps
+            }
+
+            pub fn on_event(&mut self, event: Event, now: u64) -> ActionBatch {
+                match event {
+                    Event::Connected(index) => self.on_connected(index, now),
+                    Event::Sent(index) => self.on_sent(index, now),
+                    Event::GenerationDrained(index) => self.on_generation_drained(index, now),
+                    Event::CloseRequested(index) => {
+                        let slot = index as usize;
+                        if slot < self.sessions.len()
+                            && self.sessions[slot].state == SessionState::Closing
+                            && !self.close_anchored[slot]
+                        {
+                            self.close_anchored[slot] = true;
+                            self.sessions[slot].deadline =
+                                Some(now.saturating_add(self.drain_grace_ticks));
+                            self.arm(index);
+                        }
+                        ActionBatch::new()
+                    }
+                    Event::TransportFailure { index, failure } => {
+                        if failure.is_some_and(|failure| {
+                            failure.classification != crate::types::FailureClass::Network
+                        }) {
+                            self.statistics.fatal = true;
+                        }
+                        self.on_transport_failure(index, now)
+                    }
+                    Event::Received {
+                        index,
+                        bytes,
+                        expected,
+                        echoed,
+                    } => {
+                        let slot = index as usize;
+                        if slot >= self.sessions.len()
+                            || self.sessions[slot].state != SessionState::Active
+                        {
+                            return ActionBatch::new();
+                        }
+                        if !self.flows[slot].receive_posted || self.flows[slot].batch_units == 0 {
+                            self.statistics.fatal = true;
+                            return ActionBatch::new();
+                        }
+                        self.flows[slot].receive_posted = false;
+                        if self.protocol == Protocol::Tcp && !expected {
+                            return self.on_transport_failure(index, now);
+                        }
+                        self.statistics.received_bytes = self
+                            .statistics
+                            .received_bytes
+                            .saturating_add(u64::from(bytes));
+                        self.flows[slot].receive_done = true;
+                        self.flows[slot].receive_corrupted = !expected || !echoed;
+                        self.finish_attempt(index, now)
+                    }
+                }
             }
 
             /// Step construction can precede expensive socket preparation or payload validation.
@@ -550,7 +759,7 @@ pub mod session {
                 granted.min(u64::from(u32::MAX)) as u32
             }
 
-            fn post_one_send(&mut self, index: u32, steps: &mut Vec<Step>) -> bool {
+            fn post_one_send(&mut self, index: u32, steps: &mut ActionBatch) -> bool {
                 let slot = index as usize;
                 if !self.can_request_more(slot) {
                     return false;
@@ -581,7 +790,7 @@ pub mod session {
                 true
             }
 
-            fn ensure_receive(&mut self, index: u32, steps: &mut Vec<Step>) {
+            fn ensure_receive(&mut self, index: u32, steps: &mut ActionBatch) {
                 let slot = index as usize;
                 let flow = self.flows[slot];
                 // A receive is posted once per attempt, and only for the bytes still missing after a
@@ -618,9 +827,9 @@ pub mod session {
 
             /// Fills an active session. With `/i == 0` it fills the business pipeline immediately.
             /// With `/i != 0`, the first send is immediate and later cycles are paced by `send_at`.
-            fn top_up(&mut self, index: u32, now: u64) -> Vec<Step> {
+            fn top_up(&mut self, index: u32, now: u64) -> ActionBatch {
                 let slot = index as usize;
-                let mut steps = Vec::new();
+                let mut steps = ActionBatch::new();
                 if slot >= self.sessions.len() || self.sessions[slot].state != SessionState::Active
                 {
                     return steps;
@@ -680,24 +889,25 @@ pub mod session {
                 steps
             }
 
-            pub fn on_connected(&mut self, index: u32, now: u64) -> Vec<Step> {
+            pub fn on_connected(&mut self, index: u32, now: u64) -> ActionBatch {
                 let slot = index as usize;
                 if slot >= self.sessions.len() || !self.sessions[slot].connected() {
-                    return Vec::new();
+                    return ActionBatch::new();
                 }
+                self.close_anchored[slot] = false;
                 self.statistics.connections = self.statistics.connections.saturating_add(1);
                 self.flows[slot] = Flow::after_failure(&self.flows[slot]);
                 self.top_up(index, now)
             }
 
-            pub fn on_sent(&mut self, index: u32, now: u64) -> Vec<Step> {
+            pub fn on_sent(&mut self, index: u32, now: u64) -> ActionBatch {
                 let slot = index as usize;
                 if slot >= self.flows.len() || self.sessions[slot].state != SessionState::Active {
-                    return Vec::new();
+                    return ActionBatch::new();
                 }
                 if self.flows[slot].batch_units == 0 || self.flows[slot].send_done {
                     self.statistics.fatal = true;
-                    return Vec::new();
+                    return ActionBatch::new();
                 }
                 self.flows[slot].send_done = true;
                 self.finish_attempt(index, now)
@@ -706,7 +916,7 @@ pub mod session {
             /// Retires the posted attempt once both of its native operations have completed and starts
             /// the next one. Nothing else may be posted for the session before that, because its request
             /// queue holds exactly one outstanding receive and one outstanding send.
-            fn finish_attempt(&mut self, index: u32, now: u64) -> Vec<Step> {
+            fn finish_attempt(&mut self, index: u32, now: u64) -> ActionBatch {
                 let slot = index as usize;
                 let flow = self.flows[slot];
                 if flow.batch_units == 0
@@ -714,7 +924,7 @@ pub mod session {
                     || !flow.receive_done
                     || flow.receive_posted
                 {
-                    return Vec::new();
+                    return ActionBatch::new();
                 }
                 let units = u64::from(flow.batch_units);
                 if flow.receive_corrupted {
@@ -739,7 +949,7 @@ pub mod session {
                 if self.interval_ticks != 0 {
                     self.sessions[slot].send_at = Some(now.saturating_add(self.interval_ticks));
                     self.arm(index);
-                    return Vec::new();
+                    return ActionBatch::new();
                 }
                 self.top_up(index, now)
             }
@@ -780,15 +990,15 @@ pub mod session {
                 chunk: &[u8],
                 payload: &[u8],
                 now: u64,
-            ) -> Vec<Step> {
+            ) -> ActionBatch {
                 let slot = index as usize;
                 if slot >= self.sessions.len() || self.sessions[slot].state != SessionState::Active
                 {
-                    return Vec::new();
+                    return ActionBatch::new();
                 }
                 if !self.flows[slot].receive_posted {
                     self.statistics.fatal = true;
-                    return Vec::new();
+                    return ActionBatch::new();
                 }
                 // The native request ended when its completion was dequeued.
                 self.flows[slot].receive_posted = false;
@@ -796,7 +1006,7 @@ pub mod session {
                 let units = self.flows[slot].batch_units;
                 if units == 0 {
                     self.statistics.fatal = true;
-                    return Vec::new();
+                    return ActionBatch::new();
                 }
                 if self.protocol == Protocol::Tcp && chunk.len() != self.batch_bytes(index) as usize
                 {
@@ -847,10 +1057,10 @@ pub mod session {
 
             /// Starts generation retirement after a connection-scoped failure. This is idempotent:
             /// cancellation completions from a generation already closing do not count as new losses.
-            pub fn on_transport_failure(&mut self, index: u32, now: u64) -> Vec<Step> {
+            pub fn on_transport_failure(&mut self, index: u32, now: u64) -> ActionBatch {
                 let slot = index as usize;
                 if slot >= self.sessions.len() {
-                    return Vec::new();
+                    return ActionBatch::new();
                 }
                 if matches!(
                     self.sessions[slot].state,
@@ -859,7 +1069,7 @@ pub mod session {
                         | SessionState::Completed
                         | SessionState::Failed
                 ) {
-                    return Vec::new();
+                    return ActionBatch::new();
                 }
 
                 let lost = match self.inflight_echoes(slot) {
@@ -881,22 +1091,27 @@ pub mod session {
                 if self.sessions[slot].begin_closing() {
                     // Cancellation completion is normally prompt, but never let a broken provider
                     // strand the worker in Closing forever. Expiry is fatal; transport shutdown then
-                    // performs its bounded safe-drain/leak fallback rather than freeing live memory.
+                    // performs its bounded drain and fails fast rather than freeing live memory.
                     self.sessions[slot].deadline = Some(now.saturating_add(self.drain_grace_ticks));
                     self.arm(index);
-                    vec![Step::Close(index)]
+                    ActionBatch::one(Step::Close(index))
                 } else {
-                    Vec::new()
+                    ActionBatch::new()
                 }
             }
 
             /// Called only after the transport proved all completions from the old generation were
             /// dequeued and its OVERLAPPED/RQ/socket can no longer be referenced by Windows.
-            pub fn on_generation_drained(&mut self, index: u32, now: u64) -> Vec<Step> {
+            pub fn on_generation_drained(&mut self, index: u32, now: u64) -> ActionBatch {
                 let slot = index as usize;
                 if slot >= self.sessions.len() || self.sessions[slot].state != SessionState::Closing
                 {
-                    return Vec::new();
+                    return ActionBatch::new();
+                }
+                if self.stopping {
+                    self.sessions[slot].complete();
+                    self.heap.remove(index);
+                    return ActionBatch::new();
                 }
                 match self.reconnect_ticks {
                     Some(delay) => {
@@ -909,12 +1124,12 @@ pub mod session {
                         self.heap.remove(index);
                     }
                 }
-                Vec::new()
+                ActionBatch::new()
             }
 
-            fn interval_send_due(&mut self, index: u32, now: u64) -> Vec<Step> {
+            fn interval_send_due(&mut self, index: u32, now: u64) -> ActionBatch {
                 let slot = index as usize;
-                let mut steps = Vec::new();
+                let mut steps = ActionBatch::new();
                 if self.sessions[slot].state != SessionState::Active {
                     return steps;
                 }
@@ -938,10 +1153,41 @@ pub mod session {
                 steps
             }
 
+            /// Cold compatibility adapter for existing pure-model fixtures. Without a native
+            /// arbiter or DrainTimeout action, a missed drain is classified locally as fatal.
+            #[cfg(test)]
             pub fn poll(&mut self, now: u64, expired: &mut Vec<u32>) -> Vec<Step> {
+                let mut steps = Vec::with_capacity(self.sessions.len().saturating_mul(3));
+                self.poll_into(now, expired, &mut steps);
+                steps
+            }
+
+            #[cfg(test)]
+            pub fn poll_into(&mut self, now: u64, expired: &mut Vec<u32>, steps: &mut Vec<Step>) {
+                self.poll_with_sink(now, expired, steps, true);
+            }
+
+            /// Production interface: a due drain emits an action whose runtime checks the
+            /// transport's native clock and CQ arbitration before classifying ownership loss.
+            pub fn poll_actions_into(
+                &mut self,
+                now: u64,
+                expired: &mut Vec<u32>,
+                steps: &mut Vec<Action>,
+            ) {
+                self.poll_with_sink(now, expired, steps, false);
+            }
+
+            fn poll_with_sink<S: ActionSink>(
+                &mut self,
+                now: u64,
+                expired: &mut Vec<u32>,
+                steps: &mut S,
+                step_only: bool,
+            ) {
                 expired.clear();
                 let count = self.heap.pop_expired(now, expired);
-                let mut steps = Vec::new();
+                steps.clear();
 
                 for position in 0..count {
                     let index = expired[position];
@@ -985,8 +1231,14 @@ pub mod session {
                                     "GENERATION_DRAIN_TIMEOUT",
                                     format_args!("session={index}"),
                                 );
-                                self.statistics.fatal = true;
+                                // The runtime's typed action delegates native deadline arbitration
+                                // to the transport. The legacy Step-only pure-model adapter has no
+                                // way to carry that action and preserves its local fatal result.
+                                if step_only {
+                                    self.statistics.fatal = true;
+                                }
                                 self.heap.remove(index);
+                                steps.drain_timeout(index);
                             } else {
                                 self.arm(index);
                             }
@@ -994,7 +1246,6 @@ pub mod session {
                         _ => self.arm(index),
                     }
                 }
-                steps
             }
         }
 
@@ -1422,7 +1673,7 @@ pub mod worker {
 
     use crate::native::clock::milliseconds_to_ticks;
     use crate::native::completion::Operation;
-    use crate::session::scheduler::{Scheduler, Step};
+    use crate::session::scheduler::{Action, Event, Scheduler, Step};
     use crate::types::Options;
 
     /// One completion after native ownership accounting has already been retired by the transport.
@@ -1439,6 +1690,16 @@ pub mod worker {
 
     /// Narrow interface driven by the worker. Production uses `RioTransport`; tests use a recorder.
     pub trait Transport {
+        fn failure(&self) -> Option<crate::types::Failure> {
+            None
+        }
+        fn lifecycle(&self) -> Option<crate::types::Lifecycle> {
+            None
+        }
+        fn generation_outstanding(&self, _index: u32) -> bool {
+            false
+        }
+        fn check_generation_drain(&self, _index: u32) {}
         fn connect(&mut self, index: u32) -> Result<(), String>;
 
         /// Invoke immediately before posting, after any socket preparation. Native transports
@@ -1446,6 +1707,13 @@ pub mod worker {
         fn connect_at(&mut self, index: u32, before_post: &mut dyn FnMut()) -> Result<(), String> {
             before_post();
             self.connect(index)
+        }
+        fn connect_at_static<F: FnMut()>(
+            &mut self,
+            index: u32,
+            before_post: &mut F,
+        ) -> Result<(), String> {
+            self.connect_at(index, before_post)
         }
         fn send(&mut self, index: u32, bytes: u32) -> Result<(), String>;
         fn receive(&mut self, index: u32, bytes: u32) -> Result<(), String>;
@@ -1492,12 +1760,25 @@ pub mod worker {
             self.drain(budget)
         }
 
+        /// Settles one queued native packet before a pure timer decision. None means no packet.
+        fn poll_deadline_packet(
+            &mut self,
+            _budget: u32,
+        ) -> Result<Option<Vec<Completion>>, String> {
+            Ok(None)
+        }
+
+        /// Settles CQ records whose notification can still be queued behind other packets.
+        fn drain_before_deadlines(&mut self) -> Result<Vec<Completion>, String> {
+            Ok(Vec::new())
+        }
+
         /// Takes back the batch the previous `wait_and_drain` handed out so the transport can
         /// reuse its buffer. Without this the buffer is freed every loop iteration, which the
         /// datagram path pays once per round trip.
         fn recycle(&mut self, _completions: Vec<Completion>) {}
 
-        /// Quiesces native I/O and releases resources in a safe order.
+        /// Quiesces native I/O; the coordinator owns the subsequent resource release.
         fn shutdown(&mut self) -> Result<(), String> {
             Ok(())
         }
@@ -1674,7 +1955,13 @@ pub mod worker {
         ) {
             self.clear_latency_queue(index);
             let now = clock.now_ticks();
-            let steps = self.scheduler.on_transport_failure(index, now);
+            let steps = self.scheduler.on_event(
+                Event::TransportFailure {
+                    index,
+                    failure: transport.failure(),
+                },
+                now,
+            );
             self.dispatch(&steps, transport, outcome, clock);
         }
 
@@ -1700,7 +1987,9 @@ pub mod worker {
             );
 
             if completion.operation == Operation::GenerationDrained {
-                let steps = self.scheduler.on_generation_drained(completion.index, now);
+                let steps = self
+                    .scheduler
+                    .on_event(Event::GenerationDrained(completion.index), now);
                 self.dispatch(&steps, transport, outcome, clock);
                 return;
             }
@@ -1738,7 +2027,8 @@ pub mod worker {
                         self.fail_session(completion.index, clock, transport, outcome);
                         return;
                     }
-                    self.scheduler.on_connected(completion.index, now)
+                    self.scheduler
+                        .on_event(Event::Connected(completion.index), now)
                 }
                 Operation::Send => {
                     // The transport re-posts the remainder of a partial native send, so a send
@@ -1759,7 +2049,7 @@ pub mod worker {
                     if transport.sent_bytes().is_none() {
                         self.scheduler.on_sent_bytes(u64::from(completion.bytes));
                     }
-                    self.scheduler.on_sent(completion.index, now)
+                    self.scheduler.on_event(Event::Sent(completion.index), now)
                 }
                 Operation::Receive => {
                     let chunk = transport.received(
@@ -1767,8 +2057,23 @@ pub mod worker {
                         completion.generation,
                         completion.bytes,
                     );
-                    self.scheduler
-                        .on_received(completion.index, chunk, &self.payload, now)
+                    let expected =
+                        chunk.len() == self.scheduler.batch_bytes(completion.index) as usize;
+                    let echoed = !self.payload.is_empty()
+                        && !chunk.is_empty()
+                        && chunk.len() % self.payload.len() == 0
+                        && chunk
+                            .chunks_exact(self.payload.len())
+                            .all(|unit| crate::payload::verify_echo(unit, &self.payload));
+                    self.scheduler.on_event(
+                        Event::Received {
+                            index: completion.index,
+                            bytes: chunk.len() as u32,
+                            expected,
+                            echoed,
+                        },
+                        now,
+                    )
                 }
                 Operation::GenerationDrained => unreachable!(),
             };
@@ -1807,9 +2112,12 @@ pub mod worker {
                 )))
             };
 
-            let steps = self.scheduler.start(started);
-            self.dispatch(&steps, transport, &mut outcome, clock);
-            let mut expired = Vec::new();
+            let mut startup_actions = Vec::with_capacity(self.scheduler.sessions().len());
+            self.scheduler.start_into(started, &mut startup_actions);
+            self.dispatch(&startup_actions, transport, &mut outcome, clock);
+            let mut expired = Vec::with_capacity(self.scheduler.sessions().len());
+            let mut timed_actions =
+                Vec::with_capacity(self.scheduler.sessions().len().saturating_mul(3));
 
             loop {
                 let now = clock.now_ticks();
@@ -1873,24 +2181,127 @@ pub mod worker {
                 if self.scheduler.statistics().fatal {
                     break;
                 }
-                let steps = self.scheduler.poll(poll_now, &mut expired);
-                self.dispatch(&steps, transport, &mut outcome, clock);
+
+                if self.scheduler.wait_milliseconds(poll_now, 1) == 0 {
+                    // Dispatch each packet before acquiring the next, retaining the fixed entry
+                    // budget even if these completions post fresh work. Stop wins after each packet.
+                    for _ in 0..self.scheduler.sessions().len().saturating_add(2) {
+                        if self.scheduler.wait_milliseconds(clock.now_ticks(), 1) != 0 {
+                            break;
+                        }
+                        let completions = match transport.poll_deadline_packet(DRAIN_BATCHES) {
+                            Ok(Some(completions)) => completions,
+                            Ok(None) => break,
+                            Err(reason) => {
+                                crate::worker::trace::event("DEADLINE_PACKET_FAILED", &reason);
+                                self.scheduler.mark_fatal();
+                                outcome.failures = outcome.failures.saturating_add(1);
+                                break;
+                            }
+                        };
+                        self.handle_batch(completions, clock, transport, &mut outcome);
+                        if stop.is_requested() || self.scheduler.statistics().fatal {
+                            break;
+                        }
+                    }
+                }
+                if stop.is_requested() {
+                    outcome.controlled_stop = !stop.is_fatal();
+                    break;
+                }
+                if self.scheduler.statistics().fatal {
+                    break;
+                }
+                // Keep the timestamp taken before the direct CQ pass. Newly posted deadlines
+                // anchor to their own current clock readings and cannot expire in this decision.
+                let poll_now = clock.now_ticks();
+                if self.scheduler.wait_milliseconds(poll_now, 1) == 0 {
+                    let completions = match transport.drain_before_deadlines() {
+                        Ok(completions) => completions,
+                        Err(reason) => {
+                            crate::worker::trace::event("DEADLINE_CQ_FAILED", &reason);
+                            self.scheduler.mark_fatal();
+                            outcome.failures = outcome.failures.saturating_add(1);
+                            break;
+                        }
+                    };
+                    self.handle_batch(completions, clock, transport, &mut outcome);
+                }
+                if stop.is_requested() {
+                    outcome.controlled_stop = !stop.is_fatal();
+                    break;
+                }
+                if self.scheduler.statistics().fatal {
+                    break;
+                }
+                self.scheduler
+                    .poll_actions_into(poll_now, &mut expired, &mut timed_actions);
+                let mut position = 0;
+                while position < timed_actions.len() {
+                    match timed_actions[position] {
+                        Action::DrainTimeout(index) => {
+                            transport.check_generation_drain(index);
+                            position += 1;
+                        }
+                        Action::Step(step) => {
+                            let index = match step {
+                                Step::Connect(index)
+                                | Step::Close(index)
+                                | Step::Send { index, .. }
+                                | Step::Receive { index, .. } => index,
+                            };
+                            let mut batch = [Step::Close(0); 3];
+                            let mut count = 0;
+                            while position < timed_actions.len() && count < batch.len() {
+                                let Action::Step(step) = timed_actions[position] else {
+                                    break;
+                                };
+                                let next_index = match step {
+                                    Step::Connect(index)
+                                    | Step::Close(index)
+                                    | Step::Send { index, .. }
+                                    | Step::Receive { index, .. } => index,
+                                };
+                                if next_index != index {
+                                    break;
+                                }
+                                batch[count] = step;
+                                count += 1;
+                                position += 1;
+                            }
+                            self.dispatch(&batch[..count], transport, &mut outcome, clock);
+                        }
+                    }
+                }
             }
 
             // Only an internal failure means no further progress is possible anywhere, and only then
             // may this worker end the run for its peers. Waking them because *this* worker's session
             // lost its connection would truncate their accounting: a peer that is still closing its
             // own generation never reaches the drain event that counts its network failure.
+            if stop.is_fatal() {
+                self.scheduler.mark_fatal();
+                outcome.controlled_stop = false;
+            }
             let terminal = self.scheduler.statistics();
             if !outcome.controlled_stop && terminal.fatal {
                 StopFlag::request_fatal_global();
             }
 
+            self.scheduler.begin_shutdown(clock.now_ticks());
+            self.publish_progress(clock.now_ticks(), true);
             if let Err(reason) = transport.shutdown() {
                 crate::worker::trace::event("TRANSPORT_SHUTDOWN_FAILED", &reason);
                 self.scheduler.mark_fatal();
                 StopFlag::request_fatal_global();
                 outcome.failures = outcome.failures.saturating_add(1);
+            } else {
+                // Successful global shutdown proves every generation's native operations have
+                // retired. Convey that terminal fact to the pure scheduler without reconnecting.
+                for index in 0..self.scheduler.sessions().len() as u32 {
+                    self.scheduler
+                        .on_event(Event::GenerationDrained(index), clock.now_ticks());
+                }
             }
             if let Some(bytes) = transport.sent_bytes() {
                 self.scheduler.set_sent_bytes(bytes);
@@ -1899,6 +2310,25 @@ pub mod worker {
                 .set_elapsed_milliseconds(self.started_at.elapsed().as_millis() as u64);
             self.publish_progress(clock.now_ticks(), true);
             outcome
+        }
+
+        fn handle_batch<C: Clock, T: Transport>(
+            &mut self,
+            completions: Vec<Completion>,
+            clock: &mut C,
+            transport: &mut T,
+            outcome: &mut RunOutcome,
+        ) {
+            if let Some(bytes) = transport.sent_bytes() {
+                self.scheduler.set_sent_bytes(bytes);
+            }
+            for completion in &completions {
+                self.handle_completion(*completion, clock, transport, outcome);
+                if self.scheduler.statistics().fatal {
+                    break;
+                }
+            }
+            transport.recycle(completions);
         }
 
         fn dispatch<C: Clock, T: Transport>(
@@ -1935,13 +2365,15 @@ pub mod worker {
                     }
                 }
                 let result = match *step {
-                    Step::Connect(index) => transport.connect_at(index, &mut || {
+                    Step::Connect(index) => transport.connect_at_static(index, &mut || {
                         self.scheduler
                             .anchor_posted_timeout(index, clock.now_ticks());
                     }),
                     Step::Send { index, bytes } => transport.send(index, bytes),
                     Step::Receive { index, bytes } => transport.receive(index, bytes),
                     Step::Close(index) => {
+                        self.scheduler
+                            .on_event(Event::CloseRequested(index), clock.now_ticks());
                         let result = transport.try_close(index);
                         self.clear_latency_queue(index);
                         result
@@ -1959,7 +2391,10 @@ pub mod worker {
                             format_args!("{step:?} reason={reason}"),
                         );
                         outcome.failures = outcome.failures.saturating_add(1);
-                        if reason.contains("RIONotify") || matches!(step, Step::Close(_)) {
+                        if transport.failure().is_some_and(|failure| {
+                            failure.classification != crate::types::FailureClass::Network
+                        }) || matches!(step, Step::Close(_))
+                        {
                             self.scheduler.mark_fatal();
                         }
 

@@ -117,3 +117,80 @@ pub fn available_processors() -> u32 {
     }
     unsafe { GetActiveProcessorCount(u16::MAX) }
 }
+
+/// Failure metadata shared by pure engines and their runtimes. Native ownership faults are fatal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    Network,
+    Invariant,
+    DrainTimeout,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureDomain {
+    Win32,
+    Winsock,
+    Allocation,
+    Invariant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub classification: FailureClass,
+    pub domain: FailureDomain,
+    pub stage: &'static str,
+    pub code: i32,
+}
+
+impl Failure {
+    pub const fn invariant(stage: &'static str) -> Self {
+        Self {
+            classification: FailureClass::Invariant,
+            domain: FailureDomain::Invariant,
+            stage,
+            code: 13,
+        }
+    }
+    pub const fn timeout(stage: &'static str) -> Self {
+        Self {
+            classification: FailureClass::DrainTimeout,
+            domain: FailureDomain::Win32,
+            stage,
+            code: 1460,
+        }
+    }
+}
+
+/// Pure clock conversions: timer decisions depend only on the supplied counter frequency.
+pub(crate) fn milliseconds_to_ticks(milliseconds: u64, frequency: u64) -> u64 {
+    if let Some(scaled) = milliseconds.checked_mul(frequency) {
+        scaled.div_ceil(1_000)
+    } else {
+        (u128::from(milliseconds) * u128::from(frequency))
+            .div_ceil(1_000)
+            .min(u128::from(u64::MAX)) as u64
+    }
+}
+pub(crate) fn ticks_to_wait_milliseconds(ticks: u64, frequency: u64) -> u64 {
+    if let Some(scaled) = ticks.checked_mul(1_000) {
+        scaled.div_ceil(frequency)
+    } else {
+        (u128::from(ticks) * 1_000)
+            .div_ceil(u128::from(frequency))
+            .min(u128::from(u64::MAX)) as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecyclePhase {
+    Running,
+    Draining,
+    Stopped,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lifecycle {
+    pub phase: LifecyclePhase,
+    pub total_outstanding: u32,
+    pub rio_outstanding: u32,
+    pub notification_armed: bool,
+    pub releasable: bool,
+}

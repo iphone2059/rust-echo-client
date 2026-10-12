@@ -82,10 +82,14 @@ impl Drop for TimerResolution {
 }
 
 impl ConsoleHandler {
-    fn install() -> Result<Self, String> {
+    fn install() -> Result<Self, crate::native::NativeError> {
         let ok = unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 1) };
         if ok == 0 {
-            return Err("SetConsoleCtrlHandler failed".to_string());
+            return Err(crate::native::NativeError {
+                stage: "SetConsoleCtrlHandler",
+                code: unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
+                origin: crate::types::FailureDomain::Win32,
+            });
         }
         Ok(Self)
     }
@@ -132,8 +136,16 @@ fn run_worker(
     wake: WakePort,
     rio: RioFunctions,
     connect_ex: windows::Win32::mswsock::LPFN_CONNECTEX,
-) -> Result<(Statistics, bool, NotificationCounters), String> {
-    let result = (|| -> Result<(Statistics, bool, NotificationCounters), String> {
+) -> Result<
+    (
+        Statistics,
+        bool,
+        NotificationCounters,
+        transport::DrainedOwner,
+    ),
+    String,
+> {
+    let result = (|| -> Result<(Statistics, bool, NotificationCounters, transport::DrainedOwner), String> {
         let _winsock = Winsock::start()
             .map_err(|error| format!("{} failed: native_error={}", error.stage, error.code))?;
         let payload_bytes = u32::try_from(payload.len())
@@ -176,6 +188,7 @@ fn run_worker(
             statistics,
             outcome.controlled_stop,
             transport.notification_counters(),
+            transport.into_drained_owner(),
         ))
     })();
     if result.is_err() {
@@ -398,6 +411,7 @@ pub fn run(options: &Options) -> ExitCode {
     // A worker that returns Err never reached a clean stop, so the run must not be classified from the
     // statistics it left behind: those are partial and a controlled stop would otherwise look clean.
     let mut worker_failure = false;
+    let mut joined_owners = Vec::with_capacity(handles.len());
 
     // Always join every worker. Returning on the first failed handle would detach the rest
     // while they may still own sockets, RIO queues and registered memory. `run_worker`
@@ -405,10 +419,11 @@ pub fn run(options: &Options) -> ExitCode {
     // cleanly here.
     for handle in handles {
         match handle.join() {
-            Ok(Ok((worker_statistics, controlled, snapshot))) => {
+            Ok(Ok((worker_statistics, controlled, snapshot, owner))) => {
                 statistics.merge(&worker_statistics);
                 controlled_stop |= controlled;
                 snapshots.push(snapshot);
+                joined_owners.push(owner);
             }
             Ok(Err(reason)) => {
                 eprintln!("RIO worker failed: {reason}");
@@ -421,6 +436,14 @@ pub fn run(options: &Options) -> ExitCode {
                 StopFlag::request_fatal_global();
             }
         }
+    }
+
+    // Join every owner before any provider release precondition or native teardown.
+    for owner in &joined_owners {
+        owner.require_release();
+    }
+    for owner in joined_owners {
+        owner.release();
     }
 
     // A finite quota the run never claimed is a loss, exactly like the reference: those attempts
@@ -530,8 +553,8 @@ pub mod transport {
 
     use crate::native::arena::Arena;
     use crate::native::completion::{
-        MAXIMUM_SESSION_INDEX, NO_SEND_SLOT, Operation, RequestContext, WSAEMSGSIZE,
-        decode_context, encode_context, next_generation,
+        MAXIMUM_SESSION_INDEX, NO_SEND_SLOT, Operation, RequestContext, decode_context,
+        encode_context, next_generation,
     };
     use crate::native::endpoint::{begin_connect, bind_local, connect_udp, update_connect_context};
     use crate::native::overlapped::PendingOverlapped;
@@ -548,12 +571,12 @@ pub mod transport {
     const WAIT_TIMEOUT: i32 = 258;
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-    fn stage(error: NativeError) -> String {
+    fn stage(error: NativeError) -> NativeError {
         crate::worker::trace::event_args(
             "TRANSPORT_ERROR",
             format_args!("{} code={}", error.stage, error.code),
         );
-        format!("{} (code {})", error.stage, error.code)
+        error
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -570,6 +593,7 @@ pub mod transport {
         /// An earlier completion in this collected batch failed the attempt. The worker still
         /// consumes that completion before changing state, but later sends must not resume it.
         failure_pending: bool,
+        close_deadline: Option<Instant>,
         connect_outstanding: bool,
         send_outstanding: u32,
         receive_outstanding: u32,
@@ -593,6 +617,7 @@ pub mod transport {
                 generation: 0,
                 state: GenerationState::Empty,
                 failure_pending: false,
+                close_deadline: None,
                 connect_outstanding: false,
                 send_outstanding: 0,
                 receive_outstanding: 0,
@@ -608,17 +633,17 @@ pub mod transport {
             }
         }
 
-        fn socket(&self) -> Result<SOCKET, String> {
+        fn socket(&self) -> Result<SOCKET, NativeError> {
             self.socket
                 .as_ref()
                 .map(SocketOwner::raw)
-                .ok_or_else(|| "session has no socket".to_string())
+                .ok_or_else(|| NativeError::invariant("session has no socket"))
         }
 
-        fn queue(&self) -> Result<&RequestQueue, String> {
+        fn queue(&self) -> Result<&RequestQueue, NativeError> {
             self.request_queue
                 .as_ref()
-                .ok_or_else(|| "session has no request queue".to_string())
+                .ok_or_else(|| NativeError::invariant("session has no request queue"))
         }
 
         fn generation_drained(&self) -> bool {
@@ -633,55 +658,73 @@ pub mod transport {
             Some(0)
         }
 
-        fn release_send_slot(&mut self, slot: u32) -> Result<(), String> {
+        fn release_send_slot(&mut self, slot: u32) -> Result<(), NativeError> {
             if slot != 0 {
-                return Err("send completion has an out-of-range slot".to_string());
+                return Err(NativeError::invariant(
+                    "send completion has an out-of-range slot",
+                ));
             }
             if !self.tx_in_use {
-                return Err("send completion references a free slot".to_string());
+                return Err(NativeError::invariant(
+                    "send completion references a free slot",
+                ));
             }
             self.tx_in_use = false;
             Ok(())
         }
 
-        fn reset_generation_storage(&mut self) -> Result<(), String> {
+        fn reset_generation_storage(&mut self) -> Result<(), NativeError> {
             if !self.generation_drained() {
-                return Err("generation released before all completions drained".to_string());
+                return Err(NativeError::invariant(
+                    "generation released before all completions drained",
+                ));
             }
             if self.tx_in_use {
-                return Err("generation drained while a send slot is still busy".to_string());
+                return Err(NativeError::invariant(
+                    "generation drained while a send slot is still busy",
+                ));
             }
             if self.receive_posted_bytes != 0 {
-                return Err("generation drained with a stale receive length".to_string());
+                return Err(NativeError::invariant(
+                    "generation drained with a stale receive length",
+                ));
             }
             if self.send_posted_bytes != 0 || self.send_offset != 0 {
-                return Err("generation drained with a stale send range".to_string());
+                return Err(NativeError::invariant(
+                    "generation drained with a stale send range",
+                ));
             }
             if self.overlapped.is_armed() {
-                return Err("generation drained while ConnectEx OVERLAPPED is armed".to_string());
+                return Err(NativeError::invariant(
+                    "generation drained while ConnectEx OVERLAPPED is armed",
+                ));
             }
             self.request_queue = None;
             self.socket = None;
-            self.overlapped.reset_after_drain().map_err(stage)?;
+            self.overlapped
+                .reset_after_drain()
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
             self.state = GenerationState::Empty;
+            self.close_deadline = None;
             self.failure_pending = false;
             Ok(())
         }
     }
 
     pub struct RioTransport {
-        // Safe fallback drop order if explicit shutdown cannot run to completion:
-        // sessions -> CQ -> IOCP -> CQ notification OVERLAPPED -> registered arena.
-        sessions: Vec<SessionTransport>,
+        // After the mandatory release guard: CQ -> registered arena -> host session storage ->
+        // IOCP -> notification OVERLAPPED. Native counts are zero before any of these drop.
         queue: Option<CompletionQueue>,
+        arena: Option<Arena>,
+        sessions: Vec<SessionTransport>,
         port: Option<CompletionPort>,
         notification_overlapped: Option<Box<OVERLAPPED>>,
-        arena: Option<Arena>,
         rio: RioFunctions,
         connect_ex: LPFN_CONNECTEX,
         results: Vec<RIORESULT>,
         protocol: Protocol,
         pending: Vec<Completion>,
+        last_failure: Option<crate::types::Failure>,
         no_delay: bool,
         send_buffer_bytes: u32,
         receive_buffer_bytes: u32,
@@ -689,7 +732,9 @@ pub mod transport {
         /// Registered bytes one attempt occupies: the payload repeated `batch_capacity` times.
         batch_bytes: u32,
         shutdown_started: bool,
-        resources_leaked: bool,
+        shutdown_deadline: Option<Instant>,
+        completed_buffer: Vec<Completion>,
+        drain_arbitration: Option<Instant>,
         sent_bytes: u64,
         rio_outstanding: u32,
         notify_arms: u64,
@@ -707,14 +752,19 @@ pub mod transport {
             target: SOCKADDR_IN,
             rio: RioFunctions,
             connect_ex: LPFN_CONNECTEX,
-        ) -> Result<Self, String> {
+        ) -> Result<Self, NativeError> {
             if session_count == 0 || payload.is_empty() {
-                return Err(
-                    "transport requires at least one session and one payload byte".to_string(),
-                );
+                return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "transport requires at least one session and one payload byte",
+                    code: 87,
+                });
             }
-            let payload_bytes = u32::try_from(payload.len())
-                .map_err(|_| "payload is too large for a RIO_BUF".to_string())?;
+            let payload_bytes = u32::try_from(payload.len()).map_err(|_| NativeError {
+                origin: crate::types::FailureDomain::Invariant,
+                stage: "payload is too large for a RIO_BUF",
+                code: 87,
+            })?;
             // One attempt is one send plus one receive, whatever /k is: /k is the number of echo
             // units an attempt carries, not the number of concurrent operations. UDP never batches.
             let batch_capacity = if options.protocol == Protocol::Tcp {
@@ -725,48 +775,92 @@ pub mod transport {
             let batch_bytes = u32::try_from(
                 u64::from(payload_bytes)
                     .checked_mul(u64::from(batch_capacity))
-                    .ok_or_else(|| "attempt batch size overflow".to_string())?,
+                    .ok_or_else(|| NativeError {
+                        origin: crate::types::FailureDomain::Invariant,
+                        stage: "attempt batch size overflow",
+                        code: 87,
+                    })?,
             )
-            .map_err(|_| "attempt batch exceeds a RIO buffer".to_string())?;
+            .map_err(|_| NativeError {
+                origin: crate::types::FailureDomain::Invariant,
+                stage: "attempt batch exceeds a RIO buffer",
+                code: 87,
+            })?;
             if u64::from(session_count) > u64::from(MAXIMUM_SESSION_INDEX) + 1 {
-                return Err("session count exceeds request-context capacity".to_string());
+                return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "session count exceeds request-context capacity",
+                    code: 87,
+                });
             }
             if options.cq_capacity == 0 {
-                return Err("completion queue capacity must be non-zero".to_string());
+                return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "completion queue capacity must be non-zero",
+                    code: 87,
+                });
             }
 
             // RQ reservations are charged against the shared CQ. One receive plus one send per
             // session makes the sum exact, not an estimate.
             let per_session = u64::from(MAX_RECEIVE)
                 .checked_add(u64::from(MAX_SEND))
-                .ok_or_else(|| "request queue reservation overflow".to_string())?;
+                .ok_or_else(|| NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "request queue reservation overflow",
+                    code: 87,
+                })?;
             let required_cq = u64::from(session_count)
                 .checked_mul(per_session)
-                .ok_or_else(|| "completion queue reservation overflow".to_string())?;
+                .ok_or_else(|| NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "completion queue reservation overflow",
+                    code: 87,
+                })?;
             if required_cq > u64::from(options.cq_capacity) {
-                return Err(format!(
-                    "completion queue capacity {} is smaller than the {required_cq} entries reserved by {session_count} sessions",
-                    options.cq_capacity
-                ));
+                return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "completion queue capacity",
+                    code: 13,
+                });
             }
 
             // One registered window per session in each direction, each the size of a full attempt.
             let receive_bytes = u64::from(session_count)
                 .checked_mul(u64::from(batch_bytes))
-                .ok_or_else(|| "receive arena size overflow".to_string())?;
+                .ok_or_else(|| NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "receive arena size overflow",
+                    code: 87,
+                })?;
             let send_bytes = u64::from(session_count)
                 .checked_mul(u64::from(batch_bytes))
-                .ok_or_else(|| "send arena size overflow".to_string())?;
-            let required_memory = receive_bytes
-                .checked_add(send_bytes)
-                .ok_or_else(|| "registered memory size overflow".to_string())?;
+                .ok_or_else(|| NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "send arena size overflow",
+                    code: 87,
+                })?;
+            let required_memory =
+                receive_bytes
+                    .checked_add(send_bytes)
+                    .ok_or_else(|| NativeError {
+                        origin: crate::types::FailureDomain::Invariant,
+                        stage: "registered memory size overflow",
+                        code: 87,
+                    })?;
             if required_memory > memory_bytes {
-                return Err(format!(
-                    "RIO registered memory needs {required_memory} bytes (RX {receive_bytes} + TX {send_bytes}) but this worker budget is {memory_bytes}"
-                ));
+                return Err(NativeError {
+                    origin: crate::types::FailureDomain::Allocation,
+                    stage: "RIO registered memory budget",
+                    code: 8,
+                });
             }
             if required_memory > u64::from(u32::MAX) {
-                return Err("worker registered arena exceeds DWORD capacity".to_string());
+                return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "worker registered arena exceeds DWORD capacity",
+                    code: 87,
+                });
             }
 
             // Local declaration order is chosen for the constructor-error path too: Rust drops
@@ -804,14 +898,17 @@ pub mod transport {
                 connect_ex,
                 results: vec![RIORESULT::default(); COMPLETION_BATCH_SIZE],
                 protocol: options.protocol,
-                pending: Vec::new(),
+                pending: Vec::with_capacity(session_count as usize),
+                last_failure: None,
                 no_delay: options.protocol == Protocol::Tcp,
                 send_buffer_bytes: options.socket_buffer_bytes,
                 receive_buffer_bytes: options.socket_buffer_bytes,
                 local_port: options.local_port,
                 batch_bytes,
                 shutdown_started: false,
-                resources_leaked: false,
+                shutdown_deadline: None,
+                completed_buffer: Vec::with_capacity((session_count as usize).saturating_mul(4)),
+                drain_arbitration: None,
                 sent_bytes: 0,
                 rio_outstanding: 0,
                 notify_arms: 0,
@@ -821,10 +918,10 @@ pub mod transport {
             })
         }
 
-        fn queue(&self) -> Result<&CompletionQueue, String> {
+        fn queue(&self) -> Result<&CompletionQueue, NativeError> {
             self.queue
                 .as_ref()
-                .ok_or_else(|| "transport completion queue is closed".to_string())
+                .ok_or_else(|| NativeError::invariant("transport completion queue is closed"))
         }
 
         pub(super) fn notification_counters(&self) -> super::NotificationCounters {
@@ -835,11 +932,14 @@ pub mod transport {
             }
         }
 
-        pub(super) fn set_wake(&mut self, wake: crate::worker::WakePort) -> Result<(), String> {
+        pub(super) fn set_wake(
+            &mut self,
+            wake: crate::worker::WakePort,
+        ) -> Result<(), NativeError> {
             let handle = self.port()?.raw() as usize;
             *wake
                 .lock()
-                .map_err(|_| "worker wake mutex poisoned".to_string())? = handle;
+                .map_err(|_| NativeError::invariant("worker wake mutex poisoned"))? = handle;
             self.wake = Some(wake);
             Ok(())
         }
@@ -853,7 +953,7 @@ pub mod transport {
             }
         }
 
-        fn arm_queue(&mut self) -> Result<(), String> {
+        fn arm_queue(&mut self) -> Result<(), NativeError> {
             if self.rio_outstanding == 0 || self.queue()?.is_armed() {
                 return Ok(());
             }
@@ -864,37 +964,41 @@ pub mod transport {
             let queue = self
                 .queue
                 .as_mut()
-                .ok_or_else(|| "transport completion queue is closed".to_string())?;
-            queue.arm(rio).map_err(stage)?;
+                .ok_or_else(|| NativeError::invariant("transport completion queue is closed"))?;
+            queue
+                .arm(rio)
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
             self.notify_arms = self.notify_arms.saturating_add(1);
             Ok(())
         }
 
-        fn port(&self) -> Result<&CompletionPort, String> {
+        fn port(&self) -> Result<&CompletionPort, NativeError> {
             self.port
                 .as_ref()
-                .ok_or_else(|| "transport completion port is closed".to_string())
+                .ok_or_else(|| NativeError::invariant("transport completion port is closed"))
         }
 
-        fn generation_of(&self, index: u32) -> Result<u32, String> {
+        fn generation_of(&self, index: u32) -> Result<u32, NativeError> {
             self.sessions
                 .get(index as usize)
                 .map(|slot| slot.generation)
-                .ok_or_else(|| "session index out of range".to_string())
+                .ok_or_else(|| NativeError::invariant("session index out of range"))
         }
 
-        fn prepare(&mut self, index: u32) -> Result<(), String> {
+        fn prepare(&mut self, index: u32) -> Result<(), NativeError> {
             if self.shutdown_started {
-                return Err("transport is shutting down".to_string());
+                return Err(NativeError::invariant("transport is shutting down"));
             }
             let slot_index = index as usize;
             let current_generation = self
                 .sessions
                 .get(slot_index)
-                .ok_or_else(|| "session index out of range".to_string())?
+                .ok_or_else(|| NativeError::invariant("session index out of range"))?
                 .generation;
             if self.sessions[slot_index].state != GenerationState::Empty {
-                return Err("previous connection generation has not drained".to_string());
+                return Err(NativeError::invariant(
+                    "previous connection generation has not drained",
+                ));
             }
             let generation = next_generation(current_generation);
 
@@ -908,10 +1012,11 @@ pub mod transport {
                 )
             };
             if associated.is_null() {
-                return Err(format!(
-                    "CreateIoCompletionPort(socket) failed with {}",
-                    unsafe { windows::Win32::errhandlingapi::GetLastError() }
-                ));
+                return Err(NativeError {
+                    origin: crate::types::FailureDomain::Win32,
+                    stage: "CreateIoCompletionPort(socket)",
+                    code: unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
+                });
             }
 
             configure_socket(
@@ -933,7 +1038,9 @@ pub mod transport {
             slot.tx_in_use = false;
             slot.request_queue = None;
             slot.socket = Some(socket);
-            slot.overlapped.reset_after_drain().map_err(stage)?;
+            slot.overlapped
+                .reset_after_drain()
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
 
             crate::worker::trace::event_args(
                 "GENERATION_BEGIN",
@@ -942,18 +1049,18 @@ pub mod transport {
             Ok(())
         }
 
-        fn tx_global_slot(&self, index: u32, slot: u32) -> Result<u32, String> {
+        fn tx_global_slot(&self, index: u32, slot: u32) -> Result<u32, NativeError> {
             if slot != 0 || index as usize >= self.sessions.len() {
-                return Err("TX slot index exceeds arena".to_string());
+                return Err(NativeError::invariant("TX slot index exceeds arena"));
             }
             Ok(index)
         }
 
-        fn finish_generation(&mut self, index: u32) -> Result<Completion, String> {
+        fn finish_generation(&mut self, index: u32) -> Result<Completion, NativeError> {
             let slot = self
                 .sessions
                 .get_mut(index as usize)
-                .ok_or_else(|| "session index out of range".to_string())?;
+                .ok_or_else(|| NativeError::invariant("session index out of range"))?;
             let generation = slot.generation;
             slot.reset_generation_storage()?;
             crate::worker::trace::event_args(
@@ -970,10 +1077,10 @@ pub mod transport {
             })
         }
 
-        fn begin_close(&mut self, index: u32) -> Result<(), String> {
+        fn begin_close(&mut self, index: u32) -> Result<(), NativeError> {
             let slot_index = index as usize;
             let Some(slot) = self.sessions.get_mut(slot_index) else {
-                return Err("session index out of range".to_string());
+                return Err(NativeError::invariant("session index out of range"));
             };
             if slot.state == GenerationState::Closing {
                 return Ok(());
@@ -1001,6 +1108,7 @@ pub mod transport {
                 format_args!("session={index} generation={}", slot.generation),
             );
             slot.state = GenerationState::Closing;
+            slot.close_deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
             // closesocket releases the RQ and starts cancellation. Keep the RQ value,
             // OVERLAPPED and registered buffers alive until their completions are dequeued.
             drop(slot.socket.take());
@@ -1025,10 +1133,12 @@ pub mod transport {
             mut status: i32,
             bytes: u32,
             completions: &mut Vec<Completion>,
-        ) -> Result<(), String> {
+        ) -> Result<(), NativeError> {
             let slot_index = context.index as usize;
             let Some(session) = self.sessions.get_mut(slot_index) else {
-                return Err("completion has an out-of-range session index".to_string());
+                return Err(NativeError::invariant(
+                    "completion has an out-of-range session index",
+                ));
             };
             if context.generation != session.generation {
                 crate::worker::trace::event_args(
@@ -1038,7 +1148,7 @@ pub mod transport {
                         context.index, context.generation, session.generation
                     ),
                 );
-                return Ok(());
+                return Err(NativeError::invariant("completion from retired generation"));
             }
 
             let closing = session.state == GenerationState::Closing;
@@ -1049,25 +1159,38 @@ pub mod transport {
             match context.operation {
                 Operation::Connect => {
                     if !session.connect_outstanding {
-                        return Err("duplicate/unexpected ConnectEx completion".to_string());
+                        return Err(NativeError::invariant(
+                            "duplicate/unexpected ConnectEx completion",
+                        ));
+                    }
+                    if !session.overlapped.is_armed() || bytes != 0 {
+                        crate::native::fail_fast("ConnectEx completion metadata", 13);
                     }
                     session.connect_outstanding = false;
-                    session.overlapped.complete().map_err(stage)?;
+                    session
+                        .overlapped
+                        .complete()
+                        .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
                 }
                 Operation::Send => {
                     if session.send_outstanding != 1 || context.slot != session.send_slot {
-                        return Err("send completion arrived with no send outstanding".to_string());
+                        return Err(NativeError::invariant(
+                            "send completion arrived with no send outstanding",
+                        ));
+                    }
+                    let remaining = session
+                        .send_posted_bytes
+                        .checked_sub(session.send_offset)
+                        .ok_or_else(|| NativeError::invariant("send offset exceeds its request"))?;
+                    if bytes > remaining {
+                        crate::native::fail_fast("client send completion exceeds posted range", 13);
                     }
                     self.rio_outstanding = self
                         .rio_outstanding
                         .checked_sub(1)
-                        .ok_or_else(|| "RIO send completion underflow".to_string())?;
+                        .ok_or_else(|| NativeError::invariant("RIO send completion underflow"))?;
                     session.send_outstanding -= 1;
-                    let remaining = session
-                        .send_posted_bytes
-                        .checked_sub(session.send_offset)
-                        .ok_or_else(|| "send offset exceeds its request".to_string())?;
-                    if status == 0 && !suppress_send && (bytes == 0 || bytes > remaining) {
+                    if status == 0 && !suppress_send && bytes == 0 {
                         status = crate::native::completion::WSAECONNRESET;
                     }
                     if status == 0 && !suppress_send {
@@ -1091,9 +1214,11 @@ pub mod transport {
                         let buffer = self
                             .arena
                             .as_ref()
-                            .ok_or_else(|| "send arena is unavailable".to_string())?
+                            .ok_or_else(|| NativeError::invariant("send arena is unavailable"))?
                             .send_view_from(global_slot, offset, remaining)
-                            .map_err(stage)?;
+                            .unwrap_or_else(|error| {
+                                crate::native::fail_fast(error.stage, error.code)
+                            });
                         let reposted = self.sessions[slot_index].queue()?.send(
                             &self.rio,
                             &buffer,
@@ -1126,21 +1251,19 @@ pub mod transport {
                 }
                 Operation::Receive => {
                     if session.receive_outstanding != 1 || session.receive_posted_bytes == 0 {
-                        return Err(
-                            "receive completion arrived without exactly one receive outstanding"
-                                .to_string(),
-                        );
-                    }
-                    self.rio_outstanding = self
-                        .rio_outstanding
-                        .checked_sub(1)
-                        .ok_or_else(|| "RIO receive completion underflow".to_string())?;
-                    if bytes > session.receive_posted_bytes && status != WSAEMSGSIZE {
-                        return Err(format!(
-                            "receive completion transferred {bytes} bytes into a {}-byte request",
-                            session.receive_posted_bytes
+                        return Err(NativeError::invariant(
+                            "receive completion arrived without exactly one receive outstanding",
                         ));
                     }
+                    if bytes > session.receive_posted_bytes {
+                        return Err(NativeError::invariant(
+                            "receive completion exceeds posted range",
+                        ));
+                    }
+                    self.rio_outstanding =
+                        self.rio_outstanding.checked_sub(1).ok_or_else(|| {
+                            NativeError::invariant("RIO receive completion underflow")
+                        })?;
                     if !closing
                         && self.protocol == Protocol::Tcp
                         && bytes != session.receive_posted_bytes
@@ -1151,7 +1274,9 @@ pub mod transport {
                     session.receive_posted_bytes = 0;
                 }
                 Operation::GenerationDrained => {
-                    return Err("GenerationDrained cannot come from an OS request".to_string());
+                    return Err(NativeError::invariant(
+                        "GenerationDrained cannot come from an OS request",
+                    ));
                 }
             }
 
@@ -1184,19 +1309,38 @@ pub mod transport {
             &mut self,
             budget: u32,
             completions: &mut Vec<Completion>,
-        ) -> Result<(), String> {
+        ) -> Result<(), NativeError> {
+            self.drain_rio_bounded_into(budget, None, completions)
+        }
+
+        fn drain_rio_bounded_into(
+            &mut self,
+            budget: u32,
+            mut records: Option<u32>,
+            completions: &mut Vec<Completion>,
+        ) -> Result<(), NativeError> {
             for _ in 0..budget {
+                let capacity = records.map_or(self.results.len(), |remaining| {
+                    (remaining as usize).min(self.results.len())
+                });
+                if capacity == 0 {
+                    break;
+                }
                 let count = {
                     let rio = &self.rio;
                     let results = &mut self.results;
-                    let queue = self
-                        .queue
-                        .as_mut()
-                        .ok_or_else(|| "transport completion queue is closed".to_string())?;
-                    queue.dequeue(rio, results).map_err(stage)?
+                    let queue = self.queue.as_mut().ok_or_else(|| {
+                        NativeError::invariant("transport completion queue is closed")
+                    })?;
+                    queue
+                        .dequeue(rio, &mut results[..capacity])
+                        .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code))
                 };
                 if count == 0 {
                     break;
+                }
+                if let Some(remaining) = &mut records {
+                    *remaining -= count;
                 }
                 // Do not clear the RIONotify armed state merely because CQ entries were
                 // dequeued. The one-shot notification is retired only when its IOCP packet is
@@ -1205,8 +1349,12 @@ pub mod transport {
                 // is still queued.
                 for position in 0..count as usize {
                     let item = self.results[position];
-                    let context = decode_context(item.RequestContext)
-                        .ok_or_else(|| "completion has an invalid request context".to_string())?;
+                    let context = decode_context(item.RequestContext).ok_or_else(|| {
+                        NativeError::invariant("completion has an invalid request context")
+                    })?;
+                    if !matches!(context.operation, Operation::Send | Operation::Receive) {
+                        return Err(NativeError::invariant("RIO completion operation"));
+                    }
                     self.retire_into(context, item.Status, item.BytesTransferred, completions)?;
                 }
             }
@@ -1217,7 +1365,7 @@ pub mod transport {
             &mut self,
             wait_ms: u32,
             completions: &mut Vec<Completion>,
-        ) -> Result<bool, String> {
+        ) -> Result<Option<bool>, NativeError> {
             let mut bytes = 0u32;
             let mut key = 0u64;
             let mut overlapped: *mut OVERLAPPED = ptr::null_mut();
@@ -1237,111 +1385,143 @@ pub mod transport {
                 (unsafe { windows::Win32::errhandlingapi::GetLastError() }) as i32
             };
             if error == 0 && key == 1 && overlapped.is_null() {
-                return Ok(false);
+                return Ok(Some(false));
             }
             if key as usize == crate::native::rio::RIO_COMPLETION_KEY {
                 let expected = self
                     .notification_overlapped
                     .as_mut()
                     .map(|value| &mut **value as *mut OVERLAPPED)
-                    .ok_or_else(|| "RIO notification OVERLAPPED is unavailable".to_string())?;
-                if error != 0 || overlapped != expected {
-                    return Err("invalid RIO notification packet identity/status".to_string());
+                    .ok_or_else(|| {
+                        NativeError::invariant("RIO notification OVERLAPPED is unavailable")
+                    })?;
+                if error != 0 {
+                    crate::native::fail_fast(
+                        "GetQueuedCompletionStatus(client notification)",
+                        error,
+                    );
+                }
+                if overlapped != expected {
+                    crate::native::fail_fast("invalid RIO notification packet identity", 13);
                 }
                 self.queue
                     .as_mut()
-                    .ok_or_else(|| "transport completion queue is closed".to_string())?
+                    .ok_or_else(|| NativeError::invariant("transport completion queue is closed"))?
                     .on_delivery()
-                    .map_err(stage)?;
+                    .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
                 self.notify_deliveries = self.notify_deliveries.saturating_add(1);
-                return Ok(true);
+                return Ok(Some(true));
             }
             if !overlapped.is_null() {
                 let context = decode_context(key).ok_or_else(|| {
-                    "failed IOCP completion has an invalid completion key".to_string()
+                    NativeError::invariant("failed IOCP completion has an invalid completion key")
                 })?;
                 if context.operation != Operation::Connect {
-                    return Err("non-ConnectEx operation arrived through IOCP".to_string());
+                    return Err(NativeError::invariant(
+                        "non-ConnectEx operation arrived through IOCP",
+                    ));
                 }
                 let slot = self
                     .sessions
                     .get_mut(context.index as usize)
-                    .ok_or_else(|| "ConnectEx packet has an invalid session index".to_string())?;
+                    .ok_or_else(|| {
+                        NativeError::invariant("ConnectEx packet has an invalid session index")
+                    })?;
                 if context.generation != slot.generation
                     || overlapped != slot.overlapped.as_mut_ptr()
                 {
-                    return Err("invalid ConnectEx completion identity".to_string());
+                    return Err(NativeError::invariant(
+                        "invalid ConnectEx completion identity",
+                    ));
                 }
                 self.retire_into(context, error, bytes, completions)?;
-                return Ok(false);
+                return Ok(Some(false));
             }
             if error == WAIT_TIMEOUT && key == 0 {
                 if self.rio_outstanding != 0 && !self.queue()?.is_armed() {
                     self.timeout_wakeups_while_outstanding =
                         self.timeout_wakeups_while_outstanding.saturating_add(1);
                 }
-                Ok(false)
+                Ok(None)
             } else {
-                Err(format!(
-                    "unexpected GetQueuedCompletionStatus packet ({error})"
-                ))
+                Err(NativeError {
+                    origin: crate::types::FailureDomain::Win32,
+                    stage: "GetQueuedCompletionStatus(client)",
+                    code: if error == 0 { 13 } else { error },
+                })
+            }
+        }
+
+        fn lifecycle_snapshot(&self) -> crate::types::Lifecycle {
+            let total_outstanding = self.sessions.iter().fold(0u32, |count, session| {
+                count
+                    .saturating_add(u32::from(session.connect_outstanding))
+                    .saturating_add(session.send_outstanding)
+                    .saturating_add(session.receive_outstanding)
+            });
+            let releasable = total_outstanding == 0
+                && self.rio_outstanding == 0
+                && self.sessions.iter().all(|session| {
+                    !session.overlapped.is_armed()
+                        && !session.tx_in_use
+                        && session.send_posted_bytes == 0
+                        && session.receive_posted_bytes == 0
+                });
+            crate::types::Lifecycle {
+                phase: if self.shutdown_started {
+                    if releasable {
+                        crate::types::LifecyclePhase::Stopped
+                    } else {
+                        crate::types::LifecyclePhase::Draining
+                    }
+                } else {
+                    crate::types::LifecyclePhase::Running
+                },
+                total_outstanding,
+                rio_outstanding: self.rio_outstanding,
+                notification_armed: self.queue.as_ref().is_some_and(CompletionQueue::is_armed),
+                releasable,
+            }
+        }
+
+        fn require_release(&self) {
+            if !self.lifecycle_snapshot().releasable {
+                crate::native::fail_fast("client worker release precondition", 996);
             }
         }
 
         fn release_resources(&mut self) {
+            self.require_release();
             self.clear_wake_port();
-            // The notification OVERLAPPED and IOCP both outlive the CQ configuration. Close the
-            // CQ first, then close the IOCP so any already-queued notification packet can no
-            // longer be retrieved, and only then free the notification OVERLAPPED. Registered
-            // buffers are released last; all native requests have already been retired here.
+            // The notification OVERLAPPED and IOCP outlive the CQ, registered arena, and host
+            // session storage. Every provider-held request was already retired by the guard.
             drop(self.queue.take());
+            drop(self.arena.take());
+            drop(core::mem::take(&mut self.sessions));
+            drop(core::mem::take(&mut self.results));
+            drop(core::mem::take(&mut self.pending));
+            drop(core::mem::take(&mut self.completed_buffer));
             drop(self.port.take());
             drop(self.notification_overlapped.take());
-            drop(self.arena.take());
         }
 
-        fn leak_resources(&mut self, reason: &str) {
-            self.clear_wake_port();
-            crate::worker::trace::event("SHUTDOWN_LEAK", reason);
-            // Memory safety wins over cleanup if Windows/provider state is no longer observable.
-            // The process will reclaim these objects; freeing them while I/O may still reference
-            // them would be undefined behaviour.
-            for session in &mut self.sessions {
-                drop(session.socket.take());
-            }
-            let sessions = core::mem::take(&mut self.sessions);
-            core::mem::forget(sessions);
-            if let Some(value) = self.queue.take() {
-                core::mem::forget(value);
-            }
-            if let Some(value) = self.arena.take() {
-                core::mem::forget(value);
-            }
-            if let Some(value) = self.notification_overlapped.take() {
-                core::mem::forget(value);
-            }
-            if let Some(value) = self.port.take() {
-                core::mem::forget(value);
-            }
-            self.resources_leaked = true;
-        }
-
-        pub fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<(), String> {
-            if self.resources_leaked || self.queue.is_none() {
+        pub fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<(), NativeError> {
+            if self.queue.is_none() {
                 return Ok(());
             }
             if !self.shutdown_started {
                 self.shutdown_started = true;
+                // This caller cap starts at the first global stop. Older generations keep their
+                // own first-close limits, but their drained deadlines cannot shorten other slots.
+                self.shutdown_deadline = Some(Instant::now() + timeout);
                 self.pending.clear();
                 for index in 0..self.sessions.len() as u32 {
                     if let Err(error) = self.begin_close(index) {
-                        self.leak_resources(&error);
-                        return Err(error);
+                        crate::native::fail_fast(error.stage, error.code);
                     }
                 }
             }
 
-            let started = Instant::now();
             loop {
                 if self
                     .sessions
@@ -1349,22 +1529,13 @@ pub mod transport {
                     .all(|session| session.state == GenerationState::Empty)
                 {
                     self.pending.clear();
-                    self.release_resources();
+                    self.clear_wake_port();
                     crate::worker::trace::event("SHUTDOWN", "all generations drained");
                     return Ok(());
                 }
-                if started.elapsed() >= timeout {
-                    let reason = "shutdown timed out before all connection generations drained";
-                    self.leak_resources(reason);
-                    return Err(reason.to_string());
-                }
-
                 match self.wait_and_drain(50, 64) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        self.leak_resources(&error);
-                        return Err(error);
-                    }
+                    Ok(completions) => self.recycle(completions),
+                    Err(error) => crate::native::fail_fast(error.stage, error.code),
                 }
             }
         }
@@ -1372,12 +1543,39 @@ pub mod transport {
 
     impl Drop for RioTransport {
         fn drop(&mut self) {
+            if std::thread::panicking() {
+                crate::native::fail_fast("client worker panic with native resources", 13);
+            }
             let _ = self.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
+            self.release_resources();
         }
     }
 
-    impl Transport for RioTransport {
-        fn try_close(&mut self, index: u32) -> Result<(), String> {
+    /// Only a successfully quiesced transport crosses the JoinHandle boundary. The registered
+    /// arena and notification OVERLAPPED retain their heap addresses until coordinator release.
+    pub(super) struct DrainedOwner {
+        transport: RioTransport,
+    }
+    // SAFETY: its private constructor follows successful shutdown. Heap addresses remain stable
+    // across the ownership move; the resources have no native thread affinity and no other thread
+    // retains a reference. The coordinator performs every Join before collective release checks.
+    unsafe impl Send for DrainedOwner {}
+    impl DrainedOwner {
+        pub(super) fn require_release(&self) {
+            self.transport.require_release();
+        }
+        pub(super) fn release(mut self) {
+            self.transport.release_resources();
+        }
+    }
+    impl RioTransport {
+        pub(super) fn into_drained_owner(self) -> DrainedOwner {
+            DrainedOwner { transport: self }
+        }
+    }
+
+    impl RioTransport {
+        fn try_close(&mut self, index: u32) -> Result<(), NativeError> {
             self.begin_close(index)
         }
 
@@ -1385,11 +1583,15 @@ pub mod transport {
             Some(self.sent_bytes)
         }
 
-        fn connect(&mut self, index: u32) -> Result<(), String> {
+        fn connect(&mut self, index: u32) -> Result<(), NativeError> {
             self.connect_at(index, &mut || {})
         }
 
-        fn connect_at(&mut self, index: u32, before_post: &mut dyn FnMut()) -> Result<(), String> {
+        fn connect_at<F: FnMut()>(
+            &mut self,
+            index: u32,
+            before_post: &mut F,
+        ) -> Result<(), NativeError> {
             self.prepare(index)?;
             let slot_index = index as usize;
             let generation = self.generation_of(index)?;
@@ -1421,7 +1623,9 @@ pub mod transport {
             let result = {
                 let connect_ex = self.connect_ex;
                 let slot = &mut self.sessions[slot_index];
-                slot.overlapped.arm().map_err(stage)?;
+                slot.overlapped
+                    .arm()
+                    .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
                 let socket = slot.socket()?;
                 let target = slot.target;
                 let overlapped = slot.overlapped.as_mut_ptr();
@@ -1447,20 +1651,24 @@ pub mod transport {
             }
         }
 
-        fn connected(&mut self, index: u32, generation: u32) -> Result<(), String> {
+        fn connected(&mut self, index: u32, generation: u32) -> Result<(), NativeError> {
             let protocol = self.protocol;
             let queue_raw = self.queue()?.raw();
             let rio = self.rio;
             let slot = self
                 .sessions
                 .get_mut(index as usize)
-                .ok_or_else(|| "session index out of range".to_string())?;
+                .ok_or_else(|| NativeError::invariant("session index out of range"))?;
             if slot.generation != generation || slot.state != GenerationState::Connecting {
-                return Err("connect completion does not belong to the live generation".to_string());
+                return Err(NativeError::invariant(
+                    "connect completion does not belong to the live generation",
+                ));
             }
             if protocol == Protocol::Tcp && (slot.connect_outstanding || slot.overlapped.is_armed())
             {
-                return Err("ConnectEx completion was not retired before connected()".to_string());
+                return Err(NativeError::invariant(
+                    "ConnectEx completion was not retired before connected()",
+                ));
             }
             if protocol == Protocol::Tcp {
                 update_connect_context(slot.socket()?).map_err(stage)?;
@@ -1487,32 +1695,40 @@ pub mod transport {
             Ok(())
         }
 
-        fn send(&mut self, index: u32, bytes: u32) -> Result<(), String> {
+        fn send(&mut self, index: u32, bytes: u32) -> Result<(), NativeError> {
             if self.shutdown_started {
-                return Err("transport is shutting down".to_string());
+                return Err(NativeError::invariant("transport is shutting down"));
             }
             let slot_index = index as usize;
             let generation = self.generation_of(index)?;
             if self.sessions[slot_index].state != GenerationState::Active {
-                return Err("send attempted outside an active generation".to_string());
+                return Err(NativeError::invariant(
+                    "send attempted outside an active generation",
+                ));
             }
             if bytes == 0 || bytes > self.batch_bytes {
-                return Err("invalid send length".to_string());
+                return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "invalid send length",
+                    code: 87,
+                });
             }
             if self.sessions[slot_index].send_outstanding >= MAX_SEND {
-                return Err("RIO send depth exceeded".to_string());
+                return Err(NativeError::invariant("RIO send depth exceeded"));
             }
 
             let send_slot = self.sessions[slot_index]
                 .allocate_send_slot()
-                .ok_or_else(|| "no free TX slot despite available send depth".to_string())?;
+                .ok_or_else(|| {
+                    NativeError::invariant("no free TX slot despite available send depth")
+                })?;
             let global_slot = self.tx_global_slot(index, send_slot)?;
             let buffer = self
                 .arena
                 .as_ref()
-                .ok_or_else(|| "send arena is unavailable".to_string())?
+                .ok_or_else(|| NativeError::invariant("send arena is unavailable"))?
                 .send_view(global_slot, bytes)
-                .map_err(stage)?;
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
             let context = encode_context(index, generation, send_slot, Operation::Send);
             let posted = self.sessions[slot_index]
                 .queue()?
@@ -1537,28 +1753,36 @@ pub mod transport {
             Ok(())
         }
 
-        fn receive(&mut self, index: u32, bytes: u32) -> Result<(), String> {
+        fn receive(&mut self, index: u32, bytes: u32) -> Result<(), NativeError> {
             if self.shutdown_started {
-                return Err("transport is shutting down".to_string());
+                return Err(NativeError::invariant("transport is shutting down"));
             }
             let slot_index = index as usize;
             let generation = self.generation_of(index)?;
             if self.sessions[slot_index].state != GenerationState::Active {
-                return Err("receive attempted outside an active generation".to_string());
+                return Err(NativeError::invariant(
+                    "receive attempted outside an active generation",
+                ));
             }
             if self.sessions[slot_index].receive_outstanding != 0 {
-                return Err("second RIOReceive posted for the same session".to_string());
+                return Err(NativeError::invariant(
+                    "second RIOReceive posted for the same session",
+                ));
             }
             if bytes == 0 || bytes > self.batch_bytes {
-                return Err("invalid receive length".to_string());
+                return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
+                    stage: "invalid receive length",
+                    code: 87,
+                });
             }
 
             let buffer = self
                 .arena
                 .as_ref()
-                .ok_or_else(|| "receive arena is unavailable".to_string())?
+                .ok_or_else(|| NativeError::invariant("receive arena is unavailable"))?
                 .receive_view(index, bytes)
-                .map_err(stage)?;
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
             self.sessions[slot_index]
                 .queue()?
                 .receive(
@@ -1585,7 +1809,7 @@ pub mod transport {
 
         fn close(&mut self, index: u32) {
             if let Err(error) = self.begin_close(index) {
-                crate::worker::trace::event("CLOSE_ERROR", &error);
+                crate::native::fail_fast(error.stage, error.code);
             }
         }
 
@@ -1612,8 +1836,9 @@ pub mod transport {
                 .unwrap_or(&[])
         }
 
-        fn drain(&mut self, budget: u32) -> Result<Vec<Completion>, String> {
-            let mut completions = Vec::with_capacity(self.results.len());
+        fn drain(&mut self, budget: u32) -> Result<Vec<Completion>, NativeError> {
+            let mut completions = core::mem::take(&mut self.completed_buffer);
+            completions.extend(self.pending.drain(..));
             self.drain_rio_into(budget, &mut completions)?;
             // RIONotify is one-shot. If native work remains after a drain, re-arm even when the
             // scheduler did not post a replacement operation (for example, only a receive is
@@ -1628,16 +1853,108 @@ pub mod transport {
             &mut self,
             wait_milliseconds: u32,
             budget: u32,
-        ) -> Result<Vec<Completion>, String> {
-            let mut completions = core::mem::take(&mut self.pending);
+        ) -> Result<Vec<Completion>, NativeError> {
+            let mut completions = core::mem::take(&mut self.completed_buffer);
+            completions.extend(self.pending.drain(..));
+            let grace_wait = self
+                .sessions
+                .iter()
+                .filter_map(|session| session.close_deadline)
+                .chain(self.shutdown_deadline)
+                .map(|deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(u128::from(u32::MAX)) as u32
+                })
+                .min()
+                .unwrap_or(wait_milliseconds);
             let wait = if completions.is_empty() {
-                wait_milliseconds
+                wait_milliseconds.min(grace_wait)
             } else {
                 0
             };
-            if self.wait_iocp_once_into(wait, &mut completions)? {
+            if self.wait_iocp_once_into(wait, &mut completions)? == Some(true) {
                 self.drain_rio_into(budget, &mut completions)?;
             }
+            let arbitration = Instant::now();
+            self.drain_arbitration = Some(arbitration);
+            let due = self
+                .shutdown_deadline
+                .is_some_and(|deadline| arbitration >= deadline)
+                || self.sessions.iter().any(|session| {
+                    session
+                        .close_deadline
+                        .is_some_and(|deadline| arbitration >= deadline)
+                });
+            // The grace can expire during the blocking wait. Give queued ConnectEx, control,
+            // and notification packets a bounded zero-wait pass before checking ownership.
+            if due {
+                for _ in 0..self.sessions.len().saturating_add(2) {
+                    if self.wait_iocp_once_into(0, &mut completions)? == Some(true) {
+                        self.drain_rio_into(budget, &mut completions)?;
+                    }
+                }
+            }
+            if self.rio_outstanding != 0 {
+                self.arm_queue()?;
+            }
+            // RIONotify delivery can lag behind already-queued RIO results. At the release
+            // deadline inspect the CQ itself, without retiring the notification's armed state.
+            // At most two native RIO operations per session can be held by the provider; allow
+            // one nonempty dequeue per operation even when the provider returns short batches.
+            if due {
+                let records = (self.sessions.len() as u32).saturating_mul(2);
+                self.drain_rio_bounded_into(records, Some(records), &mut completions)?;
+            }
+            for session in &self.sessions {
+                if session
+                    .close_deadline
+                    .is_some_and(|deadline| arbitration >= deadline)
+                    && !session.generation_drained()
+                {
+                    crate::native::fail_fast("client generation drain", 1460);
+                }
+            }
+            if self
+                .shutdown_deadline
+                .is_some_and(|deadline| arbitration >= deadline)
+                && self
+                    .sessions
+                    .iter()
+                    .any(|session| !session.generation_drained())
+            {
+                crate::native::fail_fast("client shutdown drain", 1460);
+            }
+            Ok(completions)
+        }
+
+        fn poll_deadline_packet(
+            &mut self,
+            budget: u32,
+        ) -> Result<Option<Vec<Completion>>, NativeError> {
+            let mut completions = core::mem::take(&mut self.completed_buffer);
+            completions.extend(self.pending.drain(..));
+            let packet = self.wait_iocp_once_into(0, &mut completions)?;
+            if packet == Some(true) {
+                self.drain_rio_into(budget, &mut completions)?;
+            }
+            if self.rio_outstanding != 0 {
+                self.arm_queue()?;
+            }
+            if packet.is_none() && completions.is_empty() {
+                self.completed_buffer = completions;
+                Ok(None)
+            } else {
+                Ok(Some(completions))
+            }
+        }
+
+        fn drain_before_deadlines(&mut self) -> Result<Vec<Completion>, NativeError> {
+            let mut completions = core::mem::take(&mut self.completed_buffer);
+            completions.extend(self.pending.drain(..));
+            let records = (self.sessions.len() as u32).saturating_mul(2);
+            self.drain_rio_bounded_into(records, Some(records), &mut completions)?;
             if self.rio_outstanding != 0 {
                 self.arm_queue()?;
             }
@@ -1650,12 +1967,117 @@ pub mod transport {
             completions.clear();
             // Handling this batch can synchronously retire a generation and enqueue its drain
             // event. Preserve those new control completions when returning the reusable buffer.
-            completions.append(&mut self.pending);
-            self.pending = completions;
+            self.completed_buffer = completions;
         }
 
-        fn shutdown(&mut self) -> Result<(), String> {
+        fn shutdown(&mut self) -> Result<(), NativeError> {
             self.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
+        }
+    }
+
+    impl RioTransport {
+        fn report_failure(&mut self, error: NativeError) -> String {
+            self.last_failure = Some(crate::types::Failure {
+                classification: crate::types::FailureClass::Network,
+                domain: error.origin,
+                stage: error.stage,
+                code: error.code,
+            });
+            eprintln!("{} failed: native_error={}", error.stage, error.code);
+            String::new()
+        }
+    }
+
+    impl Transport for RioTransport {
+        fn failure(&self) -> Option<crate::types::Failure> {
+            self.last_failure
+        }
+        fn lifecycle(&self) -> Option<crate::types::Lifecycle> {
+            Some(self.lifecycle_snapshot())
+        }
+        fn generation_outstanding(&self, index: u32) -> bool {
+            self.sessions
+                .get(index as usize)
+                .is_some_and(|session| !session.generation_drained())
+        }
+        fn check_generation_drain(&self, index: u32) {
+            // The pure QPC timer can expire slightly before its native close timestamp. Only
+            // the saved Instant arbitration has proved a due CQ received its bounded pass.
+            if self.sessions.get(index as usize).is_some_and(|session| {
+                self.drain_arbitration.is_some_and(|arbitration| {
+                    session
+                        .close_deadline
+                        .is_some_and(|deadline| arbitration >= deadline)
+                }) && !session.generation_drained()
+            }) {
+                crate::native::fail_fast("client generation drain", 1460);
+            }
+        }
+        fn connect(&mut self, index: u32) -> Result<(), String> {
+            RioTransport::connect(self, index).map_err(|error| self.report_failure(error))
+        }
+        fn connect_at(&mut self, index: u32, before_post: &mut dyn FnMut()) -> Result<(), String> {
+            RioTransport::connect_at(self, index, &mut || before_post())
+                .map_err(|error| self.report_failure(error))
+        }
+        fn connect_at_static<F: FnMut()>(
+            &mut self,
+            index: u32,
+            before_post: &mut F,
+        ) -> Result<(), String> {
+            RioTransport::connect_at(self, index, before_post)
+                .map_err(|error| self.report_failure(error))
+        }
+        fn connected(&mut self, index: u32, generation: u32) -> Result<(), String> {
+            RioTransport::connected(self, index, generation)
+                .map_err(|error| self.report_failure(error))
+        }
+        fn send(&mut self, index: u32, bytes: u32) -> Result<(), String> {
+            RioTransport::send(self, index, bytes).map_err(|error| self.report_failure(error))
+        }
+        fn receive(&mut self, index: u32, bytes: u32) -> Result<(), String> {
+            RioTransport::receive(self, index, bytes).map_err(|error| self.report_failure(error))
+        }
+        fn close(&mut self, index: u32) {
+            RioTransport::close(self, index);
+        }
+        fn try_close(&mut self, index: u32) -> Result<(), String> {
+            RioTransport::try_close(self, index)
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
+            Ok(())
+        }
+        fn sent_bytes(&self) -> Option<u64> {
+            RioTransport::sent_bytes(self)
+        }
+        fn completion_is_live(&self, index: u32, generation: u32) -> bool {
+            RioTransport::completion_is_live(self, index, generation)
+        }
+        fn received(&self, index: u32, generation: u32, length: u32) -> &[u8] {
+            RioTransport::received(self, index, generation, length)
+        }
+        fn drain(&mut self, budget: u32) -> Result<Vec<Completion>, String> {
+            Ok(RioTransport::drain(self, budget)
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code)))
+        }
+        fn wait_and_drain(&mut self, wait: u32, budget: u32) -> Result<Vec<Completion>, String> {
+            Ok(RioTransport::wait_and_drain(self, wait, budget)
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code)))
+        }
+        fn poll_deadline_packet(&mut self, budget: u32) -> Result<Option<Vec<Completion>>, String> {
+            Ok(RioTransport::poll_deadline_packet(self, budget)
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code)))
+        }
+        fn drain_before_deadlines(&mut self) -> Result<Vec<Completion>, String> {
+            Ok(RioTransport::drain_before_deadlines(self)
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code)))
+        }
+        fn recycle(&mut self, completions: Vec<Completion>) {
+            RioTransport::recycle(self, completions);
+        }
+        fn shutdown(&mut self) -> Result<(), String> {
+            RioTransport::shutdown(self)
+                .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
+            Ok(())
         }
     }
 
@@ -1792,6 +2214,41 @@ pub mod transport {
             }
         }
 
+        const FAIL_FAST_PROBE: &str = "CEC_NATIVE_FAIL_FAST_PROBE";
+
+        fn is_fail_fast_probe(test_name: &str) -> bool {
+            std::env::var(FAIL_FAST_PROBE).is_ok_and(|value| value == test_name)
+        }
+
+        /// Ownership faults terminate the process, so keep the existing fault fixtures isolated
+        /// from the test runner. A hung child is a failure, with no unbounded process wait.
+        fn assert_fail_fast(test_name: &str, stage: &str) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+                .env(FAIL_FAST_PROBE, test_name)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!("native fail-fast child exceeded its deadline: {test_name}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(crate::types::ExitCode::Internal as i32)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains(stage));
+        }
+
         #[test]
         fn native_partial_send_preserves_registration_and_reports_whole_attempt() {
             let mut transport = send_transport(None);
@@ -1863,7 +2320,16 @@ pub mod transport {
 
         #[test]
         fn native_invalid_successful_send_lengths_fail_without_counting_bytes() {
-            for bytes in [0, 7] {
+            let test_name = "engine::transport::tests::native_invalid_successful_send_lengths_fail_without_counting_bytes";
+            if is_fail_fast_probe(test_name) {
+                let mut transport = send_transport(None);
+                transport.send(0, 6).unwrap();
+                let _ = transport.retire_into(send_context(), 0, 7, &mut Vec::new());
+                panic!("oversized native completion crossed its ownership guard");
+            }
+            // A zero-byte send is a connection failure. An oversized provider completion is
+            // ownership corruption and must terminate before retiring or counting its bytes.
+            for bytes in [0] {
                 let mut transport = send_transport(None);
                 transport.send(0, 6).unwrap();
                 let mut completions = Vec::new();
@@ -1877,16 +2343,22 @@ pub mod transport {
                 assert!(!transport.sessions[0].tx_in_use);
                 transport.shutdown().unwrap();
             }
+            assert_fail_fast(test_name, "client send completion exceeds posted range");
         }
 
         #[test]
         fn tx_slot_cannot_be_reused_before_completion() {
+            let test_name = "engine::transport::tests::tx_slot_cannot_be_reused_before_completion";
             let target: SOCKADDR_IN = unsafe { core::mem::zeroed() };
             let mut session = SessionTransport::new(target);
             let slot = session.allocate_send_slot().expect("slot");
             assert_eq!(slot, 0);
             assert!(session.allocate_send_slot().is_none());
-            assert!(session.release_send_slot(1).is_err());
+            if is_fail_fast_probe(test_name) {
+                let _ = session.release_send_slot(1);
+                panic!("out-of-range release crossed its ownership guard");
+            }
+            assert_fail_fast(test_name, "send completion has an out-of-range slot");
             assert!(session.allocate_send_slot().is_none());
             session.release_send_slot(slot).expect("release");
             assert_eq!(session.allocate_send_slot(), Some(0));
@@ -1895,11 +2367,16 @@ pub mod transport {
 
         #[test]
         fn tx_slot_double_release_is_rejected() {
+            let test_name = "engine::transport::tests::tx_slot_double_release_is_rejected";
             let target: SOCKADDR_IN = unsafe { core::mem::zeroed() };
             let mut session = SessionTransport::new(target);
             let slot = session.allocate_send_slot().expect("slot");
             session.release_send_slot(slot).expect("release");
-            assert!(session.release_send_slot(slot).is_err());
+            if is_fail_fast_probe(test_name) {
+                let _ = session.release_send_slot(slot);
+                panic!("double release crossed its ownership guard");
+            }
+            assert_fail_fast(test_name, "send completion references a free slot");
         }
     }
 }

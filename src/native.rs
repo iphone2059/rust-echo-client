@@ -28,15 +28,46 @@ use crate::types::Protocol;
 pub struct NativeError {
     pub stage: &'static str,
     pub code: i32,
+    pub origin: crate::types::FailureDomain,
+}
+
+/// Ownership/CQ faults cannot unwind through resources still borrowed by Windows.
+pub fn fail_fast(stage: &str, code: i32) -> ! {
+    eprintln!("{stage} failed: native_error={code}");
+    unsafe {
+        let _ = windows::Win32::processthreadsapi::TerminateProcess(
+            windows::Win32::processthreadsapi::GetCurrentProcess(),
+            crate::types::ExitCode::Internal as u32,
+        );
+    }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 impl NativeError {
+    pub fn invariant(stage: &'static str) -> Self {
+        fail_fast(stage, 13)
+    }
     pub(crate) fn winsock_last(stage: &'static str) -> Self {
         // The code is captured at the failing call site; GetLastError is never read later.
         Self {
             stage,
             code: unsafe { WSAGetLastError() },
+            origin: crate::types::FailureDomain::Winsock,
         }
+    }
+}
+
+impl From<NativeError> for String {
+    fn from(error: NativeError) -> Self {
+        format!("{} failed: native_error={}", error.stage, error.code)
+    }
+}
+
+impl core::fmt::Display for NativeError {
+    fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(out, "{} failed: native_error={}", self.stage, self.code)
     }
 }
 
@@ -51,6 +82,7 @@ impl Winsock {
         let status = unsafe { WSAStartup(0x0202, &mut data) };
         if status != 0 {
             return Err(NativeError {
+                origin: crate::types::FailureDomain::Winsock,
                 stage: "WSAStartup",
                 code: status,
             });
@@ -109,6 +141,7 @@ pub fn registered_socket(protocol: Protocol) -> Result<SocketOwner, NativeError>
         Protocol::None => {
             // 87 = ERROR_INVALID_PARAMETER, matching the baseline's rejected-protocol path.
             return Err(NativeError {
+                origin: crate::types::FailureDomain::Winsock,
                 stage: "registered_socket(protocol)",
                 code: 87,
             });
@@ -209,6 +242,7 @@ impl RioFunctions {
         }
         if returned != expected || table.cbSize != expected {
             return Err(NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIO table size",
                 code: 13,
             });
@@ -224,6 +258,7 @@ impl RioFunctions {
             || table.RIONotify.is_none()
         {
             return Err(NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIO table entry points",
                 code: 13,
             });
@@ -271,6 +306,7 @@ pub fn load_connect_ex(socket: SOCKET) -> Result<LPFN_CONNECTEX, NativeError> {
     }
     if function.is_none() || returned != size_of::<LPFN_CONNECTEX>() as u32 {
         return Err(NativeError {
+            origin: crate::types::FailureDomain::Invariant,
             stage: "ConnectEx entry point",
             code: 13,
         });
@@ -285,7 +321,7 @@ pub mod arena {
     //! One worker-owned virtual allocation for both directions of registered RIO memory.
     //!
     //! TX windows precede RX windows, and each session has a disjoint window in each region.
-    //! RX uses one registration. TX uses one registration per concurrent send window: the
+    //! RX and TX use one registration per session window: the
     //! documented RIOSend contract prohibits using any other portion of its registration while
     //! the send is pending, even when those portions would otherwise be disjoint.
 
@@ -345,7 +381,7 @@ pub mod arena {
         slots: u32,
         receive_offset: usize,
         send_registrations: Vec<RegisteredBuffer>,
-        receive_registration: Option<RegisteredBuffer>,
+        receive_registrations: Vec<RegisteredBuffer>,
     }
 
     impl Arena {
@@ -359,11 +395,13 @@ pub mod arena {
         ) -> Result<Self, NativeError> {
             if payload.is_empty() || stride as usize % payload.len() != 0 {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "worker arena payload dimensions",
                     code: 13,
                 });
             }
             let bytes = checked_worker_bytes(slots, stride).ok_or(NativeError {
+                origin: crate::types::FailureDomain::Allocation,
                 stage: "worker arena DWORD capacity",
                 code: 8,
             })? as usize;
@@ -372,11 +410,21 @@ pub mod arena {
             send_registrations
                 .try_reserve_exact(slots as usize)
                 .map_err(|_| NativeError {
+                    origin: crate::types::FailureDomain::Allocation,
                     stage: "worker arena registration allocation",
+                    code: 8,
+                })?;
+            let mut receive_registrations = Vec::new();
+            receive_registrations
+                .try_reserve_exact(slots as usize)
+                .map_err(|_| NativeError {
+                    origin: crate::types::FailureDomain::Allocation,
+                    stage: "worker arena receive registration allocation",
                     code: 8,
                 })?;
             if bytes > isize::MAX as usize {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "worker arena exceeds Rust pointer-offset range",
                     code: 13,
                 });
@@ -386,6 +434,7 @@ pub mod arena {
                     as *mut u8;
             if base.is_null() {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Win32,
                     stage: "VirtualAlloc(worker arena)",
                     code: unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
                 });
@@ -397,11 +446,12 @@ pub mod arena {
                 slots,
                 receive_offset,
                 send_registrations,
-                receive_registration: None,
+                receive_registrations,
             };
             for slot in 0..slots as usize {
                 let offset = checked_slot_offset(slot, stride as usize, receive_offset).ok_or(
                     NativeError {
+                        origin: crate::types::FailureDomain::Invariant,
                         stage: "worker arena send slot bounds",
                         code: 13,
                     },
@@ -415,10 +465,24 @@ pub mod arena {
                     .send_registrations
                     .push(RegisteredBuffer::register(rio, send)?);
             }
-            let receive = unsafe {
-                core::slice::from_raw_parts_mut(base.add(receive_offset), receive_offset)
-            };
-            arena.receive_registration = Some(RegisteredBuffer::register(rio, receive)?);
+            for slot in 0..slots as usize {
+                let offset = checked_slot_offset(slot, stride as usize, receive_offset).ok_or(
+                    NativeError {
+                        origin: crate::types::FailureDomain::Invariant,
+                        stage: "worker arena receive slot bounds",
+                        code: 13,
+                    },
+                )?;
+                let receive = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        base.add(receive_offset + offset),
+                        stride as usize,
+                    )
+                };
+                arena
+                    .receive_registrations
+                    .push(RegisteredBuffer::register(rio, receive)?);
+            }
             Ok(arena)
         }
 
@@ -449,6 +513,7 @@ pub mod arena {
                 .send_registrations
                 .get(slot as usize)
                 .ok_or(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "worker arena send view bounds",
                     code: 13,
                 })?;
@@ -456,26 +521,28 @@ pub mod arena {
         }
 
         pub fn receive_view(&self, slot: u32, length: u32) -> Result<RIO_BUF, NativeError> {
-            let offset =
+            let _offset =
                 checked_slot_offset(slot as usize, self.stride as usize, self.receive_offset)
                     .filter(|_| length != 0 && length <= self.stride)
                     .ok_or(NativeError {
+                        origin: crate::types::FailureDomain::Invariant,
                         stage: "worker arena receive view bounds",
                         code: 13,
                     })?;
-            self.receive_registration
-                .as_ref()
+            self.receive_registrations
+                .get(slot as usize)
                 .ok_or(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "worker arena receive registration unavailable",
                     code: 13,
                 })?
-                .slice(offset as u32, length)
+                .slice(0, length)
         }
 
         /// Reads bytes written by a completed receive. The caller must only call this after the
         /// corresponding completion has been dequeued and before that slot is reposted.
         pub fn read_receive(&self, slot: u32, length: u32) -> &[u8] {
-            if self.receive_registration.is_none()
+            if self.receive_registrations.get(slot as usize).is_none()
                 || slot >= self.slots
                 || length == 0
                 || length > self.stride
@@ -501,7 +568,7 @@ pub mod arena {
         fn drop(&mut self) {
             // Deregister every BufferId while its virtual memory is still mapped.
             self.send_registrations.clear();
-            drop(self.receive_registration.take());
+            self.receive_registrations.clear();
             release_pages_checked(self.base);
         }
     }
@@ -580,11 +647,13 @@ pub mod clock {
         let mut value = LARGE_INTEGER::default();
         if !unsafe { QueryPerformanceCounter(&mut value) }.as_bool() {
             return Err(NativeError {
+                origin: crate::types::FailureDomain::Win32,
                 stage: "QueryPerformanceCounter(client timer)",
                 code: unsafe { GetLastError() } as i32,
             });
         }
         u64::try_from(unsafe { value.QuadPart }).map_err(|_| NativeError {
+            origin: crate::types::FailureDomain::Invariant,
             stage: "QueryPerformanceCounter(client timer value)",
             code: 13,
         })
@@ -601,6 +670,7 @@ pub mod clock {
             let mut frequency = LARGE_INTEGER::default();
             if !unsafe { QueryPerformanceFrequency(&mut frequency) }.as_bool() {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Win32,
                     stage: "QueryPerformanceFrequency(client timer)",
                     code: unsafe { GetLastError() } as i32,
                 });
@@ -608,6 +678,7 @@ pub mod clock {
             let ticks_per_second = unsafe { frequency.QuadPart };
             if ticks_per_second <= 0 {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "QueryPerformanceFrequency(client timer value)",
                     code: 13,
                 });
@@ -630,11 +701,8 @@ pub mod clock {
         }
 
         fn now_ticks(&mut self) -> u64 {
-            // The worker boundary catches a panic, requests fatal stop for its peers and joins
-            // them. A failed timer must never silently switch to a different clock domain.
-            counter().unwrap_or_else(|error| {
-                panic!("{} failed: native_error={}", error.stage, error.code)
-            })
+            // A failed timer cannot unwind through provider-owned I/O or change clock domains.
+            counter().unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code))
         }
 
         fn wait(&mut self, _milliseconds: u32) {
@@ -1014,6 +1082,7 @@ pub mod endpoint {
         };
         if status != 0 {
             return Err(NativeError {
+                origin: crate::types::FailureDomain::Winsock,
                 stage: "bind(local port)",
                 code: unsafe { windows::Win32::winsock2::WSAGetLastError() },
             });
@@ -1033,6 +1102,7 @@ pub mod endpoint {
         };
         if status != 0 {
             return Err(NativeError {
+                origin: crate::types::FailureDomain::Winsock,
                 stage: "connect(udp peer)",
                 code: unsafe { windows::Win32::winsock2::WSAGetLastError() },
             });
@@ -1050,6 +1120,7 @@ pub mod endpoint {
         overlapped: *mut OVERLAPPED,
     ) -> Result<(), NativeError> {
         let connect = connect_ex.ok_or(NativeError {
+            origin: crate::types::FailureDomain::Invariant,
             stage: "ConnectEx entry point",
             code: 13,
         })?;
@@ -1073,6 +1144,7 @@ pub mod endpoint {
             Ok(())
         } else {
             Err(NativeError {
+                origin: crate::types::FailureDomain::Winsock,
                 stage: "ConnectEx",
                 code,
             })
@@ -1085,6 +1157,7 @@ pub mod endpoint {
         let status = unsafe { setsockopt(socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None, 0) };
         if status != 0 {
             return Err(NativeError {
+                origin: crate::types::FailureDomain::Winsock,
                 stage: "setsockopt(SO_UPDATE_CONNECT_CONTEXT)",
                 code: unsafe { windows::Win32::winsock2::WSAGetLastError() },
             });
@@ -1159,6 +1232,7 @@ pub mod overlapped {
         pub fn arm(&mut self) -> Result<(), NativeError> {
             if self.armed {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "OVERLAPPED armed twice",
                     code: 13,
                 });
@@ -1170,6 +1244,7 @@ pub mod overlapped {
         pub fn complete(&mut self) -> Result<(), NativeError> {
             if !self.armed {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "OVERLAPPED completed while unarmed",
                     code: 13,
                 });
@@ -1183,6 +1258,7 @@ pub mod overlapped {
         pub fn post_failed(&mut self) -> Result<(), NativeError> {
             if !self.armed {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "OVERLAPPED post failure while unarmed",
                     code: 13,
                 });
@@ -1199,6 +1275,7 @@ pub mod overlapped {
         pub fn reset_after_drain(&mut self) -> Result<(), NativeError> {
             if self.armed {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "OVERLAPPED reset while armed",
                     code: 13,
                 });
@@ -1266,6 +1343,7 @@ pub mod rio {
             // INVALID_HANDLE_VALUE), and the reason has to be captured at the call site.
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Win32,
                     stage: "CreateIoCompletionPort",
                     code: unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
                 });
@@ -1307,6 +1385,7 @@ pub mod rio {
             overlapped: *mut c_void,
         ) -> Result<Self, NativeError> {
             let create = rio.table().RIOCreateCompletionQueue.ok_or(NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIOCreateCompletionQueue entry point",
                 code: 13,
             })?;
@@ -1329,6 +1408,7 @@ pub mod rio {
                 // The table entry reports through its return value; the reason is captured here
                 // rather than being replaced by a placeholder code.
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Winsock,
                     stage: "RIOCreateCompletionQueue",
                     code: unsafe { windows::Win32::winsock2::WSAGetLastError() },
                 });
@@ -1354,11 +1434,13 @@ pub mod rio {
         pub fn arm(&mut self, rio: &RioFunctions) -> Result<(), NativeError> {
             if self.armed {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "RIO notification duplicate arm",
                     code: 5023,
                 });
             }
             let notify = rio.table().RIONotify.ok_or(NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIONotify entry point",
                 code: 13,
             })?;
@@ -1369,6 +1451,7 @@ pub mod rio {
             // internal error instead of taking ownership of an untracked notification.
             if status != 0 {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Winsock,
                     stage: "RIONotify",
                     code: status,
                 });
@@ -1381,6 +1464,7 @@ pub mod rio {
         pub fn on_delivery(&mut self) -> Result<(), NativeError> {
             if !self.armed {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "RIO notification delivery transition",
                     code: 5023,
                 });
@@ -1401,15 +1485,18 @@ pub mod rio {
             results: &mut [RIORESULT],
         ) -> Result<u32, NativeError> {
             let dequeue = rio.table().RIODequeueCompletion.ok_or(NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIODequeueCompletion entry point",
                 code: 13,
             })?;
             let capacity = u32::try_from(results.len()).map_err(|_| NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIODequeueCompletion capacity",
                 code: 13,
             })?;
             if capacity == 0 {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "RIODequeueCompletion capacity",
                     code: 13,
                 });
@@ -1417,12 +1504,14 @@ pub mod rio {
             let count = unsafe { dequeue(self.queue, results.as_mut_ptr(), capacity) };
             if count == u32::MAX {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "RIODequeueCompletion(RIO_CORRUPT_CQ)",
                     code: 13,
                 });
             }
             if count > capacity {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "RIODequeueCompletion count",
                     code: 13,
                 });
@@ -1453,10 +1542,12 @@ pub mod rio {
     impl RegisteredBuffer {
         pub fn register(rio: &RioFunctions, bytes: &mut [u8]) -> Result<Self, NativeError> {
             let register = rio.table().RIORegisterBuffer.ok_or(NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIORegisterBuffer entry point",
                 code: 13,
             })?;
             let length = u32::try_from(bytes.len()).map_err(|_| NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIORegisterBuffer length",
                 code: 13,
             })?;
@@ -1484,6 +1575,7 @@ pub mod rio {
         pub fn slice(&self, offset: u32, length: u32) -> Result<RIO_BUF, NativeError> {
             if length == 0 || offset > self.length || length > self.length - offset {
                 return Err(NativeError {
+                    origin: crate::types::FailureDomain::Invariant,
                     stage: "RIO_BUF slice bounds",
                     code: 13,
                 });
@@ -1525,6 +1617,7 @@ pub mod rio {
             socket_context: *mut c_void,
         ) -> Result<Self, NativeError> {
             let create = rio.table().RIOCreateRequestQueue.ok_or(NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIOCreateRequestQueue entry point",
                 code: 13,
             })?;
@@ -1559,6 +1652,7 @@ pub mod rio {
             flags: u32,
         ) -> Result<(), NativeError> {
             let receive = rio.table().RIOReceive.ok_or(NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIOReceive entry point",
                 code: 13,
             })?;
@@ -1585,6 +1679,7 @@ pub mod rio {
             request_context: *mut c_void,
         ) -> Result<(), NativeError> {
             let send = rio.table().RIOSend.ok_or(NativeError {
+                origin: crate::types::FailureDomain::Invariant,
                 stage: "RIOSend entry point",
                 code: 13,
             })?;
