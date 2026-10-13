@@ -2,7 +2,6 @@
 name = "rust-echo-client"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
 description = "Windows x64 RIO echo client (Rust port of the C++ baseline)"
 license = "MIT"
 
