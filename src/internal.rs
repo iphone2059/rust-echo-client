@@ -463,11 +463,24 @@ pub mod session {
         }
 
         impl Scheduler {
+            /// Cold convenience constructor; production uses the fallible `try_new` path.
             pub fn new(session_count: u32, payload_bytes: u32, options: &Options) -> Self {
+                Self::try_new(session_count, payload_bytes, options)
+                    .expect("scheduler fixture allocation")
+            }
+
+            pub fn try_new(
+                session_count: u32,
+                payload_bytes: u32,
+                options: &Options,
+            ) -> Result<Self, crate::types::Failure> {
+                use crate::types::try_vec_with;
                 let count = session_count as usize;
-                Self {
-                    sessions: (0..session_count).map(Session::new).collect(),
-                    heap: TimerHeap::new(count),
+                Ok(Self {
+                    sessions: try_vec_with(count, "client worker allocation", |index| {
+                        Session::new(index as u32)
+                    })?,
+                    heap: TimerHeap::try_new(count)?,
                     statistics: Statistics::default(),
                     payload_bytes,
                     limit: options.echo_count,
@@ -484,10 +497,10 @@ pub mod session {
                     } else {
                         1
                     },
-                    flows: vec![Flow::default(); count],
-                    close_anchored: vec![false; count],
+                    flows: try_vec_with(count, "client worker allocation", |_| Flow::default())?,
+                    close_anchored: try_vec_with(count, "client worker allocation", |_| false)?,
                     stopping: false,
-                }
+                })
             }
 
             pub fn statistics(&self) -> Statistics {
@@ -547,13 +560,12 @@ pub mod session {
                             0
                         });
                         if self.statistics.fatal {
-                            self.statistics.lost = self.statistics.lost.saturating_add(unsettled);
+                            self.statistics.lost = self.statistics.lost.wrapping_add(unsettled);
                         } else {
                             self.statistics.cancelled =
-                                self.statistics.cancelled.saturating_add(unsettled);
+                                self.statistics.cancelled.wrapping_add(unsettled);
                         }
-                        self.flows[slot].settled =
-                            self.flows[slot].settled.saturating_add(unsettled);
+                        self.flows[slot].settled = self.flows[slot].settled.wrapping_add(unsettled);
                         self.flows[slot] = Flow::after_failure(&self.flows[slot]);
                     }
                     if self.sessions[slot].begin_closing() {
@@ -573,6 +585,7 @@ pub mod session {
                 self.statistics.elapsed_milliseconds = milliseconds;
             }
 
+            /// Cold convenience API; Runtime supplies its preallocated startup action buffer.
             pub fn start(&mut self, now: u64) -> Vec<Step> {
                 let mut steps = Vec::with_capacity(self.sessions.len());
                 self.start_into(now, &mut steps);
@@ -638,7 +651,7 @@ pub mod session {
                         self.statistics.received_bytes = self
                             .statistics
                             .received_bytes
-                            .saturating_add(u64::from(bytes));
+                            .wrapping_add(u64::from(bytes));
                         self.flows[slot].receive_done = true;
                         self.flows[slot].receive_corrupted = !expected || !echoed;
                         self.finish_attempt(index, now)
@@ -698,9 +711,18 @@ pub mod session {
             /// accounting correct across a reconnect.
             fn inflight_echoes(&self, slot: usize) -> Option<u64> {
                 let flow = self.flows.get(slot)?;
-                flow.requested
-                    .checked_sub(self.sessions.get(slot)?.echoes)?
-                    .checked_sub(flow.settled)
+                let echoes = self.sessions.get(slot)?.echoes;
+                if self.limit == 0 {
+                    Some(
+                        flow.requested
+                            .wrapping_sub(echoes)
+                            .wrapping_sub(flow.settled),
+                    )
+                } else {
+                    flow.requested
+                        .checked_sub(echoes)?
+                        .checked_sub(flow.settled)
+                }
             }
 
             fn arm(&mut self, index: u32) {
@@ -772,10 +794,16 @@ pub mod session {
                     self.statistics.fatal = true;
                     return false;
                 };
-                let Some(requested) = self.flows[slot].requested.checked_add(u64::from(granted))
-                else {
-                    self.statistics.fatal = true;
-                    return false;
+                let requested = if self.limit == 0 {
+                    self.flows[slot].requested.wrapping_add(u64::from(granted))
+                } else {
+                    let Some(requested) =
+                        self.flows[slot].requested.checked_add(u64::from(granted))
+                    else {
+                        self.statistics.fatal = true;
+                        return false;
+                    };
+                    requested
                 };
                 let flow = &mut self.flows[slot];
                 flow.requested = requested;
@@ -785,7 +813,7 @@ pub mod session {
                 flow.receive_corrupted = false;
                 flow.started = true;
                 self.statistics.attempted =
-                    self.statistics.attempted.saturating_add(u64::from(granted));
+                    self.statistics.attempted.wrapping_add(u64::from(granted));
                 steps.push(Step::Send { index, bytes });
                 true
             }
@@ -895,7 +923,7 @@ pub mod session {
                     return ActionBatch::new();
                 }
                 self.close_anchored[slot] = false;
-                self.statistics.connections = self.statistics.connections.saturating_add(1);
+                self.statistics.connections = self.statistics.connections.wrapping_add(1);
                 self.flows[slot] = Flow::after_failure(&self.flows[slot]);
                 self.top_up(index, now)
             }
@@ -928,15 +956,15 @@ pub mod session {
                 }
                 let units = u64::from(flow.batch_units);
                 if flow.receive_corrupted {
-                    self.statistics.corrupted = self.statistics.corrupted.saturating_add(units);
-                    self.flows[slot].settled = self.flows[slot].settled.saturating_add(units);
+                    self.statistics.corrupted = self.statistics.corrupted.wrapping_add(units);
+                    self.flows[slot].settled = self.flows[slot].settled.wrapping_add(units);
                 } else {
-                    self.statistics.echoes = self.statistics.echoes.saturating_add(units);
+                    self.statistics.echoes = self.statistics.echoes.wrapping_add(units);
                     self.statistics.bytes = self
                         .statistics
                         .bytes
-                        .saturating_add(u64::from(self.batch_bytes(index)));
-                    self.sessions[slot].echoes = self.sessions[slot].echoes.saturating_add(units);
+                        .wrapping_add(u64::from(self.batch_bytes(index)));
+                    self.sessions[slot].echoes = self.sessions[slot].echoes.wrapping_add(units);
                 }
                 self.flows[slot].batch_units = 0;
                 self.flows[slot].send_done = false;
@@ -955,7 +983,7 @@ pub mod session {
             }
 
             pub fn on_sent_bytes(&mut self, bytes: u64) {
-                self.statistics.sent_bytes = self.statistics.sent_bytes.saturating_add(bytes);
+                self.statistics.sent_bytes = self.statistics.sent_bytes.wrapping_add(bytes);
             }
 
             pub fn set_sent_bytes(&mut self, bytes: u64) {
@@ -1015,7 +1043,7 @@ pub mod session {
                 self.statistics.received_bytes = self
                     .statistics
                     .received_bytes
-                    .saturating_add(chunk.len() as u64);
+                    .wrapping_add(chunk.len() as u64);
                 // TCP is a byte stream and may complete with a strict prefix. UDP is
                 // message-oriented, so Session rejects a short datagram instead of concatenating it
                 // with the next datagram.
@@ -1079,13 +1107,12 @@ pub mod session {
                         0
                     }
                 };
-                self.statistics.lost = self.statistics.lost.saturating_add(lost);
-                self.statistics.network_failures =
-                    self.statistics.network_failures.saturating_add(1);
+                self.statistics.lost = self.statistics.lost.wrapping_add(lost);
+                self.statistics.network_failures = self.statistics.network_failures.wrapping_add(1);
                 if self.reconnect_ticks.is_some() {
-                    self.statistics.reconnects = self.statistics.reconnects.saturating_add(1);
+                    self.statistics.reconnects = self.statistics.reconnects.wrapping_add(1);
                 }
-                self.flows[slot].settled = self.flows[slot].settled.saturating_add(lost);
+                self.flows[slot].settled = self.flows[slot].settled.wrapping_add(lost);
                 self.flows[slot] = Flow::after_failure(&self.flows[slot]);
                 self.heap.remove(index);
                 if self.sessions[slot].begin_closing() {
@@ -1700,6 +1727,13 @@ pub mod worker {
             false
         }
         fn check_generation_drain(&self, _index: u32) {}
+        /// Native grace decisions are Runtime inputs; pure engines never inspect ownership.
+        fn deadlines_due(&self) -> bool {
+            false
+        }
+        /// Check native grace at the timestamp saved before the direct CQ pass.
+        fn check_deadlines(&self) {}
+
         fn connect(&mut self, index: u32) -> Result<(), String>;
 
         /// Invoke immediately before posting, after any socket preparation. Native transports
@@ -1818,7 +1852,6 @@ pub mod worker {
 
         pub fn request_fatal_global() {
             FATAL_REQUESTED.store(true, Ordering::Release);
-            Self::request_global();
         }
 
         pub fn is_fatal(&self) -> bool {
@@ -1830,6 +1863,10 @@ pub mod worker {
         }
 
         pub fn is_requested(&self) -> bool {
+            self.is_external_requested() || self.is_fatal()
+        }
+
+        pub fn is_external_requested(&self) -> bool {
             STOP_REQUESTED.load(Ordering::Acquire)
         }
     }
@@ -1850,7 +1887,10 @@ pub mod worker {
     pub struct Worker {
         scheduler: Scheduler,
         payload_bytes: u32,
-        payload: std::sync::Arc<[u8]>,
+        payload: Option<std::sync::Arc<Vec<u8>>>,
+        startup_actions: Vec<Step>,
+        expired: Vec<u32>,
+        timed_actions: Vec<Action>,
         progress: Option<Progress>,
         progress_interval: u64,
         next_progress: u64,
@@ -1865,28 +1905,57 @@ pub mod worker {
     }
 
     impl Worker {
-        pub fn new(options: &Options, session_count: u32, payload_bytes: u32, _now: u64) -> Self {
-            Self {
-                scheduler: Scheduler::new(session_count, payload_bytes, options),
+        /// Cold convenience constructor; production prepares fallible storage before spawning.
+        pub fn new(options: &Options, session_count: u32, payload_bytes: u32, now: u64) -> Self {
+            Self::try_new(options, session_count, payload_bytes, now)
+                .expect("worker fixture allocation")
+        }
+
+        pub fn try_new(
+            options: &Options,
+            session_count: u32,
+            payload_bytes: u32,
+            _now: u64,
+        ) -> Result<Self, crate::types::Failure> {
+            use crate::types::{try_vec_with, try_vec_with_capacity};
+            let count = session_count as usize;
+            Ok(Self {
+                scheduler: Scheduler::try_new(session_count, payload_bytes, options)?,
                 payload_bytes,
-                payload: std::sync::Arc::from(&[][..]),
+                payload: None,
+                startup_actions: try_vec_with_capacity(count, "client worker allocation")?,
+                expired: try_vec_with_capacity(count, "client worker allocation")?,
+                timed_actions: try_vec_with_capacity(
+                    count.saturating_mul(3),
+                    "client worker allocation",
+                )?,
                 progress: None,
                 progress_interval: 0,
                 next_progress: 0,
                 run_seconds: options.run_seconds,
                 run_deadline: None,
                 started_at: Instant::now(),
-                attempt_started: (0..session_count).map(|_| None).collect(),
-            }
+                attempt_started: try_vec_with(count, "client worker allocation", |_| None)?,
+            })
         }
 
         pub fn set_payload(&mut self, payload: std::sync::Arc<[u8]>) {
+            // Cold compatibility adapter for existing fixtures. Production moves its built Vec
+            // into shared ownership and calls set_owned_payload without copying payload bytes.
+            self.set_owned_payload(std::sync::Arc::new(payload.to_vec()));
+        }
+
+        pub(crate) fn set_owned_payload(&mut self, payload: std::sync::Arc<Vec<u8>>) {
             self.payload_bytes = payload.len() as u32;
-            self.payload = payload;
+            self.payload = Some(payload);
+        }
+
+        pub(crate) fn use_coordinator_run_limit(&mut self) {
+            self.run_seconds = 0;
         }
 
         pub fn payload(&self) -> &[u8] {
-            &self.payload
+            self.payload.as_deref().map(Vec::as_slice).unwrap_or(&[])
         }
 
         pub fn scheduler(&self) -> &Scheduler {
@@ -2059,12 +2128,13 @@ pub mod worker {
                     );
                     let expected =
                         chunk.len() == self.scheduler.batch_bytes(completion.index) as usize;
-                    let echoed = !self.payload.is_empty()
+                    let payload = self.payload();
+                    let echoed = !payload.is_empty()
                         && !chunk.is_empty()
-                        && chunk.len() % self.payload.len() == 0
+                        && chunk.len() % payload.len() == 0
                         && chunk
-                            .chunks_exact(self.payload.len())
-                            .all(|unit| crate::payload::verify_echo(unit, &self.payload));
+                            .chunks_exact(payload.len())
+                            .all(|unit| crate::payload::verify_echo(unit, payload));
                     self.scheduler.on_event(
                         Event::Received {
                             index: completion.index,
@@ -2112,12 +2182,11 @@ pub mod worker {
                 )))
             };
 
-            let mut startup_actions = Vec::with_capacity(self.scheduler.sessions().len());
+            let mut startup_actions = core::mem::take(&mut self.startup_actions);
             self.scheduler.start_into(started, &mut startup_actions);
             self.dispatch(&startup_actions, transport, &mut outcome, clock);
-            let mut expired = Vec::with_capacity(self.scheduler.sessions().len());
-            let mut timed_actions =
-                Vec::with_capacity(self.scheduler.sessions().len().saturating_mul(3));
+            let mut expired = core::mem::take(&mut self.expired);
+            let mut timed_actions = core::mem::take(&mut self.timed_actions);
 
             loop {
                 let now = clock.now_ticks();
@@ -2182,11 +2251,13 @@ pub mod worker {
                     break;
                 }
 
-                if self.scheduler.wait_milliseconds(poll_now, 1) == 0 {
+                if self.scheduler.wait_milliseconds(poll_now, 1) == 0 || transport.deadlines_due() {
                     // Dispatch each packet before acquiring the next, retaining the fixed entry
                     // budget even if these completions post fresh work. Stop wins after each packet.
                     for _ in 0..self.scheduler.sessions().len().saturating_add(2) {
-                        if self.scheduler.wait_milliseconds(clock.now_ticks(), 1) != 0 {
+                        if self.scheduler.wait_milliseconds(clock.now_ticks(), 1) != 0
+                            && !transport.deadlines_due()
+                        {
                             break;
                         }
                         let completions = match transport.poll_deadline_packet(DRAIN_BATCHES) {
@@ -2215,7 +2286,7 @@ pub mod worker {
                 // Keep the timestamp taken before the direct CQ pass. Newly posted deadlines
                 // anchor to their own current clock readings and cannot expire in this decision.
                 let poll_now = clock.now_ticks();
-                if self.scheduler.wait_milliseconds(poll_now, 1) == 0 {
+                if self.scheduler.wait_milliseconds(poll_now, 1) == 0 || transport.deadlines_due() {
                     let completions = match transport.drain_before_deadlines() {
                         Ok(completions) => completions,
                         Err(reason) => {
@@ -2234,6 +2305,7 @@ pub mod worker {
                 if self.scheduler.statistics().fatal {
                     break;
                 }
+                transport.check_deadlines();
                 self.scheduler
                     .poll_actions_into(poll_now, &mut expired, &mut timed_actions);
                 let mut position = 0;
@@ -2309,6 +2381,12 @@ pub mod worker {
             self.scheduler
                 .set_elapsed_milliseconds(self.started_at.elapsed().as_millis() as u64);
             self.publish_progress(clock.now_ticks(), true);
+            startup_actions.clear();
+            expired.clear();
+            timed_actions.clear();
+            self.startup_actions = startup_actions;
+            self.expired = expired;
+            self.timed_actions = timed_actions;
             outcome
         }
 
@@ -2813,6 +2891,108 @@ pub mod worker {
             }
         }
 
+        struct DeadlineTransport {
+            packet_count: u32,
+            waits: u32,
+            connected: bool,
+            stop_packet: bool,
+            cq_passes: u32,
+            guard_passes: std::cell::Cell<u32>,
+        }
+        impl Transport for DeadlineTransport {
+            fn connect(&mut self, _index: u32) -> Result<(), String> {
+                Ok(())
+            }
+            fn connected(&mut self, _index: u32, _generation: u32) -> Result<(), String> {
+                self.connected = true;
+                Ok(())
+            }
+            fn send(&mut self, _index: u32, _bytes: u32) -> Result<(), String> {
+                Ok(())
+            }
+            fn receive(&mut self, _index: u32, _bytes: u32) -> Result<(), String> {
+                Ok(())
+            }
+            fn close(&mut self, _index: u32) {}
+            fn wait_and_drain(
+                &mut self,
+                _wait: u32,
+                _budget: u32,
+            ) -> Result<Vec<Completion>, String> {
+                self.waits += 1;
+                assert!(self.waits <= 2);
+                if self.waits == 2 {
+                    StopFlag::request_global();
+                }
+                Ok(Vec::new())
+            }
+            fn deadlines_due(&self) -> bool {
+                self.cq_passes == 0
+            }
+            fn poll_deadline_packet(
+                &mut self,
+                _budget: u32,
+            ) -> Result<Option<Vec<Completion>>, String> {
+                self.packet_count += 1;
+                match self.packet_count {
+                    1 => Ok(Some(vec![TimedTransport::completion(
+                        0,
+                        Operation::Connect,
+                        0,
+                    )])),
+                    2 => {
+                        // Runtime must finish the first packet's business dispatch before this wait.
+                        assert!(self.connected);
+                        if self.stop_packet {
+                            StopFlag::request_global();
+                            Ok(Some(Vec::new()))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    _ => panic!("STOP failed to arbitrate before the next native packet"),
+                }
+            }
+            fn drain_before_deadlines(&mut self) -> Result<Vec<Completion>, String> {
+                assert!(self.connected);
+                self.cq_passes += 1;
+                Ok(Vec::new())
+            }
+            fn check_deadlines(&self) {
+                assert_eq!(self.cq_passes, 1);
+                self.guard_passes.set(self.guard_passes.get() + 1);
+            }
+        }
+
+        #[test]
+        fn overdue_native_packets_dispatch_before_stop_and_direct_cq_guard() {
+            let _guard = WORKER_TEST_LOCK.lock().unwrap();
+            for stop_packet in [false, true] {
+                StopFlag::clear_global();
+                let options = Options {
+                    protocol: crate::types::Protocol::Tcp,
+                    echo_count: 1,
+                    ..Options::default()
+                };
+                let mut worker = Worker::new(&options, 1, 6, 0);
+                let mut transport = DeadlineTransport {
+                    packet_count: 0,
+                    waits: 0,
+                    connected: false,
+                    stop_packet,
+                    cq_passes: 0,
+                    guard_passes: std::cell::Cell::new(0),
+                };
+                let mut clock = SharedClock(Rc::new(Cell::new(0)));
+                let outcome = worker.run(&mut clock, &mut transport, &StopFlag);
+                assert!(outcome.controlled_stop);
+                assert_eq!(transport.packet_count, 2);
+                assert_eq!(transport.cq_passes, u32::from(!stop_packet));
+                assert_eq!(transport.guard_passes.get(), u32::from(!stop_packet));
+            }
+            StopFlag::clear_global();
+        }
+
         #[test]
         fn receive_step_carries_requested_length() {
             let _guard = WORKER_TEST_LOCK.lock().unwrap();
@@ -2858,13 +3038,21 @@ pub mod worker {
         }
 
         impl TimerHeap {
+            /// Cold convenience constructor; production uses the fallible `try_new` path.
             pub fn new(capacity: usize) -> Self {
-                Self {
+                Self::try_new(capacity).expect("timer fixture allocation")
+            }
+
+            pub fn try_new(capacity: usize) -> Result<Self, crate::types::Failure> {
+                use crate::types::try_vec_with;
+                Ok(Self {
                     capacity,
                     size: 0,
-                    nodes: vec![TimerNode::default(); capacity],
-                    positions: vec![-1; capacity],
-                }
+                    nodes: try_vec_with(capacity, "client worker allocation", |_| {
+                        TimerNode::default()
+                    })?,
+                    positions: try_vec_with(capacity, "client worker allocation", |_| -1)?,
+                })
             }
 
             pub fn capacity(&self) -> usize {
@@ -3124,16 +3312,16 @@ pub mod worker {
 
         /// Whether tracing is requested for this process.
         pub fn enabled() -> bool {
-            *ENABLED.get_or_init(|| std::env::var_os("CEC_TRACE").is_some())
+            *ENABLED.get_or_init(|| crate::native::environment_present("CEC_TRACE"))
         }
 
         /// Records a stage with an already-borrowed string detail.
         pub fn event(stage: &str, detail: &str) {
             if enabled() {
                 if detail.is_empty() {
-                    eprintln!("{stage}");
+                    crate::native::write_stderr(format_args!("{stage}\n"));
                 } else {
-                    eprintln!("{stage} {detail}");
+                    crate::native::write_stderr(format_args!("{stage} {detail}\n"));
                 }
             }
         }
@@ -3141,7 +3329,7 @@ pub mod worker {
         /// Allocation-free formatted tracing. `format_args!` only renders when tracing is enabled.
         pub fn event_args(stage: &str, detail: fmt::Arguments<'_>) {
             if enabled() {
-                eprintln!("{stage} {detail}");
+                crate::native::write_stderr(format_args!("{stage} {detail}\n"));
             }
         }
     }

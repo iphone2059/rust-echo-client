@@ -5,6 +5,9 @@
 //! (worker, session, scheduler) -> main. The two internal module names are re-exported so the
 //! historical `crate::worker` and `crate::session` paths keep working.
 
+// Fallible Box/Arc initialization uses the installed Rust 1.101 nightly safe APIs.
+#![feature(allocator_ext)]
+
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")))]
 compile_error!("cec targets Windows x64 (x86_64-pc-windows-msvc) only");
 

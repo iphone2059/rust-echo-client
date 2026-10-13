@@ -5,10 +5,9 @@ use crate::engine::transport::RioTransport;
 use crate::metrics::Statistics;
 use crate::native::clock::RioClock;
 use crate::native::{RioFunctions, Winsock, load_connect_ex, registered_socket};
-use crate::payload::{build, validate_payload};
+use crate::payload::{BuildError, try_build, validate_payload};
 use crate::types::{ExitCode, Options, Protocol, available_processors, resolved_worker_count};
-use crate::worker::{Progress, StopFlag, WakePort, Worker};
-use windows::Win32::ws2::SOCKADDR_IN;
+use crate::worker::{StopFlag, Worker};
 
 #[derive(Clone, Copy, Debug, Default)]
 struct NotificationCounters {
@@ -18,11 +17,7 @@ struct NotificationCounters {
 }
 
 fn write_diagnostics(protocol: Protocol, snapshots: &[NotificationCounters]) {
-    use std::io::Write;
-    let Some(path) = std::env::var_os("CEC_DIAG_FILE").filter(|path| !path.is_empty()) else {
-        return;
-    };
-    let Ok(mut file) = std::fs::File::create(path) else {
+    let Some(file) = crate::native::DiagnosticFile::open() else {
         return;
     };
     let protocol = if protocol == Protocol::Tcp {
@@ -31,8 +26,8 @@ fn write_diagnostics(protocol: Protocol, snapshots: &[NotificationCounters]) {
         "udp"
     };
     for (worker, snapshot) in snapshots.iter().enumerate() {
-        if writeln!(file, "role=client protocol={protocol} worker={worker} notify_arms={} notify_deliveries={} notify_gap={} timeout_wakeups_while_outstanding={}",
-            snapshot.arms, snapshot.deliveries, snapshot.arms.saturating_sub(snapshot.deliveries), snapshot.timeouts).is_err() {
+        if !file.write(format_args!("role=client protocol={protocol} worker={worker} notify_arms={} notify_deliveries={} notify_gap={} timeout_wakeups_while_outstanding={}\n",
+            snapshot.arms, snapshot.deliveries, snapshot.arms.saturating_sub(snapshot.deliveries), snapshot.timeouts)) {
             return;
         }
     }
@@ -103,18 +98,25 @@ impl Drop for ConsoleHandler {
     }
 }
 
+#[cfg(test)]
 fn partition(session_count: u32, worker_count: u32) -> Vec<u32> {
+    try_partition(session_count, worker_count).expect("partition fixture allocation")
+}
+
+fn try_partition(session_count: u32, worker_count: u32) -> Result<Vec<u32>, crate::types::Failure> {
     // The reference resolves /threads (or the automatic count) and then takes the smaller of that and
     // the session count, so the shard the capacity rules compute is the one actually used.
     let workers = resolved_worker_count(worker_count, available_processors())
         .min(session_count)
         .max(1);
+    if session_count == 0 {
+        return Ok(Vec::new());
+    }
     let base = session_count / workers;
     let extra = session_count % workers;
-    (0..workers)
-        .map(|index| base + u32::from(index < extra))
-        .filter(|count| *count > 0)
-        .collect()
+    crate::types::try_vec_with(workers as usize, "client coordinator allocation", |index| {
+        base + u32::from((index as u32) < extra)
+    })
 }
 
 fn worker_memory_share(total: u64, worker_sessions: u32, total_sessions: u32) -> u64 {
@@ -124,18 +126,47 @@ fn worker_memory_share(total: u64, worker_sessions: u32, total_sessions: u32) ->
     (total / u64::from(total_sessions)).saturating_mul(u64::from(worker_sessions))
 }
 
+type WorkerResult = Result<
+    (
+        Statistics,
+        bool,
+        NotificationCounters,
+        transport::DrainedOwner,
+    ),
+    crate::native::NativeError,
+>;
+
+struct WorkerThreadInput {
+    worker: Worker,
+    clock: RioClock,
+    native: transport::PreparedOwner,
+    stop: StopFlag,
+}
+
+struct WorkerThreadData {
+    input: Option<WorkerThreadInput>,
+    result: Option<WorkerResult>,
+}
+
+fn worker_thread_main(data: &mut WorkerThreadData) {
+    let WorkerThreadInput {
+        worker,
+        clock,
+        native,
+        stop,
+    } = data
+        .input
+        .take()
+        .unwrap_or_else(|| crate::native::fail_fast("client worker thread input", 13));
+    data.result = Some(run_worker(worker, clock, native, stop));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
-    options: Options,
-    payload: std::sync::Arc<[u8]>,
-    sessions: u32,
-    memory_share: u64,
-    target: SOCKADDR_IN,
+    mut worker: Worker,
+    mut clock: RioClock,
+    native: transport::PreparedOwner,
     stop: StopFlag,
-    progress: Option<Progress>,
-    wake: WakePort,
-    rio: RioFunctions,
-    connect_ex: windows::Win32::mswsock::LPFN_CONNECTEX,
 ) -> Result<
     (
         Statistics,
@@ -143,37 +174,10 @@ fn run_worker(
         NotificationCounters,
         transport::DrainedOwner,
     ),
-    String,
+    crate::native::NativeError,
 > {
-    let result = (|| -> Result<(Statistics, bool, NotificationCounters, transport::DrainedOwner), String> {
-        let _winsock = Winsock::start()
-            .map_err(|error| format!("{} failed: native_error={}", error.stage, error.code))?;
-        let payload_bytes = u32::try_from(payload.len())
-            .map_err(|_| "payload is too large for the worker".to_string())?;
-        let mut worker_options = options.clone();
-        worker_options.run_seconds = 0;
-        let mut worker = Worker::new(&worker_options, sessions, payload_bytes, 0);
-        worker.set_payload(std::sync::Arc::clone(&payload));
-        if let Some(progress) = progress {
-            worker.set_progress(
-                progress,
-                u64::from(options.report_seconds)
-                    .saturating_mul(1_000)
-                    .min(50),
-            );
-        }
-        let mut clock = RioClock::new()
-            .map_err(|error| format!("{} failed: native_error={}", error.stage, error.code))?;
-        let mut transport = RioTransport::new(
-            &options,
-            sessions,
-            payload,
-            memory_share,
-            target,
-            rio,
-            connect_ex,
-        )?;
-        transport.set_wake(wake)?;
+    let result = (|| -> Result<(Statistics, bool, NotificationCounters, transport::DrainedOwner), crate::native::NativeError> {
+        let mut transport = native.into_runtime();
         let outcome = worker.run(&mut clock, &mut transport, &stop);
         let statistics = worker.scheduler().statistics();
         // Only an internal failure means no further progress is possible anywhere, and only then
@@ -191,9 +195,10 @@ fn run_worker(
             transport.into_drained_owner(),
         ))
     })();
-    if result.is_err() {
+    if let Err(error) = &result {
         // Setup errors happen before Worker::run can observe the shared flag. Propagate the
         // stop to already-running peer workers so the join loop cannot deadlock on /n 0.
+        crate::native::write_stderr(format_args!("{error}\n"));
         StopFlag::request_fatal_global();
     }
     result
@@ -207,21 +212,37 @@ pub fn run(options: &Options) -> ExitCode {
     let _console_handler = match ConsoleHandler::install() {
         Ok(handler) => handler,
         Err(reason) => {
-            eprintln!("{reason}");
+            crate::native::write_stderr(format_args!(
+                "SetConsoleCtrlHandler failed: {}\n",
+                reason.code as u32
+            ));
             return ExitCode::Internal;
         }
     };
+    if options.session_count == 0
+        || options.echo_count > u64::MAX / u64::from(options.session_count)
+    {
+        crate::native::write_stderr(format_args!("finite echo quota failed: native_error=534\n"));
+        return ExitCode::Usage;
+    }
     // The reference starts Winsock and loads the RIO extensions before it resolves the target, so
     // the run owns the Winsock lifetime here as well and every worker joins it by refcount.
     let _winsock = match Winsock::start() {
         Ok(winsock) => winsock,
         Err(error) => {
-            eprintln!("{} failed: native_error={}", error.stage, error.code);
+            crate::native::write_stderr(format_args!(
+                "{} failed: native_error={}\n",
+                error.stage, error.code
+            ));
             return ExitCode::Network;
         }
     };
     let extensions = (|| {
-        let probe = registered_socket(Protocol::Tcp)?;
+        let probe =
+            registered_socket(Protocol::Tcp).map_err(|error| crate::native::NativeError {
+                stage: "WSASocketW(RIO probe)",
+                ..error
+            })?;
         Ok::<_, crate::native::NativeError>((
             RioFunctions::load(probe.raw())?,
             load_connect_ex(probe.raw())?,
@@ -230,37 +251,47 @@ pub fn run(options: &Options) -> ExitCode {
     let (rio, connect_ex) = match extensions {
         Ok(extensions) => extensions,
         Err(error) => {
-            eprintln!("{} failed: native_error={}", error.stage, error.code);
+            crate::native::write_stderr(format_args!(
+                "{} failed: native_error={}\n",
+                error.stage, error.code
+            ));
             return ExitCode::Network;
         }
     };
     // The target is resolved before anything else is built, exactly like the reference: the test
     // 256.256.256.256 reports GetAddrInfoW's status and exits as a network failure even though the
     // payload of that command line is otherwise valid.
-    let target = match crate::native::endpoint::resolve_ipv4(&options.host, options.remote_port) {
-        Ok(target) => target,
-        Err(code) => {
-            eprintln!("GetAddrInfoW(IPv4) failed: native_error={code}");
-            return ExitCode::Network;
-        }
-    };
+    let target =
+        match crate::native::endpoint::try_resolve_options(&options.host, options.remote_port) {
+            Ok(target) => target,
+            Err(error) => {
+                crate::native::write_stderr(format_args!(
+                    "{} failed: native_error={}\n",
+                    error.stage, error.code
+                ));
+                return ExitCode::Network;
+            }
+        };
 
-    let payload = match build(options) {
+    let payload = match try_build(options) {
         Ok(payload) => payload,
-        Err(error) => {
-            eprintln!("Invalid payload: {}", error.0);
+        Err(BuildError::Invalid(_)) | Err(BuildError::Allocation) => {
+            crate::native::write_stderr(format_args!("payload pattern failed: native_error=13\n"));
             return ExitCode::Usage;
         }
     };
     if let Err(error) = validate_payload(options, &payload) {
-        eprintln!("Invalid payload: {}", error.0);
+        let _ = error;
+        crate::native::write_stderr(format_args!("payload pattern failed: native_error=13\n"));
         return ExitCode::Usage;
     }
     let _timer_resolution = if options.interval_milliseconds != 0 {
         match TimerResolution::start() {
             Ok(resolution) => Some(resolution),
             Err(error) => {
-                eprintln!("timeBeginPeriod(client pacing) failed: native_error={error}");
+                crate::native::write_stderr(format_args!(
+                    "timeBeginPeriod(client pacing) failed: native_error={error}\n"
+                ));
                 return ExitCode::Internal;
             }
         }
@@ -274,64 +305,149 @@ pub fn run(options: &Options) -> ExitCode {
 
     let stop = StopFlag;
 
-    let payload: std::sync::Arc<[u8]> = std::sync::Arc::from(payload.into_boxed_slice());
-    let counts = partition(options.session_count, options.worker_count);
-    let mut handles = Vec::with_capacity(counts.len());
-    let mut progress = if options.report_seconds == 0 {
-        Vec::new()
-    } else {
-        Vec::with_capacity(counts.len())
-    };
-    let mut wake_ports = Vec::with_capacity(counts.len());
+    // Coordinator storage is prepared before peers start, matching the reference's worker arrays.
+    // Per-worker initialization failures below enter the fatal stop/join/final-accounting path.
+    let prepared = (|| -> Result<_, crate::types::Failure> {
+        use crate::types::{try_arc, try_vec_with_capacity};
+        // Move the sole payload Vec into a checked, small shared header. The byte allocation is
+        // reused: unlike Arc<[u8]> conversion, this does not allocate and copy the entire payload.
+        let payload = try_arc(payload, "payload allocation")?;
+        let counts = try_partition(options.session_count, options.worker_count)?;
+        let handles = try_vec_with_capacity(counts.len(), "client coordinator allocation")?;
+        let mut progress = try_vec_with_capacity(counts.len(), "client coordinator allocation")?;
+        let mut wake_ports = try_vec_with_capacity(counts.len(), "client coordinator allocation")?;
+        let snapshots = try_vec_with_capacity(counts.len(), "client coordinator allocation")?;
+        let joined_owners = try_vec_with_capacity(counts.len(), "client coordinator allocation")?;
+        let mut setups = try_vec_with_capacity(counts.len(), "client coordinator allocation")?;
+        for sessions in counts {
+            let snapshot = if options.report_seconds != 0 {
+                let snapshot = try_arc(
+                    std::sync::Mutex::new((Statistics::default(), 0)),
+                    "client coordinator allocation",
+                )?;
+                progress.push(std::sync::Arc::clone(&snapshot));
+                Some(snapshot)
+            } else {
+                None
+            };
+            let wake = try_arc(std::sync::Mutex::new(0), "client coordinator allocation")?;
+            wake_ports.push(std::sync::Arc::clone(&wake));
+            setups.push((sessions, snapshot, wake));
+        }
+        Ok((
+            payload,
+            handles,
+            progress,
+            wake_ports,
+            snapshots,
+            joined_owners,
+            setups,
+        ))
+    })();
+    let (payload, mut handles, progress, wake_ports, mut snapshots, mut joined_owners, setups) =
+        match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if error.stage == "payload allocation" {
+                    crate::native::write_stderr(format_args!(
+                        "payload pattern failed: native_error=13\n"
+                    ));
+                    return ExitCode::Usage;
+                }
+                // The reference's coordinator-array failure exits without a worker diagnostic.
+                return ExitCode::Network;
+            }
+        };
     let mut worker_spawn_error = false;
-    for (worker_index, sessions) in counts.into_iter().enumerate() {
-        let options = options.clone();
-        let worker_payload = std::sync::Arc::clone(&payload);
-        let snapshot = (options.report_seconds != 0)
-            .then(|| std::sync::Arc::new(std::sync::Mutex::new((Statistics::default(), 0))));
-        let worker_progress = snapshot.as_ref().map(std::sync::Arc::clone);
-        let wake = std::sync::Arc::new(std::sync::Mutex::new(0));
-        let worker_wake = std::sync::Arc::clone(&wake);
+    for (sessions, snapshot, worker_wake) in setups {
+        // Native QPF has the reference's first per-worker failure priority, before heap state.
+        let clock = match RioClock::new() {
+            Ok(clock) => clock,
+            Err(error) => {
+                crate::native::write_stderr(format_args!("{error}\n"));
+                worker_spawn_error = true;
+                StopFlag::request_fatal_global();
+                break;
+            }
+        };
+        let port = match crate::native::rio::CompletionPort::create() {
+            Ok(port) => port,
+            Err(error) => {
+                crate::native::write_stderr(format_args!("{error}\n"));
+                worker_spawn_error = true;
+                StopFlag::request_fatal_global();
+                break;
+            }
+        };
+        let mut worker = match Worker::try_new(options, sessions, payload.len() as u32, 0) {
+            Ok(worker) => worker,
+            Err(error) => {
+                crate::native::write_stderr(format_args!(
+                    "{} failed: native_error={}\n",
+                    error.stage, error.code
+                ));
+                worker_spawn_error = true;
+                StopFlag::request_fatal_global();
+                break;
+            }
+        };
+        worker.use_coordinator_run_limit();
+        worker.set_owned_payload(std::sync::Arc::clone(&payload));
+        if let Some(snapshot) = snapshot {
+            worker.set_progress(
+                snapshot,
+                u64::from(options.report_seconds)
+                    .saturating_mul(1_000)
+                    .min(50),
+            );
+        }
         let memory_share =
             worker_memory_share(options.memory_bytes, sessions, options.session_count);
-        let handle = std::thread::Builder::new()
-            .name(format!("cec-worker-{worker_index}"))
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_worker(
-                        options,
-                        worker_payload,
-                        sessions,
-                        memory_share,
-                        target,
-                        stop,
-                        worker_progress,
-                        worker_wake,
-                        rio,
-                        connect_ex,
-                    )
-                }));
-                match result {
-                    Ok(result) => result,
-                    Err(payload) => {
-                        // A panic must wake unlimited peer workers before this JoinHandle is
-                        // eventually observed by the main thread. Resume the original panic so
-                        // the join result still records an abnormal worker termination.
-                        StopFlag::request_fatal_global();
-                        std::panic::resume_unwind(payload);
-                    }
-                }
-            });
+        // Prepare native resources synchronously. Failed QPF/IOCP/arena/CQ initialization never
+        // creates a thread, and failed CreateThread has a never-started, I/O-free owner to roll back.
+        let native = (|| -> Result<_, crate::native::NativeError> {
+            let mut transport = RioTransport::new_with_port(
+                options,
+                sessions,
+                payload.as_slice(),
+                memory_share,
+                target,
+                rio,
+                connect_ex,
+                port,
+            )?;
+            transport.set_wake(worker_wake)?;
+            Ok(transport.into_prepared_owner())
+        })();
+        let native = match native {
+            Ok(native) => native,
+            Err(error) => {
+                crate::native::write_stderr(format_args!("{error}\n"));
+                worker_spawn_error = true;
+                StopFlag::request_fatal_global();
+                break;
+            }
+        };
+        let data = WorkerThreadData {
+            input: Some(WorkerThreadInput {
+                worker,
+                clock,
+                native,
+                stop,
+            }),
+            result: None,
+        };
+        let handle = crate::native::NativeThread::spawn(
+            data,
+            worker_thread_main,
+            "CreateThread(client worker)",
+        );
         match handle {
             Ok(handle) => {
                 handles.push(handle);
-                if let Some(snapshot) = snapshot {
-                    progress.push(snapshot);
-                }
-                wake_ports.push(wake);
             }
             Err(error) => {
-                eprintln!("failed to create worker thread {worker_index}: {error}");
+                crate::native::write_stderr(format_args!("{error}\n"));
                 worker_spawn_error = true;
                 StopFlag::request_fatal_global();
                 break;
@@ -339,45 +455,18 @@ pub fn run(options: &Options) -> ExitCode {
         }
     }
 
-    let started = std::time::Instant::now();
+    let started = unsafe { windows::Win32::sysinfoapi::GetTickCount64() };
     let mut next_report = u64::from(options.report_seconds).saturating_mul(1_000);
     let mut monitor_failure = false;
     let mut stop_posts_sent = false;
     loop {
-        let elapsed = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let elapsed = unsafe { windows::Win32::sysinfoapi::GetTickCount64() }.wrapping_sub(started);
         if options.run_seconds != 0
             && elapsed >= u64::from(options.run_seconds).saturating_mul(1_000)
         {
             StopFlag::request_global();
         }
-        if stop.is_requested() && !stop_posts_sent {
-            for wake in &wake_ports {
-                match wake.lock() {
-                    Ok(handle) if *handle != 0 => {
-                        // Hold the snapshot lock through the post: transport teardown clears this
-                        // handle under the same lock before closing the port.
-                        let posted = unsafe {
-                            windows::Win32::ioapiset::PostQueuedCompletionStatus(
-                                *handle as *mut core::ffi::c_void,
-                                0,
-                                1,
-                                None,
-                            )
-                        };
-                        if !posted.as_bool() {
-                            monitor_failure = true;
-                            StopFlag::request_fatal_global();
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        monitor_failure = true;
-                        StopFlag::request_fatal_global();
-                    }
-                }
-            }
-            stop_posts_sent = true;
-        }
+        // C++ publishes a due report before dispatching STOP to worker completion ports.
         if options.report_seconds != 0 && elapsed >= next_report {
             let mut report = Statistics::default();
             let mut active = 0u32;
@@ -394,45 +483,77 @@ pub fn run(options: &Options) -> ExitCode {
                 }
             }
             report.elapsed_milliseconds = elapsed;
-            println!("{}", report.line("report", options.session_count, active));
+            crate::native::write_stdout(format_args!(
+                "{}\n",
+                report.display("report", options.session_count, active)
+            ));
             next_report =
                 elapsed.saturating_add(u64::from(options.report_seconds).saturating_mul(1_000));
         }
-        if handles.iter().all(std::thread::JoinHandle::is_finished) {
+        if stop.is_requested() && !stop_posts_sent {
+            for wake in &wake_ports {
+                match wake.lock() {
+                    Ok(handle) if *handle != 0 => {
+                        // Hold the snapshot lock through the post: transport teardown clears this
+                        // handle under the same lock before closing the port.
+                        let posted = unsafe {
+                            windows::Win32::ioapiset::PostQueuedCompletionStatus(
+                                *handle as *mut core::ffi::c_void,
+                                0,
+                                1,
+                                None,
+                            )
+                        };
+                        if !posted.as_bool() {
+                            crate::native::fail_fast(
+                                "PostQueuedCompletionStatus(client stop)",
+                                unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        monitor_failure = true;
+                        StopFlag::request_fatal_global();
+                    }
+                }
+            }
+            stop_posts_sent = true;
+        }
+        if handles.iter().all(crate::native::NativeThread::is_finished) {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        unsafe {
+            windows::Win32::synchapi::Sleep(10);
+        }
     }
 
     let mut statistics = Statistics::default();
     let mut controlled_stop = stop.is_requested() && !stop.is_fatal();
-    let mut snapshots = Vec::with_capacity(handles.len());
-    let mut worker_panic = false;
+
     // A worker that returns Err never reached a clean stop, so the run must not be classified from the
     // statistics it left behind: those are partial and a controlled stop would otherwise look clean.
     let mut worker_failure = false;
-    let mut joined_owners = Vec::with_capacity(handles.len());
 
     // Always join every worker. Returning on the first failed handle would detach the rest
     // while they may still own sockets, RIO queues and registered memory. `run_worker`
     // already raises the global stop flag on failure, so peers will quiesce and can be joined
     // cleanly here.
-    for handle in handles {
-        match handle.join() {
-            Ok(Ok((worker_statistics, controlled, snapshot, owner))) => {
+    for handle in &mut handles {
+        let result = handle
+            .join()
+            .result
+            .unwrap_or_else(|| crate::native::fail_fast("client worker result", 13));
+        match result {
+            Ok((worker_statistics, controlled, snapshot, owner)) => {
                 statistics.merge(&worker_statistics);
                 controlled_stop |= controlled;
                 snapshots.push(snapshot);
                 joined_owners.push(owner);
             }
-            Ok(Err(reason)) => {
-                eprintln!("RIO worker failed: {reason}");
+            Err(reason) => {
+                let _ = reason; // run_worker reports the native failure before raising fatal STOP.
                 worker_failure = true;
-                StopFlag::request_fatal_global();
-            }
-            Err(_) => {
-                eprintln!("worker thread ended abnormally");
-                worker_panic = true;
                 StopFlag::request_fatal_global();
             }
         }
@@ -442,6 +563,8 @@ pub fn run(options: &Options) -> ExitCode {
     for owner in &joined_owners {
         owner.require_release();
     }
+    // Native thread handles, like provider resources, survive the collective release checks.
+    drop(handles);
     for owner in joined_owners {
         owner.release();
     }
@@ -450,16 +573,18 @@ pub fn run(options: &Options) -> ExitCode {
     // were asked for and never completed, so the shared classification reports an echo failure even
     // when the terminal cause was a worker or network failure. An unlimited run or a controlled stop
     // claims nothing extra.
-    let fatal =
-        statistics.fatal || worker_panic || worker_spawn_error || worker_failure || monitor_failure;
+    let fatal = statistics.fatal || worker_spawn_error || worker_failure || monitor_failure;
     controlled_stop &= !fatal;
-    let unclaimed =
-        statistics.unclaimed(options.echo_count, options.session_count, controlled_stop);
+    let unclaimed = statistics.unclaimed(
+        options.echo_count,
+        options.session_count,
+        stop.is_external_requested(),
+    );
     if unclaimed != 0 {
-        statistics.lost = statistics.lost.saturating_add(unclaimed);
+        statistics.lost = statistics.lost.wrapping_add(unclaimed);
         // The reference reports an echo that was asked for and never claimed as both lost and
         // attempted, so attempted stays the size of the run the command line described.
-        statistics.attempted = statistics.attempted.saturating_add(unclaimed);
+        statistics.attempted = statistics.attempted.wrapping_add(unclaimed);
     }
     // A controlled stop cancels the attempts that were claimed and never finished; they are neither
     // echoes nor losses, which is what the reference reports as cancelled.
@@ -467,19 +592,19 @@ pub fn run(options: &Options) -> ExitCode {
         let unfinished = statistics.attempted.saturating_sub(
             statistics
                 .echoes
-                .saturating_add(statistics.corrupted)
-                .saturating_add(statistics.lost),
+                .wrapping_add(statistics.corrupted)
+                .wrapping_add(statistics.lost),
         );
         statistics.cancelled = unfinished;
     } else if fatal {
         let unfinished = statistics.attempted.saturating_sub(
             statistics
                 .echoes
-                .saturating_add(statistics.corrupted)
-                .saturating_add(statistics.lost)
-                .saturating_add(statistics.cancelled),
+                .wrapping_add(statistics.corrupted)
+                .wrapping_add(statistics.lost)
+                .wrapping_add(statistics.cancelled),
         );
-        statistics.lost = statistics.lost.saturating_add(unfinished);
+        statistics.lost = statistics.lost.wrapping_add(unfinished);
     }
 
     // The reference prints the terminal line by default: /q suppresses it and /stats forces it,
@@ -487,8 +612,11 @@ pub fn run(options: &Options) -> ExitCode {
     // so no session is live when the line is printed.
     if options.stats || !options.quiet {
         statistics.elapsed_milliseconds =
-            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        println!("{}", statistics.line("final", options.session_count, 0));
+            unsafe { windows::Win32::sysinfoapi::GetTickCount64() }.wrapping_sub(started);
+        crate::native::write_stdout(format_args!(
+            "{}\n",
+            statistics.display("final", options.session_count, 0)
+        ));
     }
     write_diagnostics(options.protocol, &snapshots);
     if fatal {
@@ -711,6 +839,44 @@ pub mod transport {
         }
     }
 
+    /// The CQ retains this raw pointer before notification is armed. Raw ownership, rather than
+    /// moving a live Box, preserves its provenance across the prepared-worker transfer.
+    struct NotificationStorage {
+        pointer: core::ptr::NonNull<OVERLAPPED>,
+        registered: bool,
+    }
+    impl NotificationStorage {
+        fn new() -> Result<Self, NativeError> {
+            let value = crate::types::try_box(OVERLAPPED::default(), "client worker allocation")?;
+            let pointer = core::ptr::NonNull::new(Box::into_raw(value))
+                .unwrap_or_else(|| crate::native::fail_fast("client notification storage", 13));
+            Ok(Self {
+                pointer,
+                registered: false,
+            })
+        }
+        fn as_ptr(&self) -> *mut OVERLAPPED {
+            self.pointer.as_ptr()
+        }
+        fn reset_unarmed(&mut self) {
+            // The transport checked that the CQ is unarmed before accessing this storage.
+            unsafe {
+                self.pointer.as_ptr().write(OVERLAPPED::default());
+            }
+        }
+    }
+    impl Drop for NotificationStorage {
+        fn drop(&mut self) {
+            if self.registered {
+                crate::native::fail_fast("client notification storage release before CQ", 996);
+            }
+            // SAFETY: every successful CQ registration has closed before storage ownership returns.
+            unsafe {
+                drop(Box::from_raw(self.pointer.as_ptr()));
+            }
+        }
+    }
+
     pub struct RioTransport {
         // After the mandatory release guard: CQ -> registered arena -> host session storage ->
         // IOCP -> notification OVERLAPPED. Native counts are zero before any of these drop.
@@ -718,7 +884,7 @@ pub mod transport {
         arena: Option<Arena>,
         sessions: Vec<SessionTransport>,
         port: Option<CompletionPort>,
-        notification_overlapped: Option<Box<OVERLAPPED>>,
+        notification_overlapped: Option<NotificationStorage>,
         rio: RioFunctions,
         connect_ex: LPFN_CONNECTEX,
         results: Vec<RIORESULT>,
@@ -752,6 +918,30 @@ pub mod transport {
             target: SOCKADDR_IN,
             rio: RioFunctions,
             connect_ex: LPFN_CONNECTEX,
+        ) -> Result<Self, NativeError> {
+            let port = CompletionPort::create().map_err(stage)?;
+            Self::new_with_port(
+                options,
+                session_count,
+                payload.as_ref(),
+                memory_bytes,
+                target,
+                rio,
+                connect_ex,
+                port,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn new_with_port(
+            options: &Options,
+            session_count: u32,
+            payload: &[u8],
+            memory_bytes: u64,
+            target: SOCKADDR_IN,
+            rio: RioFunctions,
+            connect_ex: LPFN_CONNECTEX,
+            port: CompletionPort,
         ) -> Result<Self, NativeError> {
             if session_count == 0 || payload.is_empty() {
                 return Err(NativeError {
@@ -863,30 +1053,44 @@ pub mod transport {
                 });
             }
 
-            // Local declaration order is chosen for the constructor-error path too: Rust drops
-            // locals in reverse order, giving CQ -> IOCP -> notification OVERLAPPED if anything
-            // after queue creation fails. The steady-state shutdown uses the same ordering.
-            let mut notification_overlapped = Box::new(OVERLAPPED::default());
-            let port = CompletionPort::create().map_err(stage)?;
+            // Native allocation and registration precede CQ creation, matching the reference's
+            // initialization failure priority. No operation has been submitted at this point.
+            let arena =
+                Arena::create_worker(&rio, session_count, batch_bytes, payload).map_err(stage)?;
+
+            use crate::types::{try_vec_with, try_vec_with_capacity};
+            let results = try_vec_with(COMPLETION_BATCH_SIZE, "client worker allocation", |_| {
+                RIORESULT::default()
+            })?;
+            let pending =
+                try_vec_with_capacity(session_count as usize, "client worker allocation")?;
+            let completed_buffer = try_vec_with_capacity(
+                (session_count as usize).saturating_mul(4),
+                "client worker allocation",
+            )?;
+            let sessions =
+                try_vec_with(session_count as usize, "client worker allocation", |_| {
+                    SessionTransport::new(target)
+                })?;
+
+            // CQ creation is the last fallible initialization. Its failure retains no notification
+            // pointer; success moves raw-owned storage into the transport with no Box retagging.
+            let mut notification_overlapped = NotificationStorage::new()?;
             let queue = CompletionQueue::create(
                 &rio,
                 &port,
                 options.cq_capacity,
                 crate::native::rio::RIO_COMPLETION_KEY as *mut c_void,
-                &mut *notification_overlapped as *mut OVERLAPPED as *mut c_void,
+                notification_overlapped.as_ptr().cast::<c_void>(),
             )
             .map_err(stage)?;
+            notification_overlapped.registered = true;
 
             // Both directions share one virtual-memory owner. TX registrations remain isolated
             // from each other and RX, as required while RIOSend is outstanding. Each TX window
             // holds a full batch; a finite quota's tail uses a shorter view of the same bytes.
-            let arena =
-                Arena::create_worker(&rio, session_count, batch_bytes, &payload).map_err(stage)?;
             // The target was resolved once for the whole run, so every worker connects to the
             // same address the reference resolved in cec_run_client.
-            let sessions = (0..session_count)
-                .map(|_| SessionTransport::new(target))
-                .collect();
 
             Ok(Self {
                 sessions,
@@ -896,9 +1100,9 @@ pub mod transport {
                 arena: Some(arena),
                 rio,
                 connect_ex,
-                results: vec![RIORESULT::default(); COMPLETION_BATCH_SIZE],
+                results,
                 protocol: options.protocol,
-                pending: Vec::with_capacity(session_count as usize),
+                pending,
                 last_failure: None,
                 no_delay: options.protocol == Protocol::Tcp,
                 send_buffer_bytes: options.socket_buffer_bytes,
@@ -907,7 +1111,7 @@ pub mod transport {
                 batch_bytes,
                 shutdown_started: false,
                 shutdown_deadline: None,
-                completed_buffer: Vec::with_capacity((session_count as usize).saturating_mul(4)),
+                completed_buffer,
                 drain_arbitration: None,
                 sent_bytes: 0,
                 rio_outstanding: 0,
@@ -958,7 +1162,7 @@ pub mod transport {
                 return Ok(());
             }
             if let Some(overlapped) = self.notification_overlapped.as_mut() {
-                **overlapped = OVERLAPPED::default();
+                overlapped.reset_unarmed();
             }
             let rio = &self.rio;
             let queue = self
@@ -1002,31 +1206,49 @@ pub mod transport {
             }
             let generation = next_generation(current_generation);
 
-            let socket = registered_socket(self.protocol).map_err(stage)?;
-            let associated = unsafe {
-                CreateIoCompletionPort(
-                    socket.raw() as *mut c_void,
-                    Some(self.port()?.raw()),
-                    encode_context(index, generation, NO_SEND_SLOT, Operation::Connect) as usize,
-                    0,
-                )
-            };
-            if associated.is_null() {
-                return Err(NativeError {
-                    origin: crate::types::FailureDomain::Win32,
-                    stage: "CreateIoCompletionPort(socket)",
-                    code: unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
-                });
-            }
-
+            let socket = registered_socket(self.protocol).map_err(|error| {
+                stage(NativeError {
+                    stage: "client socket creation",
+                    ..error
+                })
+            })?;
             configure_socket(
                 socket.raw(),
                 self.no_delay,
                 self.send_buffer_bytes,
                 self.receive_buffer_bytes,
             )
-            .map_err(stage)?;
+            .map_err(|error| {
+                // The reference reports the specific setsockopt error before its setup stage.
+                crate::native::write_stderr(format_args!(
+                    "{} failed: native_error={}\n",
+                    error.stage, error.code
+                ));
+                stage(NativeError {
+                    stage: "client socket creation",
+                    ..error
+                })
+            })?;
             bind_local(socket.raw(), self.local_port).map_err(stage)?;
+            if self.protocol == Protocol::Tcp {
+                let associated = unsafe {
+                    CreateIoCompletionPort(
+                        socket.raw() as *mut c_void,
+                        Some(self.port()?.raw()),
+                        encode_context(index, generation, NO_SEND_SLOT, Operation::Connect)
+                            as usize,
+                        0,
+                    )
+                };
+                if associated != self.port()?.raw() {
+                    return Err(NativeError {
+                        origin: crate::types::FailureDomain::Win32,
+                        stage: "CreateIoCompletionPort(ConnectEx socket)",
+                        code: unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
+                    });
+                }
+            }
+
             let slot = &mut self.sessions[slot_index];
             slot.generation = generation;
             slot.state = GenerationState::Connecting;
@@ -1194,7 +1416,7 @@ pub mod transport {
                         status = crate::native::completion::WSAECONNRESET;
                     }
                     if status == 0 && !suppress_send {
-                        self.sent_bytes = self.sent_bytes.saturating_add(u64::from(bytes));
+                        self.sent_bytes = self.sent_bytes.wrapping_add(u64::from(bytes));
                     }
                     // A native send may complete with a strict prefix. The reference re-posts the
                     // remainder of the same attempt, so the scheduler sees exactly one send
@@ -1239,6 +1461,10 @@ pub mod transport {
                                 return Ok(());
                             }
                             Err(error) => {
+                                crate::native::write_stderr(format_args!(
+                                    "{} failed: native_error={}\n",
+                                    error.stage, error.code
+                                ));
                                 status = error.code;
                             }
                         }
@@ -1281,6 +1507,11 @@ pub mod transport {
             }
 
             if !closing {
+                if context.operation == Operation::Connect && status != 0 {
+                    crate::native::write_stderr(format_args!(
+                        "ConnectEx completion failed: native_error={status}\n"
+                    ));
+                }
                 // Match the reference's per-result failure order even though native ownership is
                 // retired in batches: later completions still drain, but cannot count or repost a
                 // send after the first failed operation. Keep liveness until the worker sees it.
@@ -1385,13 +1616,15 @@ pub mod transport {
                 (unsafe { windows::Win32::errhandlingapi::GetLastError() }) as i32
             };
             if error == 0 && key == 1 && overlapped.is_null() {
+                // The coordinator already published external STOP or fatal before posting this
+                // wake packet. Consuming a fatal wake must not turn it into an external STOP.
                 return Ok(Some(false));
             }
             if key as usize == crate::native::rio::RIO_COMPLETION_KEY {
                 let expected = self
                     .notification_overlapped
-                    .as_mut()
-                    .map(|value| &mut **value as *mut OVERLAPPED)
+                    .as_ref()
+                    .map(NotificationStorage::as_ptr)
                     .ok_or_else(|| {
                         NativeError::invariant("RIO notification OVERLAPPED is unavailable")
                     })?;
@@ -1484,6 +1717,41 @@ pub mod transport {
             }
         }
 
+        fn native_deadlines_due(&self, now: Instant) -> bool {
+            self.shutdown_deadline
+                .is_some_and(|deadline| now >= deadline)
+                || self.sessions.iter().any(|session| {
+                    session
+                        .close_deadline
+                        .is_some_and(|deadline| now >= deadline)
+                })
+        }
+
+        fn require_deadlines_after_arbitration(&self) {
+            let Some(arbitration) = self.drain_arbitration else {
+                return;
+            };
+            for session in &self.sessions {
+                if session
+                    .close_deadline
+                    .is_some_and(|deadline| arbitration >= deadline)
+                    && !session.generation_drained()
+                {
+                    crate::native::fail_fast("client generation drain", 1460);
+                }
+            }
+            if self
+                .shutdown_deadline
+                .is_some_and(|deadline| arbitration >= deadline)
+                && self
+                    .sessions
+                    .iter()
+                    .any(|session| !session.generation_drained())
+            {
+                crate::native::fail_fast("client shutdown drain", 1460);
+            }
+        }
+
         fn require_release(&self) {
             if !self.lifecycle_snapshot().releasable {
                 crate::native::fail_fast("client worker release precondition", 996);
@@ -1496,6 +1764,9 @@ pub mod transport {
             // The notification OVERLAPPED and IOCP outlive the CQ, registered arena, and host
             // session storage. Every provider-held request was already retired by the guard.
             drop(self.queue.take());
+            if let Some(storage) = self.notification_overlapped.as_mut() {
+                storage.registered = false;
+            }
             drop(self.arena.take());
             drop(core::mem::take(&mut self.sessions));
             drop(core::mem::take(&mut self.results));
@@ -1537,6 +1808,20 @@ pub mod transport {
                     Ok(completions) => self.recycle(completions),
                     Err(error) => crate::native::fail_fast(error.stage, error.code),
                 }
+                if self.native_deadlines_due(Instant::now()) {
+                    for _ in 0..self.sessions.len().saturating_add(2) {
+                        match self.poll_deadline_packet(64) {
+                            Ok(Some(completions)) => self.recycle(completions),
+                            Ok(None) => break,
+                            Err(error) => crate::native::fail_fast(error.stage, error.code),
+                        }
+                    }
+                    let completions = self
+                        .drain_before_deadlines()
+                        .unwrap_or_else(|error| crate::native::fail_fast(error.stage, error.code));
+                    self.recycle(completions);
+                    self.require_deadlines_after_arbitration();
+                }
             }
         }
     }
@@ -1551,10 +1836,26 @@ pub mod transport {
         }
     }
 
-    /// Only a successfully quiesced transport crosses the JoinHandle boundary. The registered
+    /// Only a successfully quiesced transport crosses the native Join boundary. The registered
     /// arena and notification OVERLAPPED retain their heap addresses until coordinator release.
     pub(super) struct DrainedOwner {
         transport: RioTransport,
+    }
+
+    /// A transport may cross the startup thread boundary only through this private unstarted
+    /// owner. A live transport itself deliberately remains !Send.
+    pub(super) struct PreparedOwner {
+        transport: RioTransport,
+    }
+    // SAFETY: construction below proves no socket, request queue, accepted operation or armed
+    // notification exists. Native handles/registrations have no thread affinity; session Vec and
+    // raw-owned notification storage retain their addresses across this move. Only one worker
+    // consumes this owner, and the coordinator retains the global Winsock lifetime through Join.
+    unsafe impl Send for PreparedOwner {}
+    impl PreparedOwner {
+        pub(super) fn into_runtime(self) -> RioTransport {
+            self.transport
+        }
     }
     // SAFETY: its private constructor follows successful shutdown. Heap addresses remain stable
     // across the ownership move; the resources have no native thread affinity and no other thread
@@ -1569,6 +1870,25 @@ pub mod transport {
         }
     }
     impl RioTransport {
+        pub(super) fn into_prepared_owner(self) -> PreparedOwner {
+            if self.shutdown_started
+                || self.rio_outstanding != 0
+                || !self.pending.is_empty()
+                || self.notify_arms != 0
+                || self.notify_deliveries != 0
+                || self.queue.as_ref().is_some_and(CompletionQueue::is_armed)
+                || self.sessions.iter().any(|session| {
+                    session.state != GenerationState::Empty
+                        || session.generation != 0
+                        || session.socket.is_some()
+                        || session.request_queue.is_some()
+                        || !session.generation_drained()
+                })
+            {
+                crate::native::fail_fast("client prepared worker ownership", 996);
+            }
+            PreparedOwner { transport: self }
+        }
         pub(super) fn into_drained_owner(self) -> DrainedOwner {
             DrainedOwner { transport: self }
         }
@@ -1685,7 +2005,20 @@ pub mod transport {
                     queue_raw,
                     encode_context(index, generation, NO_SEND_SLOT, Operation::Connect),
                 )
-                .map_err(stage)?,
+                .map_err(|error| {
+                    if protocol == Protocol::Udp {
+                        crate::native::write_stderr(format_args!(
+                            "{} failed: native_error={}\n",
+                            error.stage, error.code
+                        ));
+                        stage(NativeError {
+                            stage: "connect/RQ(UDP client)",
+                            ..error
+                        })
+                    } else {
+                        stage(error)
+                    }
+                })?,
             );
             slot.state = GenerationState::Active;
             crate::worker::trace::event_args(
@@ -1877,54 +2210,8 @@ pub mod transport {
             if self.wait_iocp_once_into(wait, &mut completions)? == Some(true) {
                 self.drain_rio_into(budget, &mut completions)?;
             }
-            let arbitration = Instant::now();
-            self.drain_arbitration = Some(arbitration);
-            let due = self
-                .shutdown_deadline
-                .is_some_and(|deadline| arbitration >= deadline)
-                || self.sessions.iter().any(|session| {
-                    session
-                        .close_deadline
-                        .is_some_and(|deadline| arbitration >= deadline)
-                });
-            // The grace can expire during the blocking wait. Give queued ConnectEx, control,
-            // and notification packets a bounded zero-wait pass before checking ownership.
-            if due {
-                for _ in 0..self.sessions.len().saturating_add(2) {
-                    if self.wait_iocp_once_into(0, &mut completions)? == Some(true) {
-                        self.drain_rio_into(budget, &mut completions)?;
-                    }
-                }
-            }
             if self.rio_outstanding != 0 {
                 self.arm_queue()?;
-            }
-            // RIONotify delivery can lag behind already-queued RIO results. At the release
-            // deadline inspect the CQ itself, without retiring the notification's armed state.
-            // At most two native RIO operations per session can be held by the provider; allow
-            // one nonempty dequeue per operation even when the provider returns short batches.
-            if due {
-                let records = (self.sessions.len() as u32).saturating_mul(2);
-                self.drain_rio_bounded_into(records, Some(records), &mut completions)?;
-            }
-            for session in &self.sessions {
-                if session
-                    .close_deadline
-                    .is_some_and(|deadline| arbitration >= deadline)
-                    && !session.generation_drained()
-                {
-                    crate::native::fail_fast("client generation drain", 1460);
-                }
-            }
-            if self
-                .shutdown_deadline
-                .is_some_and(|deadline| arbitration >= deadline)
-                && self
-                    .sessions
-                    .iter()
-                    .any(|session| !session.generation_drained())
-            {
-                crate::native::fail_fast("client shutdown drain", 1460);
             }
             Ok(completions)
         }
@@ -1951,6 +2238,8 @@ pub mod transport {
         }
 
         fn drain_before_deadlines(&mut self) -> Result<Vec<Completion>, NativeError> {
+            // Use this one native timestamp for every guard following the direct CQ pass.
+            self.drain_arbitration = Some(Instant::now());
             let mut completions = core::mem::take(&mut self.completed_buffer);
             completions.extend(self.pending.drain(..));
             let records = (self.sessions.len() as u32).saturating_mul(2);
@@ -1983,7 +2272,10 @@ pub mod transport {
                 stage: error.stage,
                 code: error.code,
             });
-            eprintln!("{} failed: native_error={}", error.stage, error.code);
+            crate::native::write_stderr(format_args!(
+                "{} failed: native_error={}\n",
+                error.stage, error.code
+            ));
             String::new()
         }
     }
@@ -2051,6 +2343,12 @@ pub mod transport {
         }
         fn completion_is_live(&self, index: u32, generation: u32) -> bool {
             RioTransport::completion_is_live(self, index, generation)
+        }
+        fn deadlines_due(&self) -> bool {
+            self.native_deadlines_due(Instant::now())
+        }
+        fn check_deadlines(&self) {
+            self.require_deadlines_after_arbitration();
         }
         fn received(&self, index: u32, generation: u32, length: u32) -> &[u8] {
             RioTransport::received(self, index, generation, length)

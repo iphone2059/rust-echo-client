@@ -64,23 +64,23 @@ impl Default for Statistics {
 
 impl Statistics {
     pub fn merge(&mut self, other: &Statistics) {
-        self.echoes = self.echoes.saturating_add(other.echoes);
-        self.sent_bytes = self.sent_bytes.saturating_add(other.sent_bytes);
-        self.received_bytes = self.received_bytes.saturating_add(other.received_bytes);
-        self.bytes = self.bytes.saturating_add(other.bytes);
-        self.corrupted = self.corrupted.saturating_add(other.corrupted);
-        self.lost = self.lost.saturating_add(other.lost);
-        self.attempted = self.attempted.saturating_add(other.attempted);
-        self.cancelled = self.cancelled.saturating_add(other.cancelled);
-        self.connections = self.connections.saturating_add(other.connections);
-        self.reconnects = self.reconnects.saturating_add(other.reconnects);
-        self.network_failures = self.network_failures.saturating_add(other.network_failures);
+        self.echoes = self.echoes.wrapping_add(other.echoes);
+        self.sent_bytes = self.sent_bytes.wrapping_add(other.sent_bytes);
+        self.received_bytes = self.received_bytes.wrapping_add(other.received_bytes);
+        self.bytes = self.bytes.wrapping_add(other.bytes);
+        self.corrupted = self.corrupted.wrapping_add(other.corrupted);
+        self.lost = self.lost.wrapping_add(other.lost);
+        self.attempted = self.attempted.wrapping_add(other.attempted);
+        self.cancelled = self.cancelled.wrapping_add(other.cancelled);
+        self.connections = self.connections.wrapping_add(other.connections);
+        self.reconnects = self.reconnects.wrapping_add(other.reconnects);
+        self.network_failures = self.network_failures.wrapping_add(other.network_failures);
         self.fatal |= other.fatal;
         for (target, source) in self.latency_buckets.iter_mut().zip(other.latency_buckets) {
-            *target = target.saturating_add(source);
+            *target = target.wrapping_add(source);
         }
-        self.latency_samples = self.latency_samples.saturating_add(other.latency_samples);
-        self.latency_sum_us = self.latency_sum_us.saturating_add(other.latency_sum_us);
+        self.latency_samples = self.latency_samples.wrapping_add(other.latency_samples);
+        self.latency_sum_us = self.latency_sum_us.wrapping_add(other.latency_sum_us);
         self.latency_max_us = self.latency_max_us.max(other.latency_max_us);
         self.elapsed_milliseconds = self.elapsed_milliseconds.max(other.elapsed_milliseconds);
     }
@@ -91,11 +91,11 @@ impl Statistics {
     /// reference's tick conversion, zero and sub-microsecond samples count as one microsecond.
     pub fn record_latency(&mut self, micros: u64) {
         let micros = micros.max(1);
-        self.latency_samples = self.latency_samples.saturating_add(1);
-        self.latency_sum_us = self.latency_sum_us.saturating_add(micros);
+        self.latency_samples = self.latency_samples.wrapping_add(1);
+        self.latency_sum_us = self.latency_sum_us.wrapping_add(micros);
         self.latency_max_us = self.latency_max_us.max(micros);
         let bucket = ((u64::BITS - 1 - micros.leading_zeros()) as usize).min(LATENCY_BUCKETS - 1);
-        self.latency_buckets[bucket] = self.latency_buckets[bucket].saturating_add(1);
+        self.latency_buckets[bucket] = self.latency_buckets[bucket].wrapping_add(1);
     }
 
     /// Percentile from the histogram: the lower bound of the first bucket that crosses the
@@ -113,7 +113,7 @@ impl Statistics {
             .saturating_add(remainder.saturating_mul(numerator).div_ceil(denominator));
         let mut seen = 0u64;
         for (index, count) in self.latency_buckets.iter().enumerate() {
-            seen = seen.saturating_add(*count);
+            seen = seen.wrapping_add(*count);
             if seen >= target {
                 return 1u64 << index.min(63);
             }
@@ -124,7 +124,7 @@ impl Statistics {
     pub fn sample_count(&self) -> u64 {
         let mut total = 0u64;
         for count in self.latency_buckets {
-            total = total.saturating_add(count);
+            total = total.wrapping_add(count);
         }
         total
     }
@@ -172,41 +172,72 @@ impl Statistics {
     /// can be compared across ports by reading the line alone. Pending is derived, because an attempt
     /// is pending exactly while it has been claimed and has not reached a terminal state.
     pub fn line(&self, label: &str, sessions: u32, active: u32) -> String {
-        let terminal = self
+        self.display(label, sessions, active).to_string()
+    }
+
+    /// Production writes this borrowed view directly into bounded native output storage.
+    pub fn display<'a>(&'a self, label: &'a str, sessions: u32, active: u32) -> StatisticsLine<'a> {
+        StatisticsLine {
+            statistics: self,
+            label,
+            sessions,
+            active,
+        }
+    }
+}
+
+pub struct StatisticsLine<'a> {
+    statistics: &'a Statistics,
+    label: &'a str,
+    sessions: u32,
+    active: u32,
+}
+
+impl core::fmt::Display for StatisticsLine<'_> {
+    fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let StatisticsLine {
+            statistics,
+            label,
+            sessions,
+            active,
+        } = self;
+        let self_statistics = *statistics;
+        let terminal = self_statistics
             .echoes
-            .saturating_add(self.corrupted)
-            .saturating_add(self.lost)
-            .saturating_add(self.cancelled);
-        let pending = self.attempted.saturating_sub(terminal);
-        format!(
+            .wrapping_add(self_statistics.corrupted)
+            .wrapping_add(self_statistics.lost)
+            .wrapping_add(self_statistics.cancelled);
+        let pending = self_statistics.attempted.saturating_sub(terminal);
+        write!(
+            out,
             "{} elapsed_ms={} sessions={} active={} attempted={} pending={} echoed={} corrupted={} lost={} cancelled={} \
 sent_bytes={} received_bytes={} bytes={} connections={} reconnects={} network_errors={} echo_per_sec={:.2} MiB_per_sec={:.2} \
 p50_us~{} p99_us~{} p999_us~{} mean_us={} max_us~{} latency_sample=batch",
             label,
-            self.elapsed_milliseconds,
+            self_statistics.elapsed_milliseconds,
             sessions,
             active,
-            self.attempted,
+            self_statistics.attempted,
             pending,
-            self.echoes,
-            self.corrupted,
-            self.lost,
-            self.cancelled,
-            self.sent_bytes,
-            self.received_bytes,
-            self.bytes,
-            self.connections,
-            self.reconnects,
-            self.network_failures,
-            self.echo_per_second(),
-            self.mib_per_second(),
-            self.percentile(50, 100),
-            self.percentile(99, 100),
-            self.percentile(999, 1_000),
-            self.mean_latency_us(),
+            self_statistics.echoes,
+            self_statistics.corrupted,
+            self_statistics.lost,
+            self_statistics.cancelled,
+            self_statistics.sent_bytes,
+            self_statistics.received_bytes,
+            self_statistics.bytes,
+            self_statistics.connections,
+            self_statistics.reconnects,
+            self_statistics.network_failures,
+            self_statistics.echo_per_second(),
+            self_statistics.mib_per_second(),
+            self_statistics.percentile(50, 100),
+            self_statistics.percentile(99, 100),
+            self_statistics.percentile(999, 1_000),
+            self_statistics.mean_latency_us(),
             // The reference reports the maximum as the same histogram percentile, so this field is
             // a bucket lower bound like the others rather than the exact maximum observed.
-            self.percentile(1, 1)
+            self_statistics.percentile(1, 1)
         )
     }
 }

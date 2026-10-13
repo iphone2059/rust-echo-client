@@ -28,24 +28,34 @@ pub mod token {
 
 /// Usage text, one entry per line; printed on stdout for a valid /h command line.
 pub const USAGE: &[&str] = &[
-    "Usage: rust-echo-client target /p tcp|udp [/r port] [/l port] [/n count]",
-    "       [/t seconds] [/i ms] [/d text | /z bytes | /zt bytes] [/k tcp-depth]",
-    "       [/c sessions] [/threads workers] [/w seconds] [/rc [seconds]]",
-    "       [/report seconds] [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats] [/h]",
+    "Usage: rust-echo-client target /p tcp|udp [/r port] [/l port] [/n count] [/t seconds] [/i ms]",
+    "       [/d text | /z bytes | /zt bytes] [/k depth] [/c sessions]",
+    "       [/threads workers] [/w seconds] [/rc [seconds]] [/report seconds]",
+    "       [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats] [/h]",
     "/n count: attempts per session; 0 means unlimited.",
-    "/k depth: echo units in each TCP attempt; UDP rejects /k.",
+    "/k depth: TCP requests in flight per session; UDP rejects /k.",
     "/threads 0: automatic workers, min(sessions, active processors, 64).",
     "/rc [seconds]: reconnect after failure; bare /rc means 1 second.",
     "/w 0: no run limit. /report 0: no periodic reports.",
     "/q suppresses the default final; /stats forces final; /h shows help.",
-    "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.",
-    "One attempt is one receive plus one send whatever /k is, so each worker's CQ reserves two",
-    "operations per session of its largest shard and two batches of registered memory per session.",
 ];
 
 /// The usage text as the process prints it.
-pub fn help_text() -> String {
-    USAGE.join("\n")
+pub const HELP_TEXT: &str = concat!(
+    "Usage: rust-echo-client target /p tcp|udp [/r port] [/l port] [/n count] [/t seconds] [/i ms]\n",
+    "       [/d text | /z bytes | /zt bytes] [/k depth] [/c sessions]\n",
+    "       [/threads workers] [/w seconds] [/rc [seconds]] [/report seconds]\n",
+    "       [/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats] [/h]\n",
+    "/n count: attempts per session; 0 means unlimited.\n",
+    "/k depth: TCP requests in flight per session; UDP rejects /k.\n",
+    "/threads 0: automatic workers, min(sessions, active processors, 64).\n",
+    "/rc [seconds]: reconnect after failure; bare /rc means 1 second.\n",
+    "/w 0: no run limit. /report 0: no periodic reports.\n",
+    "/q suppresses the default final; /stats forces final; /h shows help.\n",
+);
+
+pub fn help_text() -> &'static str {
+    HELP_TEXT
 }
 
 use crate::types::{
@@ -89,58 +99,177 @@ pub fn classify_result(
     }
 }
 
-fn switch_offset(token: &str) -> Option<usize> {
-    let bytes = token.as_bytes();
-    if bytes.len() < 2 || (bytes[0] != b'/' && bytes[0] != b'-') {
+#[derive(Clone, Copy)]
+enum ArgumentSource<'a> {
+    Utf8(&'a str),
+    Os(&'a std::ffi::OsStr),
+    Wide(&'a [u16]),
+}
+
+#[derive(Clone, Copy)]
+struct Argument<'a> {
+    source: ArgumentSource<'a>,
+    begin: usize,
+    end: usize,
+}
+
+enum Units<'a> {
+    Utf8(std::str::EncodeUtf16<'a>),
+    Os(std::os::windows::ffi::EncodeWide<'a>),
+    Wide(std::iter::Copied<std::slice::Iter<'a, u16>>),
+}
+
+impl Iterator for Units<'_> {
+    type Item = u16;
+    fn next(&mut self) -> Option<u16> {
+        match self {
+            Self::Utf8(value) => value.next(),
+            Self::Os(value) => value.next(),
+            Self::Wide(value) => value.next(),
+        }
+    }
+}
+
+impl<'a> Argument<'a> {
+    fn new(source: ArgumentSource<'a>) -> Self {
+        let mut value = Self {
+            source,
+            begin: 0,
+            end: usize::MAX,
+        };
+        // CRT argv ends at the first NUL; keep the public adapters on that same contract.
+        value.end = value.units().take_while(|unit| *unit != 0).count();
+        value
+    }
+    fn units(self) -> impl Iterator<Item = u16> + 'a {
+        use std::os::windows::ffi::OsStrExt;
+        let units = match self.source {
+            ArgumentSource::Utf8(value) => Units::Utf8(value.encode_utf16()),
+            ArgumentSource::Os(value) => Units::Os(value.encode_wide()),
+            ArgumentSource::Wide(value) => Units::Wide(value.iter().copied()),
+        };
+        units.skip(self.begin).take(self.end - self.begin)
+    }
+    fn len(self) -> usize {
+        self.end - self.begin
+    }
+    fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+    fn from(self, begin: usize) -> Self {
+        Self {
+            begin: self.begin + begin,
+            ..self
+        }
+    }
+    fn to(self, end: usize) -> Self {
+        Self {
+            end: self.begin + end,
+            ..self
+        }
+    }
+    fn equal(self, text: &str) -> bool {
+        self.units()
+            .map(|unit| {
+                if (65..=90).contains(&unit) {
+                    unit + 32
+                } else {
+                    unit
+                }
+            })
+            .eq(text.encode_utf16())
+    }
+    fn valid_utf16(self) -> bool {
+        char::decode_utf16(self.units()).all(|value| value.is_ok())
+    }
+}
+
+trait Arguments {
+    fn len(&self) -> usize;
+    fn argument(&self, index: usize) -> Argument<'_>;
+}
+impl Arguments for [String] {
+    fn len(&self) -> usize {
+        <[String]>::len(self)
+    }
+    fn argument(&self, index: usize) -> Argument<'_> {
+        Argument::new(ArgumentSource::Utf8(&self[index]))
+    }
+}
+impl Arguments for [std::ffi::OsString] {
+    fn len(&self) -> usize {
+        <[std::ffi::OsString]>::len(self)
+    }
+    fn argument(&self, index: usize) -> Argument<'_> {
+        Argument::new(ArgumentSource::Os(&self[index]))
+    }
+}
+impl Arguments for crate::native::NativeArguments {
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn argument(&self, index: usize) -> Argument<'_> {
+        Argument::new(ArgumentSource::Wide(self.argument(index)))
+    }
+}
+
+fn switch_offset(token: Argument<'_>) -> Option<usize> {
+    let mut units = token.units();
+    let first = units.next()?;
+    let second = units.next()?;
+    if first != u16::from(b'/') && first != u16::from(b'-') {
         return None;
     }
-    let offset = if bytes.len() > 2 && bytes[0] == b'-' && bytes[1] == b'-' {
-        2
-    } else {
-        1
-    };
-    let first = bytes[offset].to_ascii_lowercase();
-    if first.is_ascii_lowercase() {
+    let (offset, letter) =
+        if token.len() > 2 && first == u16::from(b'-') && second == u16::from(b'-') {
+            (2, units.next()?)
+        } else {
+            (1, second)
+        };
+    if (65..=90).contains(&letter) || (97..=122).contains(&letter) {
         Some(offset)
     } else {
         None
     }
 }
 
-fn numeric(value: &str) -> Result<u64, ArgumentError> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(ArgumentError(token::INVALID_NUMBER.to_string()));
+fn numeric(value: Argument<'_>) -> Result<u64, ArgumentError> {
+    if value.is_empty() {
+        return Err(ArgumentError(token::INVALID_NUMBER));
     }
-    value
-        .parse::<u64>()
-        .map_err(|_| ArgumentError(token::INVALID_NUMBER.to_string()))
+    value.units().try_fold(0u64, |number, unit| {
+        let digit = unit
+            .checked_sub(u16::from(b'0'))
+            .filter(|digit| *digit <= 9)
+            .ok_or(ArgumentError(token::INVALID_NUMBER))?;
+        number
+            .checked_mul(10)
+            .and_then(|number| number.checked_add(u64::from(digit)))
+            .ok_or(ArgumentError(token::INVALID_NUMBER))
+    })
 }
 
 /// Strict parser: exactly one positional target host, mutually exclusive payload
 /// switches, and cross rules (fixed local port requires one session and forbids
 /// reconnects on TCP). /h never masks a malformed command line.
 pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
-    parse_impl(arguments, &[])
+    parse_impl(arguments)
 }
 
 /// Preserve the reference's token-consumption order even when Windows supplies unpaired UTF-16
 /// surrogates. Invalid numeric/protocol values receive their normal value diagnostics; invalid
 /// literal text is diagnosed after the same mandatory/cross-field rules as the reference.
 pub fn parse_os(arguments: &[std::ffi::OsString]) -> Result<Options, ArgumentError> {
-    let invalid: Vec<bool> = arguments
-        .iter()
-        .map(|argument| argument.to_str().is_none())
-        .collect();
-    let arguments: Vec<String> = arguments
-        .iter()
-        .map(|argument| argument.to_string_lossy().into_owned())
-        .collect();
-    parse_impl(&arguments, &invalid)
+    parse_impl(arguments)
 }
 
-fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, ArgumentError> {
-    if arguments.is_empty() {
-        return Err(ArgumentError("invalid parser arguments".to_string()));
+pub fn parse_native(arguments: &crate::native::NativeArguments) -> Result<Options, ArgumentError> {
+    parse_impl(arguments)
+}
+
+fn parse_impl(arguments: &(impl Arguments + ?Sized)) -> Result<Options, ArgumentError> {
+    if arguments.len() == 0 {
+        return Err(ArgumentError("invalid parser arguments"));
     }
     let mut options = Options::default();
     let mut literal = false;
@@ -150,39 +279,46 @@ fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, A
     // A second positional is reported after the cross-field rules, exactly as the reference does,
     // so the worker split still wins when both are wrong.
     let mut saw_extra_target = false;
-    let mut literal_invalid_utf16 = false;
     let mut index = 1;
     while index < arguments.len() {
-        if invalid_utf16.get(index).copied().unwrap_or(false) {
-            return Err(ArgumentError(token::INVALID_UTF16.to_string()));
+        let token = arguments.argument(index);
+        if !token.valid_utf16() {
+            return Err(ArgumentError(token::INVALID_UTF16));
         }
-        let token = arguments[index].clone();
         index += 1;
-        let Some(offset) = switch_offset(&token) else {
+        let Some(offset) = switch_offset(token) else {
             if !options.host.is_empty() {
                 saw_extra_target = true;
                 continue;
             }
             if token.is_empty() {
-                return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
+                return Err(ArgumentError(token::OUT_OF_RANGE));
             }
-            if token.encode_utf16().count() >= 256 {
-                return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
+            if token.len() >= 256 {
+                return Err(ArgumentError(token::OUT_OF_RANGE));
             }
-            options.host = token;
+            if !options.host.copy_units(token.units()) {
+                return Err(ArgumentError(token::OUT_OF_RANGE));
+            }
             continue;
         };
-        let rest = &token[offset..];
-        let (name, inline) = match rest.split_once('=') {
-            Some((name, value)) => (name.to_ascii_lowercase(), Some(value.to_string())),
-            None => (rest.to_ascii_lowercase(), None),
-        };
-        if matches!(name.as_str(), "q" | "quiet" | "stats" | "h" | "help") {
+        let rest = token.from(offset);
+        let separator = rest.units().position(|unit| unit == u16::from(b'='));
+        let name_view = separator.map_or(rest, |position| rest.to(position));
+        let inline = separator.map(|position| rest.from(position + 1));
+        let name = [
+            "q", "quiet", "stats", "h", "help", "p", "d", "r", "l", "n", "t", "i", "b", "k", "z",
+            "zt", "w", "rc", "report", "c", "threads", "cq", "memory",
+        ]
+        .into_iter()
+        .find(|name| name_view.equal(name))
+        .ok_or(ArgumentError(token::UNKNOWN_SWITCH))?;
+        if matches!(name, "q" | "quiet" | "stats" | "h" | "help") {
             if inline.is_some() {
                 // A flag never takes a value, and an empty one is still a value.
-                return Err(ArgumentError(token::UNEXPECTED_VALUE.to_string()));
+                return Err(ArgumentError(token::UNEXPECTED_VALUE));
             }
-            match name.as_str() {
+            match name {
                 "q" | "quiet" => options.quiet = true,
                 "stats" => options.stats = true,
                 _ => options.help = true,
@@ -191,14 +327,14 @@ fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, A
         }
         if name == "rc" && inline.is_none() {
             let next_is_value =
-                index < arguments.len() && switch_offset(&arguments[index]).is_none();
+                index < arguments.len() && switch_offset(arguments.argument(index)).is_none();
             if !next_is_value {
                 options.reconnect_seconds = Some(1);
                 continue;
             }
         }
         if !matches!(
-            name.as_str(),
+            name,
             "p" | "d"
                 | "r"
                 | "l"
@@ -217,21 +353,19 @@ fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, A
                 | "cq"
                 | "memory"
         ) {
-            return Err(ArgumentError(token::UNKNOWN_SWITCH.to_string()));
+            return Err(ArgumentError(token::UNKNOWN_SWITCH));
         }
-        let mut value_invalid_utf16 = false;
         let value = match inline {
             Some(value) if !value.is_empty() => value,
-            Some(_) => return Err(ArgumentError(token::MISSING_VALUE.to_string())),
+            Some(_) => return Err(ArgumentError(token::MISSING_VALUE)),
             None => {
                 if index >= arguments.len()
-                    || arguments[index].is_empty()
-                    || switch_offset(&arguments[index]).is_some()
+                    || arguments.argument(index).is_empty()
+                    || switch_offset(arguments.argument(index)).is_some()
                 {
-                    return Err(ArgumentError(token::MISSING_VALUE.to_string()));
+                    return Err(ArgumentError(token::MISSING_VALUE));
                 }
-                let value = arguments[index].clone();
-                value_invalid_utf16 = invalid_utf16.get(index).copied().unwrap_or(false);
+                let value = arguments.argument(index);
                 index += 1;
                 value
             }
@@ -239,29 +373,32 @@ fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, A
         if name == "p" {
             // The reference matches the protocol keyword itself and reports the parse failure as
             // an out-of-range value, not as a protocol-specific message.
-            options.protocol = match value.to_ascii_lowercase().as_str() {
-                "tcp" => Protocol::Tcp,
-                "udp" => Protocol::Udp,
-                _ => return Err(ArgumentError(token::OUT_OF_RANGE.to_string())),
+            options.protocol = if value.equal("tcp") {
+                Protocol::Tcp
+            } else if value.equal("udp") {
+                Protocol::Udp
+            } else {
+                return Err(ArgumentError(token::OUT_OF_RANGE));
             };
             continue;
         }
         if name == "d" || name == "z" || name == "zt" {
-            let number = if name == "d" { 0 } else { numeric(&value)? };
+            let number = if name == "d" { 0 } else { numeric(value)? };
             if name != "d" {
                 if number == 0 || number > crate::types::MAXIMUM_TCP_BATCH_BYTES {
-                    return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
+                    return Err(ArgumentError(token::OUT_OF_RANGE));
                 }
             }
-            match name.as_str() {
+            match name {
                 "d" => {
-                    if value.encode_utf16().count() >= 32_768 {
-                        return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
+                    if value.len() >= 32_768 {
+                        return Err(ArgumentError(token::OUT_OF_RANGE));
                     }
                     literal = true;
                     options.pattern = Pattern::LiteralText;
-                    options.literal_pattern = value;
-                    literal_invalid_utf16 = value_invalid_utf16;
+                    if !options.literal_pattern.copy_units(value.units()) {
+                        return Err(ArgumentError(token::OUT_OF_RANGE));
+                    }
                 }
                 "z" => {
                     binary = true;
@@ -276,8 +413,8 @@ fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, A
             }
             continue;
         }
-        let number = numeric(&value)?;
-        let range = match name.as_str() {
+        let number = numeric(value)?;
+        let range = match name {
             // /n allows 0, which means "unlimited echoes".
             "n" => 0..=u64::MAX,
             "r" => 1..=65_535,
@@ -293,9 +430,9 @@ fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, A
             _ => 1_048_576..=u64::MAX,
         };
         if !range.contains(&number) {
-            return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
+            return Err(ArgumentError(token::OUT_OF_RANGE));
         }
-        match name.as_str() {
+        match name {
             "r" => options.remote_port = number as u16,
             "l" => options.local_port = number as u16,
             "n" => options.echo_count = number,
@@ -318,20 +455,20 @@ fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, A
     // The worker split is validated before the mandatory arguments, which is why
     // `/c 1 /threads 2` reports out-of-range and not missing-target.
     if options.worker_count > options.session_count {
-        return Err(ArgumentError(token::OUT_OF_RANGE.to_string()));
+        return Err(ArgumentError(token::OUT_OF_RANGE));
     }
     // /h suppresses only the two mandatory-argument checks. Every other rule, including the
     // capacity budgets, still applies exactly as it does without /h.
     // The baseline reports the missing target first and the missing protocol second, so a bare
     // invocation and a host-only invocation produce different diagnostics.
     if !options.help && options.host.is_empty() {
-        return Err(ArgumentError(token::MISSING_TARGET.to_string()));
+        return Err(ArgumentError(token::MISSING_TARGET));
     }
     if saw_extra_target {
-        return Err(ArgumentError(token::UNEXPECTED_TARGET.to_string()));
+        return Err(ArgumentError(token::UNEXPECTED_TARGET));
     }
     if !options.help && options.protocol == Protocol::None {
-        return Err(ArgumentError(token::MISSING_PROTOCOL.to_string()));
+        return Err(ArgumentError(token::MISSING_PROTOCOL));
     }
     // The target is not required to be a literal: the reference resolves it with GetAddrInfoW
     // after parsing, so a name is accepted here and an unresolvable one is a network failure
@@ -341,42 +478,46 @@ fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, A
         .filter(|flag| **flag)
         .count();
     if payload_switches > 1 {
-        return Err(ArgumentError(token::CONFLICTING_PAYLOAD.to_string()));
+        return Err(ArgumentError(token::CONFLICTING_PAYLOAD));
     }
     if options.protocol == Protocol::Udp && saw_pipeline {
-        return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
+        return Err(ArgumentError(token::PROTOCOL_OPTION));
     }
     if options.local_port != 0
         && (options.session_count != 1
             || (options.protocol == Protocol::Tcp && options.reconnect_seconds.is_some()))
     {
-        return Err(ArgumentError(token::LOCAL_PORT_CONFLICT.to_string()));
+        return Err(ArgumentError(token::LOCAL_PORT_CONFLICT));
     }
     // The run the command line describes may not exceed the quota the engine can represent.
     if options.session_count != 0
         && options.echo_count > u64::MAX / u64::from(options.session_count)
     {
-        return Err(ArgumentError(token::QUOTA_OVERFLOW.to_string()));
-    }
-    if options.pattern == Pattern::LiteralText && literal_invalid_utf16 {
-        return Err(ArgumentError(token::INVALID_UTF16.to_string()));
+        return Err(ArgumentError(token::QUOTA_OVERFLOW));
     }
     // The effective payload length is known before any session exists: the counter payloads carry
     // their own /z or /zt length, while the literal and default texts are measured in UTF-8 bytes
     // exactly as the reference measures them through WideCharToMultiByte.
     let pattern_bytes = match options.pattern {
         Pattern::BinaryCounter | Pattern::PrintableCounter => u64::from(options.pattern_bytes),
-        Pattern::LiteralText => options.literal_pattern.len() as u64,
+        Pattern::LiteralText => options
+            .literal_pattern
+            .utf8_bytes()
+            .ok_or(ArgumentError(token::INVALID_UTF16))? as u64,
         Pattern::DefaultText => {
             if options.host.is_empty() {
                 0
             } else {
-                (crate::payload::DEFAULT_TEXT_PREFIX.len() + options.host.len()) as u64
+                (crate::payload::DEFAULT_TEXT_PREFIX.len()
+                    + options
+                        .host
+                        .utf8_bytes()
+                        .ok_or(ArgumentError(token::INVALID_UTF16))?) as u64
             }
         }
     };
     if options.protocol == Protocol::Udp && pattern_bytes > MAXIMUM_UDP_PAYLOAD_BYTES {
-        return Err(ArgumentError(token::PAYLOAD_SIZE.to_string()));
+        return Err(ArgumentError(token::PAYLOAD_SIZE));
     }
     // Nothing else can be validated without a protocol, which is how /h alone succeeds.
     if options.protocol == Protocol::None {
@@ -397,7 +538,7 @@ fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, A
             .checked_mul(u64::from(options.pipeline_depth))
             .filter(|bytes| *bytes <= crate::types::MAXIMUM_TCP_BATCH_BYTES)
         else {
-            return Err(ArgumentError(token::PAYLOAD_SIZE.to_string()));
+            return Err(ArgumentError(token::PAYLOAD_SIZE));
         };
         let storage = batch
             .checked_mul(u64::from(options.session_count))
@@ -408,14 +549,14 @@ fn parse_impl(arguments: &[String], invalid_utf16: &[bool]) -> Result<Options, A
         match (storage, per_worker) {
             (Some(storage), Some(per_worker))
                 if storage <= options.memory_bytes && per_worker <= u64::from(u32::MAX) => {}
-            _ => return Err(ArgumentError(token::MEMORY_CAPACITY.to_string())),
+            _ => return Err(ArgumentError(token::MEMORY_CAPACITY)),
         }
     }
     // One attempt is one receive plus one send whatever /k is, so the largest shard reserves exactly
     // two operations per session against the completion queue.
     match shard.checked_mul(2) {
         Some(reserved) if reserved <= u64::from(options.cq_capacity) => {}
-        _ => return Err(ArgumentError(token::CQ_CAPACITY.to_string())),
+        _ => return Err(ArgumentError(token::CQ_CAPACITY)),
     }
     Ok(options)
 }
@@ -486,7 +627,7 @@ mod tests {
         assert_eq!(reconnect.reconnect_seconds, Some(1));
     }
 
-    fn error_token(arguments: &[&str]) -> String {
+    fn error_token(arguments: &[&str]) -> &'static str {
         parse(&args(arguments))
             .expect_err("expected a rejected command line")
             .0

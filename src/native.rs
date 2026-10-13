@@ -31,9 +31,365 @@ pub struct NativeError {
     pub origin: crate::types::FailureDomain,
 }
 
+/// Borrow the process-owned CRT wide argv, using the same quoting rules as C++ wmain.
+/// Initialization occurs once: subsequent safe calls cannot invalidate a prior argv view.
+#[derive(Clone, Copy)]
+pub struct NativeArguments {
+    arguments: &'static [*mut u16],
+}
+
+// The CRT owns this read-only array through process shutdown. Only current() initializes it,
+// under OnceLock; this wrapper exposes no mutation or reconfiguration operation.
+unsafe impl Send for NativeArguments {}
+unsafe impl Sync for NativeArguments {}
+
+#[link(name = "ucrt")]
+unsafe extern "C" {
+    fn _configure_wide_argv(mode: i32) -> i32;
+    fn __p___argc() -> *mut i32;
+    fn __p___wargv() -> *mut *mut *mut u16;
+}
+
+impl NativeArguments {
+    pub fn current() -> Result<Self, NativeError> {
+        static ARGUMENTS: std::sync::OnceLock<Result<NativeArguments, NativeError>> =
+            std::sync::OnceLock::new();
+        *ARGUMENTS.get_or_init(|| {
+            // _crt_argv_unexpanded = 1, matching the reference's default CRT startup.
+            if unsafe { *__p___wargv() }.is_null() && unsafe { _configure_wide_argv(1) } != 0 {
+                return Err(crate::types::Failure::allocation("command line arguments").into());
+            }
+            let count = unsafe { *__p___argc() };
+            let pointer = unsafe { *__p___wargv() };
+            if count < 1 || pointer.is_null() {
+                return Err(NativeError {
+                    stage: "command line arguments",
+                    code: 87,
+                    origin: crate::types::FailureDomain::Win32,
+                });
+            }
+            // SAFETY: successful CRT configuration publishes count initialized, NUL-terminated
+            // arguments. Their owners live through CRT process shutdown, after Rust main exits.
+            let arguments = unsafe { core::slice::from_raw_parts(pointer, count as usize) };
+            if arguments.iter().any(|argument| argument.is_null()) {
+                return Err(NativeError {
+                    stage: "command line arguments",
+                    code: 87,
+                    origin: crate::types::FailureDomain::Win32,
+                });
+            }
+            Ok(Self { arguments })
+        })
+    }
+    pub fn len(&self) -> usize {
+        self.arguments.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.arguments.is_empty()
+    }
+    pub(crate) fn argument(&self, index: usize) -> &[u16] {
+        let pointer = self.arguments[index];
+        let mut length = 0;
+        // SAFETY: current() accepts only the CRT's initialized NUL-terminated argument pointers.
+        unsafe {
+            while *pointer.add(length) != 0 {
+                length += 1;
+            }
+            core::slice::from_raw_parts(pointer, length)
+        }
+    }
+}
+
+#[link(name = "Kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(kind: u32) -> *mut c_void;
+    fn WriteFile(
+        handle: *mut c_void,
+        bytes: *const c_void,
+        count: u32,
+        written: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    fn GetEnvironmentVariableW(name: *const u16, value: *mut u16, capacity: u32) -> u32;
+    fn CreateFileW(
+        path: *const u16,
+        access: u32,
+        sharing: u32,
+        security: *const c_void,
+        creation: u32,
+        attributes: u32,
+        template: *mut c_void,
+    ) -> *mut c_void;
+}
+
+/// Rendering and output use stack storage rather than stdio's lazy heap buffer. As in the
+/// reference, an unavailable or broken output stream does not change the program's exit code.
+pub fn write_stdout(arguments: core::fmt::Arguments<'_>) {
+    write_output(unsafe { GetStdHandle((-11i32) as u32) }, arguments);
+}
+pub fn write_stderr(arguments: core::fmt::Arguments<'_>) {
+    write_output(unsafe { GetStdHandle((-12i32) as u32) }, arguments);
+}
+
+struct OutputBuffer<const CAPACITY: usize> {
+    bytes: [u8; CAPACITY],
+    length: usize,
+}
+impl<const CAPACITY: usize> core::fmt::Write for OutputBuffer<CAPACITY> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let end = self
+            .length
+            .checked_add(text.len())
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(core::fmt::Error)?;
+        self.bytes[self.length..end].copy_from_slice(text.as_bytes());
+        self.length = end;
+        Ok(())
+    }
+}
+
+fn write_output(handle: *mut c_void, arguments: core::fmt::Arguments<'_>) -> bool {
+    let mut output = OutputBuffer {
+        bytes: [0; 4_096],
+        length: 0,
+    };
+    if core::fmt::write(&mut output, arguments).is_err() {
+        return false;
+    }
+    if handle.is_null() || handle == (-1isize) as *mut c_void {
+        return false;
+    }
+    static OUTPUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = OUTPUT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut offset = 0;
+    while offset < output.length {
+        let mut written = 0;
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                output.bytes[offset..output.length].as_ptr().cast(),
+                (output.length - offset) as u32,
+                &mut written,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || written == 0 || written as usize > output.length - offset {
+            return false;
+        }
+        offset += written as usize;
+    }
+    true
+}
+
+pub(crate) fn environment_present(name: &str) -> bool {
+    let mut units = [0u16; 64];
+    if name.len() >= units.len() || !name.is_ascii() {
+        return false;
+    }
+    for (unit, byte) in units.iter_mut().zip(name.bytes()) {
+        *unit = u16::from(byte);
+    }
+    unsafe {
+        windows::Win32::errhandlingapi::SetLastError(0);
+        let required = GetEnvironmentVariableW(units.as_ptr(), core::ptr::null_mut(), 0);
+        required != 0 || windows::Win32::errhandlingapi::GetLastError() != 203
+    }
+}
+
+/// Optional diagnostics mirror the reference's fixed 512-wide-character path and file flags.
+pub(crate) struct DiagnosticFile {
+    handle: *mut c_void,
+}
+impl DiagnosticFile {
+    pub(crate) fn open() -> Option<Self> {
+        let name: [u16; 14] = [67, 69, 67, 95, 68, 73, 65, 71, 95, 70, 73, 76, 69, 0];
+        let required = unsafe { GetEnvironmentVariableW(name.as_ptr(), core::ptr::null_mut(), 0) };
+        if required == 0 || required > 512 {
+            return None;
+        }
+        let mut path = [0u16; 512];
+        let count =
+            unsafe { GetEnvironmentVariableW(name.as_ptr(), path.as_mut_ptr(), path.len() as u32) };
+        if count == 0 || count >= path.len() as u32 {
+            return None;
+        }
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                0x4000_0000,
+                1,
+                core::ptr::null(),
+                2,
+                0x80,
+                core::ptr::null_mut(),
+            )
+        };
+        (handle != (-1isize) as *mut c_void).then_some(Self { handle })
+    }
+    pub(crate) fn write(&self, arguments: core::fmt::Arguments<'_>) -> bool {
+        let mut output = OutputBuffer {
+            bytes: [0; 191],
+            length: 0,
+        };
+        // C++ _snprintf_s rejects a line that cannot fit, including the trailing NUL, in 192 bytes.
+        if core::fmt::write(&mut output, arguments).is_err() {
+            return true;
+        }
+        let mut written = 0;
+        unsafe {
+            WriteFile(
+                self.handle,
+                output.bytes.as_ptr().cast(),
+                output.length as u32,
+                &mut written,
+                core::ptr::null_mut(),
+            ) != 0
+                && written == output.length as u32
+        }
+    }
+}
+impl Drop for DiagnosticFile {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::handleapi::CloseHandle(self.handle);
+        }
+    }
+}
+
+struct ThreadState<T> {
+    value: core::cell::UnsafeCell<Option<T>>,
+    run: fn(&mut T),
+    finished: core::sync::atomic::AtomicBool,
+}
+
+/// One fallible packet allocation replaces std::thread's infallible Arc/Box setup. The packet
+/// stays at its boxed address until the native Join barrier; only the worker mutates its value.
+pub(crate) struct NativeThread<T> {
+    handle: *mut c_void,
+    state: Option<core::ptr::NonNull<ThreadState<T>>>,
+}
+
+impl<T: Send + 'static> NativeThread<T> {
+    pub(crate) fn spawn(
+        value: T,
+        run: fn(&mut T),
+        stage: &'static str,
+    ) -> Result<Self, NativeError> {
+        let state = crate::types::try_box(
+            ThreadState {
+                value: core::cell::UnsafeCell::new(Some(value)),
+                run,
+                finished: core::sync::atomic::AtomicBool::new(false),
+            },
+            "client worker allocation",
+        )
+        .map_err(NativeError::from)?;
+        // Convert the Box into raw ownership before publishing: moving a live Box after deriving
+        // the callback pointer could invalidate that pointer's exclusive provenance.
+        let state = core::ptr::NonNull::new(Box::into_raw(state))
+            .unwrap_or_else(|| fail_fast("native thread packet", 13));
+        let parameter = state.as_ptr().cast::<c_void>();
+        // SAFETY: failure starts no callback; success keeps raw packet ownership until Join.
+        // No Box or value reference is reconstructed while the callback can access the packet.
+        let handle = unsafe {
+            windows::Win32::processthreadsapi::CreateThread(
+                None,
+                0,
+                Some(native_thread_entry::<T>),
+                Some(parameter),
+                0,
+                None,
+            )
+        };
+        if handle.is_null() {
+            let error = NativeError {
+                stage,
+                code: unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
+                origin: crate::types::FailureDomain::Win32,
+            };
+            // SAFETY: failed CreateThread starts no callback and the packet accepted no I/O.
+            unsafe {
+                drop(Box::from_raw(state.as_ptr()));
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            handle,
+            state: Some(state),
+        })
+    }
+    pub(crate) fn is_finished(&self) -> bool {
+        match unsafe { windows::Win32::synchapi::WaitForSingleObject(self.handle, 0) } {
+            0 => true,
+            258 => false,
+            _ => fail_fast("WaitForSingleObject(client worker)", unsafe {
+                windows::Win32::errhandlingapi::GetLastError()
+            } as i32),
+        }
+    }
+    pub(crate) fn join(&mut self) -> T {
+        if unsafe { windows::Win32::synchapi::WaitForSingleObject(self.handle, u32::MAX) } != 0 {
+            fail_fast("WaitForSingleObject(client worker)", unsafe {
+                windows::Win32::errhandlingapi::GetLastError()
+            } as i32);
+        }
+        let state = self
+            .state
+            .take()
+            .unwrap_or_else(|| fail_fast("native thread join state", 13));
+        // SAFETY: native termination plus Acquire publication end every worker borrow before
+        // recovering exclusive Box ownership and moving the result to the coordinator.
+        if !unsafe { state.as_ref() }
+            .finished
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            fail_fast("native thread result publication", 13);
+        }
+        let ThreadState { value, .. } = *unsafe { Box::from_raw(state.as_ptr()) };
+        value
+            .into_inner()
+            .unwrap_or_else(|| fail_fast("native thread result ownership", 13))
+    }
+}
+
+impl<T> Drop for NativeThread<T> {
+    fn drop(&mut self) {
+        // Checking inside this owner prevents every caller from freeing a live callback packet.
+        if self.state.is_some() {
+            fail_fast("native thread release before join", 996);
+        }
+        if !self.handle.is_null() {
+            unsafe {
+                let _ = windows::Win32::handleapi::CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn native_thread_entry<T: Send + 'static>(parameter: *mut c_void) -> u32 {
+    // SAFETY: the typed packet is stable and exclusively borrowed by this callback until Join.
+    let state = unsafe { &*parameter.cast::<ThreadState<T>>() };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let value = unsafe { &mut *state.value.get() };
+        let value = value
+            .as_mut()
+            .unwrap_or_else(|| fail_fast("native thread entry ownership", 13));
+        (state.run)(value);
+    }));
+    if result.is_err() {
+        fail_fast("native thread panic", 13);
+    }
+    state
+        .finished
+        .store(true, core::sync::atomic::Ordering::Release);
+    0
+}
+
 /// Ownership/CQ faults cannot unwind through resources still borrowed by Windows.
 pub fn fail_fast(stage: &str, code: i32) -> ! {
-    eprintln!("{stage} failed: native_error={code}");
+    write_stderr(format_args!("{stage} failed: native_error={code}\n"));
     unsafe {
         let _ = windows::Win32::processthreadsapi::TerminateProcess(
             windows::Win32::processthreadsapi::GetCurrentProcess(),
@@ -55,6 +411,16 @@ impl NativeError {
             stage,
             code: unsafe { WSAGetLastError() },
             origin: crate::types::FailureDomain::Winsock,
+        }
+    }
+}
+
+impl From<crate::types::Failure> for NativeError {
+    fn from(error: crate::types::Failure) -> Self {
+        Self {
+            stage: error.stage,
+            code: error.code,
+            origin: error.domain,
         }
     }
 }
@@ -164,24 +530,17 @@ pub fn configure_socket(
     send_buffer_bytes: u32,
     receive_buffer_bytes: u32,
 ) -> Result<(), NativeError> {
-    if no_delay {
-        let value: i32 = 1;
-        let status = unsafe {
-            setsockopt(
-                socket,
-                IPPROTO_TCP,
-                TCP_NODELAY,
-                Some(&value as *const i32 as *const i8),
-                size_of::<i32>() as i32,
-            )
-        };
-        if status != 0 {
-            return Err(NativeError::winsock_last("setsockopt(TCP_NODELAY)"));
-        }
-    }
     for (stage, option, bytes) in [
-        ("setsockopt(SO_SNDBUF)", SO_SNDBUF, send_buffer_bytes),
-        ("setsockopt(SO_RCVBUF)", SO_RCVBUF, receive_buffer_bytes),
+        (
+            "setsockopt(SO_SNDBUF/SO_RCVBUF)",
+            SO_SNDBUF,
+            send_buffer_bytes,
+        ),
+        (
+            "setsockopt(SO_SNDBUF/SO_RCVBUF)",
+            SO_RCVBUF,
+            receive_buffer_bytes,
+        ),
     ] {
         if bytes == 0 {
             continue;
@@ -198,6 +557,21 @@ pub fn configure_socket(
         };
         if status != 0 {
             return Err(NativeError::winsock_last(stage));
+        }
+    }
+    if no_delay {
+        let value: i32 = 1;
+        let status = unsafe {
+            setsockopt(
+                socket,
+                IPPROTO_TCP,
+                TCP_NODELAY,
+                Some(&value as *const i32 as *const i8),
+                size_of::<i32>() as i32,
+            )
+        };
+        if status != 0 {
+            return Err(NativeError::winsock_last("setsockopt(TCP_NODELAY)"));
         }
     }
     Ok(())
@@ -237,7 +611,7 @@ impl RioFunctions {
         };
         if status != 0 {
             return Err(NativeError::winsock_last(
-                "WSAIoctl(SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER)",
+                "SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER(RIO)",
             ));
         }
         if returned != expected || table.cbSize != expected {
@@ -302,7 +676,9 @@ pub fn load_connect_ex(socket: SOCKET) -> Result<LPFN_CONNECTEX, NativeError> {
         )
     };
     if status != 0 {
-        return Err(NativeError::winsock_last("WSAIoctl(WSAID_CONNECTEX)"));
+        return Err(NativeError::winsock_last(
+            "SIO_GET_EXTENSION_FUNCTION_POINTER(ConnectEx)",
+        ));
     }
     if function.is_none() || returned != size_of::<LPFN_CONNECTEX>() as u32 {
         return Err(NativeError {
@@ -406,22 +782,6 @@ pub mod arena {
                 code: 8,
             })? as usize;
             let receive_offset = bytes / 2;
-            let mut send_registrations = Vec::new();
-            send_registrations
-                .try_reserve_exact(slots as usize)
-                .map_err(|_| NativeError {
-                    origin: crate::types::FailureDomain::Allocation,
-                    stage: "worker arena registration allocation",
-                    code: 8,
-                })?;
-            let mut receive_registrations = Vec::new();
-            receive_registrations
-                .try_reserve_exact(slots as usize)
-                .map_err(|_| NativeError {
-                    origin: crate::types::FailureDomain::Allocation,
-                    stage: "worker arena receive registration allocation",
-                    code: 8,
-                })?;
             if bytes > isize::MAX as usize {
                 return Err(NativeError {
                     origin: crate::types::FailureDomain::Invariant,
@@ -435,7 +795,7 @@ pub mod arena {
             if base.is_null() {
                 return Err(NativeError {
                     origin: crate::types::FailureDomain::Win32,
-                    stage: "VirtualAlloc(worker arena)",
+                    stage: "VirtualAlloc(client arena)",
                     code: unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
                 });
             }
@@ -445,9 +805,27 @@ pub mod arena {
                 stride,
                 slots,
                 receive_offset,
-                send_registrations,
-                receive_registrations,
+                send_registrations: Vec::new(),
+                receive_registrations: Vec::new(),
             };
+            // VirtualAlloc has the reference's failure priority over registration-owner storage.
+            // The arena guard already owns the pages, so either reserve failure releases them.
+            arena
+                .send_registrations
+                .try_reserve_exact(slots as usize)
+                .map_err(|_| NativeError {
+                    origin: crate::types::FailureDomain::Allocation,
+                    stage: "client registration owners",
+                    code: 8,
+                })?;
+            arena
+                .receive_registrations
+                .try_reserve_exact(slots as usize)
+                .map_err(|_| NativeError {
+                    origin: crate::types::FailureDomain::Allocation,
+                    stage: "client registration owners",
+                    code: 8,
+                })?;
             for slot in 0..slots as usize {
                 let offset = checked_slot_offset(slot, stride as usize, receive_offset).ok_or(
                     NativeError {
@@ -671,20 +1049,18 @@ pub mod clock {
             if !unsafe { QueryPerformanceFrequency(&mut frequency) }.as_bool() {
                 return Err(NativeError {
                     origin: crate::types::FailureDomain::Win32,
-                    stage: "QueryPerformanceFrequency(client timer)",
+                    stage: "QueryPerformanceFrequency",
                     code: unsafe { GetLastError() } as i32,
                 });
             }
             let ticks_per_second = unsafe { frequency.QuadPart };
             if ticks_per_second <= 0 {
                 return Err(NativeError {
-                    origin: crate::types::FailureDomain::Invariant,
-                    stage: "QueryPerformanceFrequency(client timer value)",
-                    code: 13,
+                    origin: crate::types::FailureDomain::Win32,
+                    stage: "QueryPerformanceFrequency",
+                    code: unsafe { GetLastError() } as i32,
                 });
             }
-            // Check the counter before any session has posted native I/O.
-            counter()?;
             Ok(Self {
                 ticks_per_second: ticks_per_second as u64,
             })
@@ -1019,32 +1395,67 @@ pub mod endpoint {
     /// resolver and an unresolvable one reports the Winsock status rather than a usage error.
     /// The first answer is copied out, matching the reference's single `memcpy`.
     pub fn resolve_ipv4(host: &str, port: u16) -> Result<SOCKADDR_IN, i32> {
-        let mut node: Vec<u16> = host.encode_utf16().chain(core::iter::once(0)).collect();
-        let mut service: Vec<u16> = port
-            .to_string()
-            .encode_utf16()
-            .chain(core::iter::once(0))
-            .collect();
+        try_resolve_ipv4(host, port).map_err(|error| error.code)
+    }
+
+    pub(crate) fn try_resolve_ipv4(host: &str, port: u16) -> Result<SOCKADDR_IN, NativeError> {
+        let mut node = crate::types::try_vec_with_capacity(
+            host.len().saturating_add(1),
+            "target address allocation",
+        )?;
+        node.extend(host.encode_utf16());
+        node.push(0);
+        resolve_ipv4_wide(node.as_ptr(), port)
+    }
+
+    pub(crate) fn try_resolve_options(
+        host: &crate::types::OptionText<256>,
+        port: u16,
+    ) -> Result<SOCKADDR_IN, NativeError> {
+        resolve_ipv4_wide(host.as_ptr(), port)
+    }
+
+    fn resolve_ipv4_wide(node: *const u16, port: u16) -> Result<SOCKADDR_IN, NativeError> {
+        // A decimal u16 and its terminator fit in fixed stack storage.
+        let mut service = [0u16; 6];
+        let mut number = port;
+        let mut begin = 5;
+        loop {
+            begin -= 1;
+            service[begin] = u16::from(b'0') + number % 10;
+            number /= 10;
+            if number == 0 {
+                break;
+            }
+        }
         let mut hints: ADDRINFOW = unsafe { zeroed() };
         hints.ai_family = AF_INET as _;
         let mut results: PADDRINFOW = core::ptr::null_mut();
         let status = unsafe {
             GetAddrInfoW(
-                PCWSTR(node.as_mut_ptr()),
-                PCWSTR(service.as_mut_ptr()),
+                PCWSTR(node),
+                PCWSTR(service[begin..].as_ptr()),
                 Some(&hints),
                 &mut results,
             )
         };
         if status != 0 || results.is_null() {
-            return Err(status);
+            return Err(NativeError {
+                stage: "GetAddrInfoW(IPv4)",
+                code: status,
+                origin: crate::types::FailureDomain::Winsock,
+            });
         }
         let mut address: SOCKADDR_IN = unsafe { zeroed() };
         unsafe {
             let first = &*results;
             if first.ai_addr.is_null() {
                 FreeAddrInfoW(Some(results));
-                return Err(WSAEINVAL_LIKE);
+                return Err(NativeError {
+                    stage: "GetAddrInfoW(IPv4)",
+                    code: WSAEINVAL_LIKE,
+                    origin: crate::types::FailureDomain::Winsock,
+                });
             }
             core::ptr::copy_nonoverlapping(first.ai_addr as *const SOCKADDR_IN, &mut address, 1);
             FreeAddrInfoW(Some(results));
@@ -1083,7 +1494,7 @@ pub mod endpoint {
         if status != 0 {
             return Err(NativeError {
                 origin: crate::types::FailureDomain::Winsock,
-                stage: "bind(local port)",
+                stage: "bind(client)",
                 code: unsafe { windows::Win32::winsock2::WSAGetLastError() },
             });
         }
@@ -1103,7 +1514,7 @@ pub mod endpoint {
         if status != 0 {
             return Err(NativeError {
                 origin: crate::types::FailureDomain::Winsock,
-                stage: "connect(udp peer)",
+                stage: "connect/RQ(UDP client)",
                 code: unsafe { windows::Win32::winsock2::WSAGetLastError() },
             });
         }
@@ -1158,7 +1569,7 @@ pub mod endpoint {
         if status != 0 {
             return Err(NativeError {
                 origin: crate::types::FailureDomain::Winsock,
-                stage: "setsockopt(SO_UPDATE_CONNECT_CONTEXT)",
+                stage: "ConnectEx completion",
                 code: unsafe { windows::Win32::winsock2::WSAGetLastError() },
             });
         }
@@ -1344,7 +1755,7 @@ pub mod rio {
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
                 return Err(NativeError {
                     origin: crate::types::FailureDomain::Win32,
-                    stage: "CreateIoCompletionPort",
+                    stage: "CreateIoCompletionPort(client worker)",
                     code: unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32,
                 });
             }
@@ -1409,7 +1820,7 @@ pub mod rio {
                 // rather than being replaced by a placeholder code.
                 return Err(NativeError {
                     origin: crate::types::FailureDomain::Winsock,
-                    stage: "RIOCreateCompletionQueue",
+                    stage: "RIOCreateCompletionQueue(client)",
                     code: unsafe { windows::Win32::winsock2::WSAGetLastError() },
                 });
             }
@@ -1553,7 +1964,9 @@ pub mod rio {
             })?;
             let id = unsafe { register(bytes.as_mut_ptr() as *mut i8, length) };
             if id.is_null() || id == RIO_INVALID_BUFFERID {
-                return Err(NativeError::winsock_last("RIORegisterBuffer"));
+                return Err(NativeError::winsock_last(
+                    "RIORegisterBuffer(client windows)",
+                ));
             }
             Ok(Self {
                 id,
@@ -1634,7 +2047,7 @@ pub mod rio {
                 )
             };
             if queue.is_null() {
-                return Err(NativeError::winsock_last("RIOCreateRequestQueue"));
+                return Err(NativeError::winsock_last("RIOCreateRequestQueue(client)"));
             }
             Ok(Self { queue })
         }
@@ -1666,7 +2079,7 @@ pub mod rio {
                 )
             };
             if !ok.as_bool() {
-                return Err(NativeError::winsock_last("RIOReceive"));
+                return Err(NativeError::winsock_last("RIOReceive(client)"));
             }
             Ok(())
         }
@@ -1693,7 +2106,7 @@ pub mod rio {
                 )
             };
             if !ok.as_bool() {
-                return Err(NativeError::winsock_last("RIOSend"));
+                return Err(NativeError::winsock_last("RIOSend(client)"));
             }
             Ok(())
         }

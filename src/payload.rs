@@ -8,43 +8,93 @@ use crate::types::{
 /// The default payload of the baseline: the literal text below, sent as ASCII.
 pub const DEFAULT_TEXT_PREFIX: &str = "echo from ";
 
-/// Builds the payload for a session. Sizes are validated here as well as in the parser so
-/// a caller that builds options by hand cannot smuggle an impossible payload in.
+/// Payload validation and allocation remain separate error classes in production.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BuildError {
+    Invalid(&'static str),
+    // The C++ pattern builder returns null on OOM; its caller reports ERROR_INVALID_DATA.
+    Allocation,
+}
+
+impl From<crate::types::Failure> for BuildError {
+    fn from(_error: crate::types::Failure) -> Self {
+        Self::Allocation
+    }
+}
+
+fn compatibility_error(error: BuildError) -> ArgumentError {
+    ArgumentError(match error {
+        BuildError::Invalid(reason) => reason,
+        BuildError::Allocation => "payload allocation failed",
+    })
+}
+
+/// Cold compatibility entry point; production retains the structured allocation error.
 pub fn build(options: &Options) -> Result<Vec<u8>, ArgumentError> {
-    let bytes = match options.pattern {
+    try_build(options).map_err(compatibility_error)
+}
+
+pub(crate) fn try_build(options: &Options) -> Result<Vec<u8>, BuildError> {
+    use crate::types::try_vec_with_capacity;
+    match options.pattern {
         Pattern::DefaultText => {
-            let mut text = String::from(DEFAULT_TEXT_PREFIX);
-            text.push_str(&options.host);
-            text.into_bytes()
+            let length = options
+                .host
+                .utf8_bytes()
+                .ok_or(BuildError::Invalid("invalid UTF-16 payload"))?;
+            let mut bytes = try_vec_with_capacity(
+                DEFAULT_TEXT_PREFIX.len().saturating_add(length),
+                "payload allocation",
+            )?;
+            bytes.extend_from_slice(DEFAULT_TEXT_PREFIX.as_bytes());
+            if !options.host.append_utf8(&mut bytes) {
+                return Err(BuildError::Invalid("invalid UTF-16 payload"));
+            }
+            Ok(bytes)
         }
-        Pattern::LiteralText => options.literal_pattern.clone().into_bytes(),
-        Pattern::BinaryCounter => binary_counter(options.pattern_bytes)?,
-        Pattern::PrintableCounter => printable_counter(options.pattern_bytes)?,
-    };
-    Ok(bytes)
+        Pattern::LiteralText => {
+            let length = options
+                .literal_pattern
+                .utf8_bytes()
+                .ok_or(BuildError::Invalid("invalid UTF-16 payload"))?;
+            let mut bytes = try_vec_with_capacity(length, "payload allocation")?;
+            if !options.literal_pattern.append_utf8(&mut bytes) {
+                return Err(BuildError::Invalid("invalid UTF-16 payload"));
+            }
+            Ok(bytes)
+        }
+        Pattern::BinaryCounter => try_binary_counter(options.pattern_bytes),
+        Pattern::PrintableCounter => try_printable_counter(options.pattern_bytes),
+    }
 }
 
 /// Deterministic counter: byte i holds i as u8, so the sequence wraps every 256 bytes.
 pub fn binary_counter(length: u32) -> Result<Vec<u8>, ArgumentError> {
-    if length == 0 || u64::from(length) > MAXIMUM_UDP_PAYLOAD_BYTES.max(MAXIMUM_TCP_BATCH_BYTES) {
-        return Err(ArgumentError(
-            "binary payload length out of range".to_string(),
-        ));
-    }
-    Ok((0..length).map(|index| index as u8).collect())
+    try_binary_counter(length).map_err(compatibility_error)
 }
 
-/// Printable counter: the reference's CEC printable pattern, which is a stream of nine-byte records.
-/// Each record is eight decimal digits holding the record number, followed by a space, so /zt 9 is
-/// "00000000 " and /zt 18 is "00000000 00000001 ". The bytes are what a peer sees, so this has to
-/// match the reference exactly rather than merely look readable.
-pub fn printable_counter(length: u32) -> Result<Vec<u8>, ArgumentError> {
+fn try_binary_counter(length: u32) -> Result<Vec<u8>, BuildError> {
     if length == 0 || u64::from(length) > MAXIMUM_UDP_PAYLOAD_BYTES.max(MAXIMUM_TCP_BATCH_BYTES) {
-        return Err(ArgumentError(
-            "printable payload length out of range".to_string(),
-        ));
+        return Err(BuildError::Invalid("binary payload length out of range"));
     }
-    let mut bytes = Vec::with_capacity(length as usize);
+    Ok(crate::types::try_vec_with(
+        length as usize,
+        "payload allocation",
+        |index| index as u8,
+    )?)
+}
+
+/// Printable counter: eight decimal digits and a space per nine-byte record.
+/// /zt 9 is "00000000 " and /zt 18 is "00000000 00000001 ".
+pub fn printable_counter(length: u32) -> Result<Vec<u8>, ArgumentError> {
+    try_printable_counter(length).map_err(compatibility_error)
+}
+
+fn try_printable_counter(length: u32) -> Result<Vec<u8>, BuildError> {
+    if length == 0 || u64::from(length) > MAXIMUM_UDP_PAYLOAD_BYTES.max(MAXIMUM_TCP_BATCH_BYTES) {
+        return Err(BuildError::Invalid("printable payload length out of range"));
+    }
+    let mut bytes = crate::types::try_vec_with_capacity(length as usize, "payload allocation")?;
     for index in 0..length as usize {
         let record_offset = index % 9;
         if record_offset == 8 {
@@ -71,12 +121,10 @@ pub fn payload_limit(options: &Options) -> u64 {
 
 pub fn validate_payload(options: &Options, payload: &[u8]) -> Result<(), ArgumentError> {
     if payload.is_empty() {
-        return Err(ArgumentError("payload is empty".to_string()));
+        return Err(ArgumentError("payload is empty"));
     }
     if (payload.len() as u64) > payload_limit(options) {
-        return Err(ArgumentError(
-            "payload exceeds the transport limit".to_string(),
-        ));
+        return Err(ArgumentError("payload exceeds the transport limit"));
     }
     Ok(())
 }
