@@ -19,9 +19,10 @@ fn help_exits_zero_and_lists_the_contract() {
         );
         assert!(text.contains("/p tcp|udp"), "{switch} must document /p");
         assert!(
-            text.contains("always RIO"),
-            "{switch} must state the RIO contract"
+            text.contains("[/b bytes] [/cq capacity] [/memory bytes] [/q] [/stats] [/h]"),
+            "{switch} must document the current capacity and output contract"
         );
+        assert!(output.stderr.is_empty(), "{switch} must not print an error");
     }
 }
 

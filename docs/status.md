@@ -32,9 +32,11 @@ counter order and approximate histogram percentiles as C++.
 
 Rust retains explicit generation tags and an ownership boundary between the scheduler and
 native transport. Each worker owns one VirtualAlloc arena containing all TX and RX windows.
-Send windows have independent registrations; receive windows share a separate aggregate
-registration. This follows the [Windows RIOSend contract](https://learn.microsoft.com/en-us/windows/win32/api/mswsock/nc-mswsock-lpfn_riosend),
-which reserves the entire send registration until completion. The complete worker arena
+Each Slot owns independent send and receive registrations: `send_registrations` and
+`receive_registrations` both contain one entry per Session window. This follows the
+[Windows RIOSend contract](https://learn.microsoft.com/en-us/windows/win32/api/mswsock/nc-mswsock-lpfn_riosend),
+which reserves the entire send registration until completion, and keeps the two directions'
+ownership separate while they run concurrently. The complete worker arena
 fits in a DWORD, and the single outstanding send slot is stored inline without a dynamic
 free list. Closing sockets cancels requests but does not release their
 OVERLAPPED or registered memory until completions drain. If the provider cannot safely drain
