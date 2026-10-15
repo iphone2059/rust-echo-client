@@ -297,20 +297,29 @@ function Read-TextFile {
 }
 
 function Wait-ForServer {
-    param([int] $Port, [string] $ForProtocol, [int] $TimeoutMs = 15000)
-    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
-    while ((Get-Date) -lt $deadline) {
-        if ($ForProtocol -ne 'tcp') { Start-Sleep -Milliseconds 600; return $true }
+    param([int] $Port, [string] $ForProtocol, [int] $TimeoutMs = 15000,
+        [System.Diagnostics.Process] $ServerProcess = $null)
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($clock.ElapsedMilliseconds -lt $TimeoutMs) {
+        if ($ServerProcess -and $ServerProcess.HasExited) { return $false }
+        if ($ForProtocol -ne 'tcp') {
+            Start-Sleep -Milliseconds ([Math]::Min(600, $TimeoutMs))
+            return -not ($ServerProcess -and $ServerProcess.HasExited)
+        }
         $client = $null
         try {
             $client = [System.Net.Sockets.TcpClient]::new()
-            $client.Connect('127.0.0.1', $Port)
-            return $true
+            $remaining = [int]($TimeoutMs - $clock.ElapsedMilliseconds)
+            if ($remaining -le 0) { return $false }
+            $connect = $client.ConnectAsync('127.0.0.1', $Port)
+            if ($connect.Wait([Math]::Min(200, $remaining)) -and $client.Connected) { return $true }
         } catch {
-            Start-Sleep -Milliseconds 200
+            # A refused or cancelled probe is not readiness; the next probe shares this deadline.
         } finally {
             if ($client) { $client.Dispose() }
         }
+        $remaining = [int]($TimeoutMs - $clock.ElapsedMilliseconds)
+        if ($remaining -gt 0) { Start-Sleep -Milliseconds ([Math]::Min(200, $remaining)) }
     }
     return $false
 }
@@ -372,7 +381,9 @@ function Invoke-Test {
             }
             $peerProcess = Start-Process -FilePath $Peer -ArgumentList $peerArgs -RedirectStandardOutput $peerOut -RedirectStandardError $peerErr -PassThru -NoNewWindow
             Remove-Item Env:CEC_DIAG_FILE, Env:CES_DIAG_FILE -ErrorAction SilentlyContinue
-            Wait-ForServer -Port $port -ForProtocol $Protocol | Out-Null
+            if (-not (Wait-ForServer -Port $port -ForProtocol $Protocol -ServerProcess $peerProcess)) {
+                throw 'peer server did not become ready within its deadline'
+            }
         }
         if ($Component -eq 'client' -and (Test-Feature 'notify-diagnostics')) { $env:CEC_DIAG_FILE = $diagFile }
         if ($Component -eq 'server' -and (Test-Feature 'notify-diagnostics')) { $env:CES_DIAG_FILE = $diagFile }
@@ -498,7 +509,9 @@ function Invoke-StopTest {
         $serverSeconds = [int]([Math]::Max(5, $peerRun + 5))
         $serverArgs = @('/p', $Protocol, '/s', [string]$port, '/w', [string]$serverSeconds, '/q', '/stats')
         $server = Start-Process -FilePath $Executable -ArgumentList $serverArgs -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -NoNewWindow
-        Wait-ForServer -Port $port -ForProtocol $Protocol | Out-Null
+        if (-not (Wait-ForServer -Port $port -ForProtocol $Protocol -ServerProcess $server)) {
+            throw 'server did not become ready within its deadline'
+        }
         # The peer's /n is the quota the case expects it to complete on a reliable transport.
         $quota = 0
         for ($i = 0; $i -lt $arguments.Count - 1; $i++) { if ($arguments[$i] -eq '/n') { [void][int64]::TryParse($arguments[$i + 1], [ref]$quota) } }
@@ -590,7 +603,7 @@ $Soak = [string]$SoakSeconds
 $Perf = [string]$PerfSeconds
 
 $CliOne = if ($Component -eq 'client') { '/p' } else { '/p' }
-$ErrorActionPreference = 'Continue'
+# Artifact writes remain terminating errors; each case already records caught runtime failures.
 if ($Component -eq 'client') {
     Invoke-Test -TestId 'CLI-001' -Category 'CLI' -Protocol 'tcp' -Arguments @('/h') -ExpectedExit 0 -ExpectPattern 'Usage:' -WithPeer $false
     Invoke-Test -TestId 'CLI-002' -Category 'CLI' -Protocol 'tcp' -Arguments @('/h', '/p', 'sctp') -ExpectedExit 1 -ExpectPattern 'Invalid arguments' -WithPeer $false

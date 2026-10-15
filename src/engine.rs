@@ -1536,6 +1536,31 @@ pub mod transport {
             Ok(())
         }
 
+        fn retire_rio_result_into(
+            &mut self,
+            item: RIORESULT,
+            completions: &mut Vec<Completion>,
+        ) -> Result<(), NativeError> {
+            let context = decode_context(item.RequestContext).ok_or_else(|| {
+                NativeError::invariant("completion has an invalid request context")
+            })?;
+            if !matches!(context.operation, Operation::Send | Operation::Receive) {
+                return Err(NativeError::invariant("RIO completion operation"));
+            }
+            // RQ stores this immutable generation identity separately from each operation key.
+            // Reject a mismatched queue identity before returning any provider ownership.
+            let socket_context = encode_context(
+                context.index,
+                context.generation,
+                NO_SEND_SLOT,
+                Operation::Connect,
+            ) as usize as u64;
+            if item.SocketContext != socket_context {
+                crate::native::fail_fast("client RIO SocketContext identity", 13);
+            }
+            self.retire_into(context, item.Status, item.BytesTransferred, completions)
+        }
+
         fn drain_rio_into(
             &mut self,
             budget: u32,
@@ -1580,13 +1605,7 @@ pub mod transport {
                 // is still queued.
                 for position in 0..count as usize {
                     let item = self.results[position];
-                    let context = decode_context(item.RequestContext).ok_or_else(|| {
-                        NativeError::invariant("completion has an invalid request context")
-                    })?;
-                    if !matches!(context.operation, Operation::Send | Operation::Receive) {
-                        return Err(NativeError::invariant("RIO completion operation"));
-                    }
-                    self.retire_into(context, item.Status, item.BytesTransferred, completions)?;
+                    self.retire_rio_result_into(item, completions)?;
                 }
             }
             Ok(())
@@ -2614,6 +2633,34 @@ pub mod transport {
             assert!(!transport.sessions[0].tx_in_use);
             assert_eq!(transport.sent_bytes, 0);
             transport.shutdown().unwrap();
+        }
+
+        #[test]
+        fn native_rio_socket_identity_is_checked_before_retirement() {
+            let test_name =
+                "engine::transport::tests::native_rio_socket_identity_is_checked_before_retirement";
+            let mut transport = send_transport(None);
+            transport.send(0, 6).unwrap();
+            let item = RIORESULT {
+                Status: 0,
+                BytesTransferred: 6,
+                SocketContext: if is_fail_fast_probe(test_name) {
+                    0
+                } else {
+                    encode_context(0, 1, NO_SEND_SLOT, Operation::Connect) as usize as u64
+                },
+                RequestContext: encode_context(0, 1, 0, Operation::Send) as usize as u64,
+            };
+            let mut completions = Vec::new();
+            transport
+                .retire_rio_result_into(item, &mut completions)
+                .unwrap();
+            assert_eq!(transport.rio_outstanding, 0);
+            assert_eq!(transport.sessions[0].send_outstanding, 0);
+            assert_eq!(transport.sent_bytes, 6);
+            assert_eq!(completions.len(), 1);
+            transport.shutdown().unwrap();
+            assert_fail_fast(test_name, "client RIO SocketContext identity");
         }
 
         #[test]
