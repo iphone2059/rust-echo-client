@@ -6,3 +6,5 @@
 # Local rewrite archive and binding probe
 /*.zip
 /pall.rs
+# Verification artifacts (latest.csv, latest-summary.csv, archive/, cases/)
+tools/verification/results/

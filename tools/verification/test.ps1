@@ -35,16 +35,27 @@ $PeerFile       = Join-Path $PSScriptRoot ("peer-" + $PeerKind + ".txt")
 $FeaturesFile   = Join-Path $PSScriptRoot 'features.txt'
 
 if (-not $ExecutablePath -and -not (Test-Path -LiteralPath $ExecutableFile -PathType Leaf)) { throw "executable.txt is missing: $ExecutableFile" }
-if (-not $PeerPath -and -not (Test-Path -LiteralPath $PeerFile -PathType Leaf)) { throw "$PeerKind file is missing: $PeerFile" }
+# The peer is optional. An implementation that ships no peer declaration still runs every
+# standalone case; each peer-dependent case is reported as SKIP instead of aborting the run.
+$PeerAvailable = [bool]$PeerPath -or (Test-Path -LiteralPath $PeerFile -PathType Leaf)
+if (-not $PeerAvailable) { Write-Host "no $PeerKind declared: peer-dependent cases are reported as SKIP" }
 $Executable = if ($ExecutablePath) { [System.IO.Path]::GetFullPath($ExecutablePath) } else { [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ((Get-Content -LiteralPath $ExecutableFile -Raw).Trim()))) }
-$Peer = if ($PeerPath) { [System.IO.Path]::GetFullPath($PeerPath) } else { [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ((Get-Content -LiteralPath $PeerFile -Raw).Trim()))) }
+$Peer = if ($PeerPath) {
+    [System.IO.Path]::GetFullPath($PeerPath)
+} elseif ($PeerAvailable) {
+    [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ((Get-Content -LiteralPath $PeerFile -Raw).Trim())))
+} else {
+    ''
+}
 $Features   = @()
 if (Test-Path -LiteralPath $FeaturesFile -PathType Leaf) {
     $Features = @(Get-Content -LiteralPath $FeaturesFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 }
 $HasFeature = { param([string] $Name) return $Features -contains $Name }
 
-foreach ($pair in @(@('executable', $Executable), @($PeerKind, $Peer))) {
+$requiredPaths = @(, @('executable', $Executable))
+if ($PeerAvailable) { $requiredPaths += , @($PeerKind, $Peer) }
+foreach ($pair in $requiredPaths) {
     if (-not (Test-Path -LiteralPath $pair[1] -PathType Leaf)) {
         throw "$($pair[0]) not found: $($pair[1]) - edit the text file next to this script"
     }
@@ -338,6 +349,11 @@ function Invoke-Test {
         [bool] $WithPeer = $true
     )
     if (-not (Test-CaseSelected -TestId $TestId)) { return }
+    if ($WithPeer -and -not $PeerAvailable) {
+        Add-Row -Values @{ test_id = $TestId; category = $Category; protocol = $Protocol; result = 'SKIP'
+            message = "skipped: no $PeerKind executable declared" }
+        return
+    }
     $port = Get-FreePort
     $tag = [Guid]::NewGuid().ToString('N')
     $casePath = Join-Path $CaseDir ($TestId + '-' + $tag)
@@ -471,6 +487,11 @@ function Invoke-Test {
 function Invoke-StopTest {
     param([string] $TestId, [string] $Category, [string] $Protocol, [string[]] $PeerArguments, [int] $TimeoutMs = 40000)
     if (-not (Test-CaseSelected -TestId $TestId)) { return }
+    if (-not $PeerAvailable) {
+        Add-Row -Values @{ test_id = $TestId; category = $Category; protocol = $Protocol; result = 'SKIP'
+            message = "skipped: no $PeerKind executable declared" }
+        return
+    }
     $port = Get-FreePort
     $tag = [Guid]::NewGuid().ToString('N')
     $casePath = Join-Path $CaseDir ($TestId + '-' + $tag)
