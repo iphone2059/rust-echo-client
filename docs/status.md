@@ -30,6 +30,17 @@ unclaimed quota out of the loss count. Fatal stop settles remaining claimed atte
 Periodic `report` lines aggregate every worker even under `/q`; the final line has the same
 counter order and approximate histogram percentiles as C++.
 
+The pure scheduler maintains the worker's active-session count incrementally, so periodic
+and forced progress snapshots read one counter instead of scanning the session array. The
+count preserves the existing `active_counted` contract: a session contributes after its
+first successful connection, remains counted while closing or reconnecting, and leaves the
+count at quota completion or a terminal drained generation. Reconnects and duplicate events
+never count a session twice. The existing per-worker `Arc<Mutex<...>>` publication mechanism
+and report fields are unchanged. Pure-state tests compare the counter with the session flags
+through connect failures, timeouts, resets, reconnects, paced success/corruption quotas and
+controlled/fatal stop; a worker test covers periodic and forced publication. This change
+removes the linear snapshot traversal; no measured throughput or latency gain is claimed.
+
 Rust retains explicit generation tags and an ownership boundary between the scheduler and
 native transport. Each worker owns one VirtualAlloc arena containing all TX and RX windows.
 Each Slot owns independent send and receive registrations: `send_registrations` and

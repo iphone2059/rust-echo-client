@@ -444,6 +444,9 @@ pub mod session {
 
         pub struct Scheduler {
             sessions: Vec<Session>,
+            /// Number of `active_counted` sessions, including closing/reconnecting ones until
+            /// they finish permanently. Counts sessions rather than transport generations.
+            active_count: u32,
             heap: TimerHeap,
             statistics: Statistics,
             payload_bytes: u32,
@@ -480,6 +483,7 @@ pub mod session {
                     sessions: try_vec_with(count, "client worker allocation", |index| {
                         Session::new(index as u32)
                     })?,
+                    active_count: 0,
                     heap: TimerHeap::try_new(count)?,
                     statistics: Statistics::default(),
                     payload_bytes,
@@ -531,6 +535,10 @@ pub mod session {
 
             pub fn sessions(&self) -> &[Session] {
                 &self.sessions
+            }
+
+            pub fn active_count(&self) -> u32 {
+                self.active_count
             }
 
             pub fn session(&self, index: u32) -> Option<&Session> {
@@ -910,6 +918,7 @@ pub mod session {
                     && inflight == 0
                     && !busy
                 {
+                    self.active_count -= u32::from(self.sessions[slot].active_counted);
                     self.sessions[slot].complete();
                     self.heap.remove(index);
                     steps.push(Step::Close(index));
@@ -919,9 +928,14 @@ pub mod session {
 
             pub fn on_connected(&mut self, index: u32, now: u64) -> ActionBatch {
                 let slot = index as usize;
-                if slot >= self.sessions.len() || !self.sessions[slot].connected() {
+                let Some(session) = self.sessions.get_mut(slot) else {
+                    return ActionBatch::new();
+                };
+                let was_counted = session.active_counted;
+                if !session.connected() {
                     return ActionBatch::new();
                 }
+                self.active_count += u32::from(!was_counted);
                 self.close_anchored[slot] = false;
                 self.statistics.connections = self.statistics.connections.wrapping_add(1);
                 self.flows[slot] = Flow::after_failure(&self.flows[slot]);
@@ -1136,6 +1150,7 @@ pub mod session {
                     return ActionBatch::new();
                 }
                 if self.stopping {
+                    self.active_count -= u32::from(self.sessions[slot].active_counted);
                     self.sessions[slot].complete();
                     self.heap.remove(index);
                     return ActionBatch::new();
@@ -1147,6 +1162,7 @@ pub mod session {
                         }
                     }
                     None => {
+                        self.active_count -= u32::from(self.sessions[slot].active_counted);
                         self.sessions[slot].fail_permanently();
                         self.heap.remove(index);
                     }
@@ -1289,6 +1305,189 @@ pub mod session {
                 options.reconnect_seconds = reconnect;
                 options.echo_count = 10;
                 Scheduler::new(1, 6, &options)
+            }
+
+            fn assert_active_count(scheduler: &Scheduler, expected: u32) {
+                assert_eq!(scheduler.active_count(), expected);
+                assert_eq!(
+                    scheduler.active_count() as usize,
+                    scheduler
+                        .sessions()
+                        .iter()
+                        .filter(|session| session.active_counted)
+                        .count()
+                );
+            }
+
+            #[test]
+            fn active_count_tracks_first_connections_and_permanent_drain_once() {
+                let mut options = Options::default();
+                options.protocol = Protocol::Tcp;
+                let mut scheduler = Scheduler::new(3, 6, &options);
+                assert_active_count(&scheduler, 0);
+                assert!(scheduler.on_connected(0, 0).is_empty());
+                scheduler.start(0);
+                assert_active_count(&scheduler, 0);
+
+                scheduler.on_connected(0, 1);
+                assert_active_count(&scheduler, 1);
+                assert!(scheduler.on_connected(0, 2).is_empty());
+                assert!(scheduler.on_connected(3, 2).is_empty());
+                assert_active_count(&scheduler, 1);
+
+                // A failed first connect never contributes, including its terminal drain.
+                scheduler.on_transport_failure(1, 2);
+                assert_active_count(&scheduler, 1);
+                scheduler.on_generation_drained(1, 3);
+                assert_eq!(scheduler.session(1).unwrap().state, SessionState::Failed);
+                assert_active_count(&scheduler, 1);
+
+                scheduler.on_connected(2, 3);
+                assert_active_count(&scheduler, 2);
+                scheduler.on_transport_failure(0, 4);
+                scheduler.on_transport_failure(0, 5);
+                assert_active_count(&scheduler, 2);
+                scheduler.on_generation_drained(0, 6);
+                assert_active_count(&scheduler, 1);
+                scheduler.on_generation_drained(0, 7);
+                assert_active_count(&scheduler, 1);
+
+                // Operation timeout follows the same close/drain accounting as a reset.
+                let deadline = scheduler.session(2).unwrap().deadline.unwrap();
+                let mut expired = Vec::new();
+                assert_eq!(scheduler.poll(deadline, &mut expired), vec![Step::Close(2)]);
+                assert_active_count(&scheduler, 1);
+                scheduler.on_generation_drained(2, deadline + 1);
+                assert_active_count(&scheduler, 0);
+                assert!(scheduler.all_finished());
+                assert!(!scheduler.statistics().fatal);
+            }
+
+            #[test]
+            fn active_count_survives_reconnects_without_counting_generations() {
+                let mut options = Options::default();
+                options.protocol = Protocol::Tcp;
+                options.pipeline_depth = 2;
+                options.echo_count = 4;
+                options.reconnect_seconds = Some(0);
+                let mut scheduler = Scheduler::new(1, 6, &options);
+                let mut expired = Vec::new();
+                scheduler.start(0);
+
+                scheduler.on_transport_failure(0, 1);
+                scheduler.on_generation_drained(0, 2);
+                assert_active_count(&scheduler, 0);
+                assert_eq!(scheduler.poll(2, &mut expired), vec![Step::Connect(0)]);
+                assert_active_count(&scheduler, 0);
+                scheduler.on_connected(0, 3);
+                assert_active_count(&scheduler, 1);
+
+                for now in [4, 7] {
+                    scheduler.on_transport_failure(0, now);
+                    assert_active_count(&scheduler, 1);
+                    scheduler.on_generation_drained(0, now + 1);
+                    assert_eq!(
+                        scheduler.session(0).unwrap().state,
+                        SessionState::ReconnectWait
+                    );
+                    assert_active_count(&scheduler, 1);
+                    assert_eq!(
+                        scheduler.poll(now + 1, &mut expired),
+                        vec![Step::Connect(0)]
+                    );
+                    assert_active_count(&scheduler, 1);
+                    let steps = scheduler.on_connected(0, now + 2);
+                    if now == 4 {
+                        assert_active_count(&scheduler, 1);
+                    } else {
+                        // Both failed attempts spent all quota. This connect completes the
+                        // session immediately, without counting the same session twice.
+                        assert_eq!(steps, vec![Step::Close(0)]);
+                        assert_active_count(&scheduler, 0);
+                    }
+                }
+                assert_eq!(scheduler.statistics().connections, 3);
+                assert_eq!(scheduler.statistics().attempted, 4);
+                assert_eq!(scheduler.statistics().lost, 4);
+                scheduler.on_generation_drained(0, 10);
+                assert!(scheduler.on_connected(0, 11).is_empty());
+                assert_active_count(&scheduler, 0);
+                assert!(!scheduler.statistics().fatal);
+            }
+
+            #[test]
+            fn active_count_retires_verified_and_corrupt_quotas_after_pacing() {
+                for protocol in [Protocol::Tcp, Protocol::Udp] {
+                    for interval in [0, 25] {
+                        for corrupt in [false, true] {
+                            let mut options = Options::default();
+                            options.protocol = protocol;
+                            options.echo_count = 1;
+                            options.interval_milliseconds = interval;
+                            let mut scheduler = Scheduler::new(1, 6, &options);
+                            scheduler.start(0);
+                            scheduler.on_connected(0, 1);
+                            scheduler.on_sent(0, 2);
+                            assert_active_count(&scheduler, 1);
+                            let bytes = if corrupt { b"abcdeg" } else { b"abcdef" };
+                            let steps = scheduler.on_received(0, bytes, b"abcdef", 3);
+                            if interval == 0 {
+                                assert_eq!(steps, vec![Step::Close(0)]);
+                            } else {
+                                assert!(steps.is_empty());
+                                assert_active_count(&scheduler, 1);
+                                let mut expired = Vec::new();
+                                assert!(scheduler.poll(27, &mut expired).is_empty());
+                                assert_active_count(&scheduler, 1);
+                                assert_eq!(scheduler.poll(28, &mut expired), vec![Step::Close(0)]);
+                            }
+                            assert_active_count(&scheduler, 0);
+                            assert_eq!(
+                                scheduler.session(0).unwrap().state,
+                                SessionState::Completed
+                            );
+                            assert_eq!(scheduler.statistics().echoes, u64::from(!corrupt));
+                            assert_eq!(scheduler.statistics().corrupted, u64::from(corrupt));
+                            scheduler.on_generation_drained(0, 29);
+                            scheduler.on_transport_failure(0, 30);
+                            assert_active_count(&scheduler, 0);
+                            assert!(!scheduler.statistics().fatal);
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn active_count_during_stop_is_retired_only_by_terminal_drain() {
+                for fatal in [false, true] {
+                    let mut options = Options::default();
+                    options.protocol = Protocol::Tcp;
+                    options.reconnect_seconds = Some(0);
+                    let mut scheduler = Scheduler::new(4, 6, &options);
+                    scheduler.start(0);
+                    for index in 0..3 {
+                        scheduler.on_connected(index, 1);
+                    }
+                    scheduler.on_transport_failure(1, 2);
+                    scheduler.on_generation_drained(1, 3);
+                    // Stop sees Active, ReconnectWait, Closing and never-connected sessions.
+                    scheduler.on_transport_failure(2, 4);
+                    assert_active_count(&scheduler, 3);
+                    if fatal {
+                        scheduler.mark_fatal();
+                    }
+                    scheduler.begin_shutdown(5);
+                    scheduler.begin_shutdown(6);
+                    assert_active_count(&scheduler, 3);
+                    for (index, expected) in [(3, 3), (1, 2), (2, 1), (0, 0)] {
+                        scheduler.on_generation_drained(index, 7);
+                        assert_active_count(&scheduler, expected);
+                        scheduler.on_generation_drained(index, 8);
+                        assert_active_count(&scheduler, expected);
+                    }
+                    assert!(scheduler.all_finished());
+                    assert_eq!(scheduler.statistics().fatal, fatal);
+                }
             }
 
             #[test]
@@ -1978,14 +2177,8 @@ pub mod worker {
             if let Some(progress) = &self.progress {
                 match progress.lock() {
                     Ok(mut snapshot) => {
-                        let active = self
-                            .scheduler
-                            .sessions()
-                            .iter()
-                            .filter(|session| session.active_counted)
-                            .count() as u32;
                         snapshot.0 = self.scheduler.statistics();
-                        snapshot.1 = active;
+                        snapshot.1 = self.scheduler.active_count();
                     }
                     Err(_) => self.scheduler.mark_fatal(),
                 }
@@ -2508,6 +2701,48 @@ pub mod worker {
         use std::rc::Rc;
 
         static WORKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        #[test]
+        fn progress_publishes_active_count_at_periodic_and_forced_boundaries() {
+            let mut options = Options::default();
+            options.protocol = crate::types::Protocol::Tcp;
+            options.echo_count = 1;
+            let mut worker = Worker::new(&options, 2, 6, 0);
+            let progress = std::sync::Arc::new(std::sync::Mutex::new((
+                crate::metrics::Statistics::default(),
+                0,
+            )));
+            worker.set_progress(progress.clone(), 10);
+            worker.scheduler.start(0);
+            worker.publish_progress(0, false);
+            assert_eq!(progress.lock().unwrap().1, 0);
+
+            worker.scheduler.on_connected(0, 1);
+            worker.scheduler.on_connected(1, 1);
+            worker.publish_progress(1, false);
+            assert_eq!(progress.lock().unwrap().1, 0);
+            worker.publish_progress(10, false);
+            {
+                let snapshot = progress.lock().unwrap();
+                assert_eq!(snapshot.0.connections, 2);
+                assert_eq!(snapshot.1, 2);
+            }
+
+            worker.scheduler.on_sent(0, 11);
+            worker.scheduler.on_received(0, b"abcdef", b"abcdef", 11);
+            worker.publish_progress(11, true);
+            {
+                let snapshot = progress.lock().unwrap();
+                assert_eq!(snapshot.0.echoes, 1);
+                assert_eq!(snapshot.1, 1);
+            }
+            worker.scheduler.on_transport_failure(1, 12);
+            worker.publish_progress(12, true);
+            assert_eq!(progress.lock().unwrap().1, 1);
+            worker.scheduler.on_generation_drained(1, 13);
+            worker.publish_progress(13, true);
+            assert_eq!(progress.lock().unwrap().1, 0);
+        }
 
         struct SharedClock(Rc<Cell<u64>>);
 
