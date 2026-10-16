@@ -718,11 +718,15 @@ pub mod arena {
         unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }.as_bool()
     }
 
-    /// Always performs the release; the debug assertion only verifies its result. Never put
-    /// cleanup itself inside `debug_assert!`, because release builds compile the assertion away.
+    /// Always performs the release, and fails fast when the region is still mapped. A failed
+    /// `VirtualFree` means Windows still holds the pages, which is a release-boundary invariant
+    /// exactly like the outstanding-operation checks, not a diagnostic to compile away: the C++ and
+    /// .NET clients fail fast on the same result.
     fn release_pages_checked(base: *mut u8) {
-        let released = release_pages(base);
-        debug_assert!(released, "VirtualFree(registered arena) failed");
+        if !release_pages(base) {
+            let code = unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32;
+            crate::native::fail_fast("VirtualFree(registered arena)", code);
+        }
     }
 
     pub fn checked_pool_bytes(slots: usize, stride: usize) -> Option<usize> {
@@ -1769,10 +1773,13 @@ pub mod rio {
 
     impl Drop for CompletionPort {
         fn drop(&mut self) {
-            // The port is a kernel handle, so it is closed explicitly rather than at exit,
-            // and the result is inspected rather than assumed.
-            let closed = unsafe { windows::Win32::handleapi::CloseHandle(self.handle) }.as_bool();
-            debug_assert!(closed, "CloseHandle(completion port) failed");
+            // The port is a kernel handle, so it is closed explicitly rather than at exit. A failed
+            // close leaves the handle open, which is a release-boundary invariant: fail fast instead
+            // of leaking it, as the C++ and .NET clients do.
+            if !unsafe { windows::Win32::handleapi::CloseHandle(self.handle) }.as_bool() {
+                let code = unsafe { windows::Win32::errhandlingapi::GetLastError() } as i32;
+                crate::native::fail_fast("CloseHandle(completion port)", code);
+            }
         }
     }
 
